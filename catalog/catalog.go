@@ -132,6 +132,7 @@ type ParseError struct {
 	Reason string
 }
 
+// Error names the failing path and the reason.
 func (e *ParseError) Error() string {
 	if e.Path == "" {
 		return "agentkit: model catalog is corrupt: " + e.Reason

@@ -46,8 +46,10 @@ type ResolveError struct {
 	Vendors []string
 }
 
+// Unwrap returns the sentinel this failure matches.
 func (e *ResolveError) Unwrap() error { return e.Err }
 
+// Error states what could not be resolved and what would fix it.
 func (e *ResolveError) Error() string {
 	switch {
 	case errors.Is(e.Err, ErrEmptySpec):
