@@ -38,7 +38,11 @@ type Tool struct {
 	Handler ToolHandler
 	Execute ResultHandler
 
-	Label               string // display name, never sent
+	Label string // display name, never sent
+	// Builtin marks a first-party tool. It exists so ToolPolicy.NoTools can
+	// mean "builtin" without the resolver keeping a hardcoded name list that
+	// silently stops matching when a tool is renamed (REQ-TOOL-10).
+	Builtin             bool
 	ExecutionMode       ExecutionMode
 	PrepareArguments    func(map[string]any) map[string]any
 	PromptGuidelines    []string
@@ -103,10 +107,10 @@ type ConstrainedSampling struct {
 
 // ToolResult is REQ-TOOL-08's output envelope.
 type ToolResult struct {
-	OK    bool           `json:"ok"`
-	Data  map[string]any `json:"data"`
-	Error string         `json:"error,omitzero"`
-	Detail string        `json:"detail,omitzero"`
+	OK     bool           `json:"ok"`
+	Data   map[string]any `json:"data"`
+	Error  string         `json:"error,omitzero"`
+	Detail string         `json:"detail,omitzero"`
 	// Terminate never reaches the model; it is the REQ-TOOL-13 batch vote.
 	Terminate bool          `json:"-"`
 	Metadata  *ToolMetadata `json:"metadata,omitzero"`
