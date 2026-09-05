@@ -45,6 +45,7 @@ left to be discovered.
 | `tools` | Built-in tools, path containment, bounded accumulator, process control, glob, and a layered gitignore engine. |
 | `provider` | Send-time transcript repair, HTTP transport + retry, credential resolution, header precedence, cost arithmetic, SSE decoding — everything shared by every wire API. |
 | `provider/{anthropic,openai,google,ollama,faux}` | One wire API each, encode and decode. |
+| `difftest` | Separate module: the NFR-TEST-06/07 differential harness — canonicalizing comparator, key-order side channel, divergence ledger, exit machine. |
 | `.` (root) | `Agent`, the loop, the batch executor, stop policies, the argument pipeline, compaction, Axis 1 middleware, `SubagentTool`, session resume. |
 
 ## The parts worth reading
@@ -193,7 +194,8 @@ otherwise ordinary chunk. The transport layer cannot see it.
 
 ## Testing
 
-`go test -race ./...` is the default gate. Tests were **mutation-verified**
+`go test -race ./...` is the default gate for the root module;
+`cd difftest && go test ./...` for the harness, which is its own module. Tests were **mutation-verified**
 rather than merely written green — the wrong implementation was introduced and
 confirmed to turn the corresponding test red:
 
@@ -228,6 +230,12 @@ confirmed to turn the corresponding test red:
 | Trust schema pointer identity alone | `TestRebuildingAnIdenticalToolDoesNotInvalidate` |
 | Stamp the breakpoint on a deferred tool | `TestADeferredToolIsDeclaredAfterThePrefixAndCarriesNoBreakpoint` |
 | Credit a cache hit a session average | `TestALevel2HitCreditsWhatThatResponseActuallyCost` |
+| Launder JSON numbers through `float64` | `TestNumberLiteralsAreNotNormalized` |
+| Treat an explicit `null` as absent | `TestNullVersusAbsentIsADifference` |
+| Sort arrays before comparing | `TestArrayOrderIsNeverNormalized` |
+| Let a ledger entry cover any kind at its path | `TestClassificationAndStaleEntries` |
+| Treat a stale ledger entry as clean | `TestAStaleLedgerEntryExitsThree` |
+| Report a dark run as a pass | `TestADarkRunPrintsNoTally` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
@@ -269,11 +277,17 @@ Stated plainly so nobody reports it as done.
   redaction boundary ship; the application-owned store and the
   refresh-under-lock do not.
 - **`fetch_url` and the SSRF guard.** Image normalization.
-- **Wire-level differential testing.** The harness the specification requires
-  compares against an independently produced reference, and there is no network
-  and no key here to produce one. What ships pins the wire format against
-  *regression*, not against *truth* — that distinction is real and the weaker
-  claim is the honest one.
+- **Reference bodies for the differential harness.** The harness itself ships
+  ([`difftest/`](difftest/), a separate module) and its own suite is
+  mutation-verified. It has no scenarios, because NFR-TEST-06.3 forbids
+  hand-authoring a reference — a hand-authored expectation encodes the same
+  mental model as the code under test — and producing a real one needs a
+  vendor SDK or a live key. So `go run ./cmd/difftest` reports **DARK** and
+  exits 1, which is NFR-TEST-07.3's required answer rather than a bug. The
+  unit suite pins the wire format against *regression*; only a reference pins
+  it against *truth*, and the weaker claim is the honest one until then.
+- **`docs/PROVIDERS.md`** (NFR-COMPAT-07): the ledger of pinned API versions
+  and capture dates. It has nothing to record until the harness has a corpus.
 - **Benchmarks.** Four numeric performance budgets have no acceptance
   mechanism. Per the specification's own instruction, a budget with no
   benchmark behind it constrains nothing.
