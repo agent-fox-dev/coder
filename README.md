@@ -42,7 +42,7 @@ left to be discovered.
 | `catalog` | Embedded model catalog, resolution, sibling-cloning, `max_tokens` and thinking-level clamping. |
 | `session` | Append-only JSONL log, damage-tolerant loader, branch tree, resume fold. |
 | `skills` | Skill manifests (hand-rolled TOML subset), progressive disclosure, project context files, and the default-off trust gate. |
-| `tools` | Built-in tools, path containment, bounded accumulator, process control, glob + ignore. |
+| `tools` | Built-in tools, path containment, bounded accumulator, process control, glob, and a layered gitignore engine. |
 | `provider` | Send-time transcript repair, HTTP transport + retry, credential resolution, header precedence, cost arithmetic, SSE decoding — everything shared by every wire API. |
 | `provider/{anthropic,openai,google,ollama,faux}` | One wire API each, encode and decode. |
 | `.` (root) | `Agent`, the loop, the batch executor, stop policies, the argument pipeline, compaction, Axis 1 middleware, `SubagentTool`, session resume. |
@@ -100,6 +100,22 @@ request carries dangling `tool_use` blocks.
 mutex *is* the deadlock the reliability requirement exists to prevent — a
 panicking listener leaks it and hangs every peer at the join, producing no
 stack trace and no error.
+
+**A tool added mid-session is declared after the prefix, not prepended to it**
+([`provider/toolcache.go`](provider/toolcache.go)). Prepending a newly
+discovered tool invalidates the provider-side cache over the entire
+transcript — on the turn an MCP server connects, which is when the transcript
+is longest. `SplitDeferredTools` is a single forward pass and later usage
+cannot un-defer a tool: a tool used on the turn *after* it appeared is the
+normal case, and un-deferring there promotes it exactly when promotion costs
+most.
+
+**Ignore rules are layered, and a nested repository is its own root**
+([`tools/ignore.go`](tools/ignore.go)). A deeper `.gitignore` overrides a
+shallower one; a vendored dependency that is itself a git checkout does not
+inherit the outer project's rules. Without the boundary, a rule the outer
+project wrote about *its* build output silently deletes files from the listing
+of a repository that has never heard of it.
 
 **Compaction applies its checkpoint before estimating.** The naive reading
 oscillates: the compacted request reports small usage → the threshold passes →
@@ -203,6 +219,15 @@ confirmed to turn the corresponding test red:
 | Continue one text block across a Gemini function call | `TestTextAfterAToolCallStartsANewBlock` |
 | Ignore Ollama's error string inside a 200 | `TestOllamaReportsErrorsInsideA200Body` |
 | Synthesize tool-call ids from a global counter | `TestStreamingAndWholeResponsesAgree` |
+| Load only the root `.gitignore` | `TestFindFilesHonoursANestedGitignore` |
+| Ignore the nested-repository boundary | `TestANestedRepositoryIsItsOwnIgnoreRoot` |
+| Consult XDG before `core.excludesFile` | `TestGlobalExcludesResolutionOrder` |
+| Evaluate ignore layers deepest-first | `TestADeeperGitignoreOverridesAShallowerOne` |
+| Un-defer a tool on later usage | `TestLaterUsageCannotUnDeferATool` |
+| Treat a tool addition as a prefix invalidation | `TestAddingAToolDoesNotInvalidateThePrefix` |
+| Trust schema pointer identity alone | `TestRebuildingAnIdenticalToolDoesNotInvalidate` |
+| Stamp the breakpoint on a deferred tool | `TestADeferredToolIsDeclaredAfterThePrefixAndCarriesNoBreakpoint` |
+| Credit a cache hit a session average | `TestALevel2HitCreditsWhatThatResponseActuallyCost` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
@@ -239,10 +264,6 @@ Stated plainly so nobody reports it as done.
   trust gate; the four plugin categories do not.
 - **OpenAI Responses.** It is a separate wire API, not this one with a flag —
   different message model, tool-call identity, reasoning replay and billing.
-- **Caching levels 2 and 3.** Level 0 (`prompt_cache_key`) and Level 1
-  (Anthropic `cache_control` stamping) ship, and the dedup LRU of Level 2
-  ships as `CachingMiddleware`; the tool-schema cache and deferred tool
-  loading do not.
 - **`CredentialStore` and OAuth refresh** (REQ-AUTH-05/06). The ordered
   per-vendor environment table, the three-valued credential state and the
   redaction boundary ship; the application-owned store and the
@@ -257,9 +278,8 @@ Stated plainly so nobody reports it as done.
   mechanism. Per the specification's own instruction, a budget with no
   benchmark behind it constrains nothing.
 
-The ignore engine is also partial: no global excludes file, no
-`.git/info/exclude`, no nested-repository boundaries. `find_files` is
-therefore not bit-identical to `fd` or `rg`.
+`search_files` (REQ-TOOL-05's grep tool, with `rg --json` acceleration) is not
+built. The ignore engine underneath it is, and `find_files` uses it.
 
 ## License
 

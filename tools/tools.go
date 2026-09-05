@@ -440,6 +440,12 @@ func (f *fileTools) findFiles() core.Tool {
 					return nil
 				}
 				if d.IsDir() {
+					// Load this directory's own ignore files before its
+					// children are matched (REQ-TOOL-05.2). WalkDir visits a
+					// directory before descending, which is what makes a
+					// single forward pass sufficient — there is no need to
+					// pre-scan for .gitignore files that may not exist.
+					ig.enter(rel, p)
 					return nil
 				}
 				if MatchGlob(a.Pattern, rel) {

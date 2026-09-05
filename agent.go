@@ -86,6 +86,11 @@ type Agent struct {
 	holds int
 
 	usage core.Usage
+
+	// meter is REQ-CACHE-08's session aggregate. It is never nil, so every
+	// call site is unconditional and the metered and unmetered paths cannot
+	// drift apart — the same reasoning that makes rec never nil.
+	meter *CacheMeter
 }
 
 // NewAgent constructs an Agent. Credentials, catalog lookup and provider
@@ -120,7 +125,7 @@ func NewAgentWithHistory(cfg core.AgentConfig, h *core.ConversationHistory) (*Ag
 }
 
 func newAgent(cfg core.AgentConfig, h *core.ConversationHistory) *Agent {
-	a := &Agent{producerID: newID("prod"), cfg: cfg, history: h}
+	a := &Agent{producerID: newID("prod"), cfg: cfg, history: h, meter: NewCacheMeter()}
 	a.rec = session.NewRecorder(cfg.SessionStore, h, cfg.OnPersistError)
 	a.tools = append(a.tools, cfg.ToolPolicy.CustomTools...)
 	return a
@@ -262,6 +267,25 @@ func (a *Agent) Snapshot(ctx context.Context) (core.SessionSnapshot, error) {
 // History exposes the in-memory active branch. It is a view; the durable
 // representation is the session log (NFR-REL-04).
 func (a *Agent) History() *core.ConversationHistory { return a.history }
+
+// CacheStats is REQ-CACHE-08's session aggregate across all three caching
+// levels, extended by REQ-CACHE-11's prefix diagnostics.
+//
+// Level 1 figures come from what the PROVIDER reported, never from a
+// re-estimate: REQ-GO-15 forbids treating an estimate as a measurement, and a
+// savings number computed from estimated tokens is a guess wearing a dollar
+// sign. Level 2 hit and miss counts require CachingMiddleware to have been
+// registered with this agent's Meter — see AgentConfig.Middleware and
+// CacheOptions.Meter.
+func (a *Agent) CacheStats() CacheStats { return a.meter.Stats() }
+
+// Meter exposes the agent's cache meter so CachingMiddleware can be wired to
+// it at construction:
+//
+//	a, _ := agentkit.NewAgent(cfg)
+//	cfg.Middleware = append(cfg.Middleware,
+//	    agentkit.CachingMiddleware(agentkit.CacheOptions{Meter: a.Meter()}))
+func (a *Agent) Meter() *CacheMeter { return a.meter }
 
 // Usage returns cumulative usage for the agent's lifetime.
 func (a *Agent) Usage() core.Usage {

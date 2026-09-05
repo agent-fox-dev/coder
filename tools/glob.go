@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -193,89 +192,3 @@ func translateClasses(p string) string {
 }
 
 // ---------------------------------------------------------------- ignore
-
-// ignoreSet is a minimal but real gitignore engine.
-//
-// v1 implements: patterns from .gitignore files from the search root down,
-// with deeper files taking precedence; negation with `!`; directory-only
-// patterns ending in `/`; anchoring for patterns containing a `/`; and the
-// always-ignored `.git` directory.
-//
-// NOT implemented in v1, and stated so the gap is visible: the global excludes
-// file (core.excludesFile, XDG, ~/.config/git/ignore), .git/info/exclude, and
-// nested-repository boundary semantics. Those are real parts of REQ-TOOL-05
-// and their absence means AgentKit's find is not yet bit-identical to either
-// `fd` or `rg` — which is precisely why REQ-TOOL-05's parity test cannot be
-// executable in CI as written, since it depends on what happens to be
-// installed on the runner.
-type ignoreSet struct {
-	pats []ignorePattern
-}
-
-type ignorePattern struct {
-	glob    string
-	negate  bool
-	dirOnly bool
-	// anchored patterns match from the root; unanchored ones match any segment.
-	anchored bool
-}
-
-func loadIgnore(root string) *ignoreSet {
-	s := &ignoreSet{}
-	s.addFile(filepath.Join(root, ".gitignore"))
-	return s
-}
-
-func (s *ignoreSet) addFile(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		p := ignorePattern{}
-		if strings.HasPrefix(line, "!") {
-			p.negate, line = true, line[1:]
-		}
-		if strings.HasSuffix(line, "/") {
-			p.dirOnly, line = true, strings.TrimSuffix(line, "/")
-		}
-		p.anchored = strings.Contains(line, "/")
-		p.glob = strings.TrimPrefix(line, "/")
-		s.pats = append(s.pats, p)
-	}
-}
-
-// match reports whether rel should be ignored. Later patterns win, which is
-// how `!` negation re-includes a path an earlier pattern excluded.
-func (s *ignoreSet) match(rel string, isDir bool) bool {
-	rel = filepath.ToSlash(rel)
-	if rel == ".git" || strings.HasPrefix(rel, ".git/") {
-		return true
-	}
-	ignored := false
-	for _, p := range s.pats {
-		if p.dirOnly && !isDir {
-			continue
-		}
-		var hit bool
-		if p.anchored {
-			hit = matchSegments(p.glob, rel) || strings.HasPrefix(rel, p.glob+"/")
-		} else {
-			// Unanchored: match any segment, and any path under a matched dir.
-			for _, seg := range strings.Split(rel, "/") {
-				if matchOne(p.glob, seg) {
-					hit = true
-					break
-				}
-			}
-		}
-		if hit {
-			ignored = !p.negate
-		}
-	}
-	return ignored
-}

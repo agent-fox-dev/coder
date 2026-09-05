@@ -33,6 +33,11 @@ type request struct {
 	TopP        *float64    `json:"top_p,omitzero"`
 	Stream      bool        `json:"stream"`
 	Thinking    *thinking   `json:"thinking,omitzero"`
+
+	// immediateTools is the count of leading non-deferred tools. It is
+	// unexported and therefore never marshalled; StampCacheControl reads it to
+	// find the last tool eligible for a breakpoint.
+	immediateTools int
 }
 
 type thinking struct {
@@ -115,6 +120,12 @@ type tool struct {
 	Description  string          `json:"description,omitzero"`
 	InputSchema  json.RawMessage `json:"input_schema"`
 	CacheControl *cacheControl   `json:"cache_control,omitzero"`
+	// DeferLoading is REQ-CACHE-10's Anthropic arm: a tool that appeared
+	// mid-session is declared at its transcript position instead of being
+	// prepended to the cached prefix. A deferred tool carries NO
+	// cache_control — stamping one would place a breakpoint after the prefix
+	// it was meant to preserve.
+	DeferLoading *bool `json:"defer_loading,omitzero"`
 }
 
 type toolChoice struct {
@@ -175,12 +186,32 @@ func BuildRequest(m *core.Model, req core.Request, retention core.CacheRetention
 		}
 	}
 
-	for _, tw := range req.Tools {
-		raw, err := json.Marshal(tw.InputSchema)
-		if err != nil {
-			return nil, rep, err
+	// REQ-CACHE-10: immediate tools first, deferred tools after. The ORDER is
+	// the mechanism — appending late arrivals keeps the cached prefix byte-
+	// identical, where inserting them anywhere else rewrites it and costs the
+	// whole provider-side cache over one added tool.
+	split := provider.SplitDeferredTools(req.Tools, req.Messages)
+	out.immediateTools = len(split.Immediate)
+	appendTools := func(ts []core.ToolWire, deferred bool) error {
+		for _, tw := range ts {
+			raw, err := json.Marshal(tw.InputSchema)
+			if err != nil {
+				return err
+			}
+			t := tool{Name: tw.Name, Description: tw.Description, InputSchema: raw}
+			if deferred {
+				yes := true
+				t.DeferLoading = &yes
+			}
+			out.Tools = append(out.Tools, t)
 		}
-		out.Tools = append(out.Tools, tool{Name: tw.Name, Description: tw.Description, InputSchema: raw})
+		return nil
+	}
+	if err := appendTools(split.Immediate, false); err != nil {
+		return nil, rep, err
+	}
+	if err := appendTools(split.Deferred, true); err != nil {
+		return nil, rep, err
 	}
 
 	// ToolChoice absent is NOT auto: a provider must not invent a selection
@@ -227,7 +258,11 @@ func StampCacheControl(r *request, retention core.CacheRetention, m *core.Model)
 	for i := range r.System {
 		r.System[i].CacheControl = cc
 	}
-	if n := len(r.Tools); n > 0 {
+	// The breakpoint goes on the last IMMEDIATE tool, not the last tool.
+	// A deferred tool sits after the prefix by construction (REQ-CACHE-10);
+	// stamping it would place the breakpoint past the very content the
+	// deferral exists to keep cached.
+	if n := r.immediateTools; n > 0 && n <= len(r.Tools) {
 		r.Tools[n-1].CacheControl = cc
 	}
 	if n := len(r.Messages); n > 0 {
