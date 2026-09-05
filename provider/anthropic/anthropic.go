@@ -83,6 +83,25 @@ type block struct {
 	Source *imageSource `json:"source,omitzero"`
 
 	CacheControl *cacheControl `json:"cache_control,omitzero"`
+
+	// Raw carries a block this build does not model, verbatim. It is how
+	// REQ-PROV-07's server-side compaction blocks are "passed back unchanged
+	// in subsequent turns" without the SDK having to model a beta wire shape
+	// that is expected to change: a compaction block decodes to core.RawBlock
+	// and re-encodes to exactly the bytes that arrived.
+	Raw json.RawMessage `json:"-"`
+}
+
+// MarshalJSON emits Raw verbatim when present, and the modelled fields
+// otherwise. The alias type is required: a defined struct type does not
+// inherit its source type's methods, so json.Marshal(alias(b)) recurses no
+// further.
+func (b block) MarshalJSON() ([]byte, error) {
+	if len(b.Raw) > 0 {
+		return b.Raw, nil
+	}
+	type alias block
+	return json.Marshal(alias(b))
 }
 
 type imageSource struct {
@@ -376,6 +395,16 @@ func encodeBlock(b core.ContentBlock) block {
 	case core.ToolResultBlock:
 		inner, _ := splitResultContent(v.Content)
 		return block{Type: "tool_result", ToolUseID: v.ToolUseID, Content: inner, IsError: v.IsError}
+	case core.RawBlock:
+		// Replayed verbatim (REQ-PROV-07). Dropping it would be the safe-
+		// looking choice and it is wrong here: a server-side compaction block
+		// the model expects to see again is load-bearing state, and a
+		// transcript that silently loses it re-sends the history the
+		// compaction was paid to remove.
+		if len(v.Raw) == 0 || v.Type == "" {
+			return block{}
+		}
+		return block{Type: v.Type, Raw: v.Raw}
 	}
 	return block{}
 }

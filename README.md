@@ -12,6 +12,17 @@ go test ./...          # everything, offline, no API key
 go run ./examples/agentdemo
 ```
 
+To talk to a real model, register a wire API on the config. Nothing is
+registered by import side effect, so the root package never drags `net/http`
+into a consumer that only wants the loop:
+
+```go
+reg := agentkit.DefaultProviders()
+reg.Register(anthropic.Provider(anthropic.Options{}))
+
+cfg := core.AgentConfig{Model: model, Providers: reg}   // credential per REQ-AUTH-03
+```
+
 The demo drives the real loop against a scripted provider with no network, and
 prints seven behaviours — five the specification originally got wrong, plus a
 kill-and-resume across two "processes" and three concurrent delegations.
@@ -32,8 +43,8 @@ left to be discovered.
 | `session` | Append-only JSONL log, damage-tolerant loader, branch tree, resume fold. |
 | `skills` | Skill manifests (hand-rolled TOML subset), progressive disclosure, project context files, and the default-off trust gate. |
 | `tools` | Built-in tools, path containment, bounded accumulator, process control, glob + ignore. |
-| `provider` | Send-time transcript repair shared by every wire API. |
-| `provider/{anthropic,openai,google,ollama,faux}` | One wire API each. |
+| `provider` | Send-time transcript repair, HTTP transport + retry, credential resolution, header precedence, cost arithmetic, SSE decoding — everything shared by every wire API. |
+| `provider/{anthropic,openai,google,ollama,faux}` | One wire API each. Anthropic is full duplex; the other three encode only. |
 | `.` (root) | `Agent`, the loop, the batch executor, stop policies, the argument pipeline, compaction, Axis 1 middleware, `SubagentTool`, session resume. |
 
 ## The parts worth reading
@@ -143,6 +154,13 @@ confirmed to turn the corresponding test red:
 | Estimate on full history | `TestCompactionDoesNotOscillate` |
 | Add a cgo dependency | `TestNoCgoOutsideStdlib` |
 | Leave the session log unwired | `TestARunIsPersistedAsItHappens` |
+| Emit block-end events from the chunk handler | `TestBlockEndEventsFollowTheWholeStream` |
+| Re-encode decoded tool arguments | `TestStreamingAndWholeResponseAgreeByteForByte` |
+| Apply OpenAI's cache-token netting to Anthropic | `TestAnthropicInputTokensAreNotNettedAgain` |
+| Drop header deletion markers per layer | `TestNilHeaderValueSuppressesAProviderDefault` |
+| Clamp an overlong `Retry-After` instead of abandoning | `TestOverlongServerDelayIsAbandonedNotClamped` |
+| Close a truncated JSON string instead of dropping it | `TestATruncatedMemberIsDroppedNotClosed` |
+| Dispatch a partially accumulated SSE event at EOF | `TestATruncatedFinalEventIsDiscardedNotDispatched` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
@@ -157,7 +175,8 @@ with `CGO_ENABLED=0` the toolchain excludes cgo files by build constraint, so
 A cgo-off gate cannot see the thing it claims to check.
 
 Also included: `FuzzRepairAlwaysSendable` (432k executions clean),
-`FuzzSessionLogLoad`, and a cross-target build gate for `linux/amd64`,
+`FuzzSalvageAlwaysProducesValidJSON` (1.6M clean), `FuzzSessionLogLoad`, and a
+cross-target build gate for `linux/amd64`,
 `linux/arm64`, `darwin/arm64` and `windows/amd64`.
 
 ## What is not built
@@ -171,17 +190,20 @@ Stated plainly so nobody reports it as done.
   trust gate; the four plugin categories do not.
 - **OpenAI Responses.** It is a separate wire API, not this one with a flag —
   different message model, tool-call identity, reasoning replay and billing.
-- **Provider response decoding.** All five providers implement the
-  request-building half: `BuildRequest` is exported so the exact bytes can be
-  captured offline, but there is no HTTP transport, no SSE/NDJSON decoding, no
-  usage/cost computation and no transport retry layer. Consequently
-  REQ-PROV-17's streaming-vs-whole byte-identity conformance test cannot be
-  written yet — only the encode direction is pinned.
+- **Response decoding for OpenAI, Google and Ollama.** Those three implement
+  the request-building half only: `BuildRequest` is exported so the exact bytes
+  can be captured offline, but they have no `Stream`, so they cannot be
+  registered and run. Anthropic is complete in both directions, and the shared
+  layer it now sits on — transport retry, auth, headers, cost, SSE — is what
+  the remaining three need wiring to rather than reimplementing.
 - **Caching levels 2 and 3.** Level 0 (`prompt_cache_key`) and Level 1
   (Anthropic `cache_control` stamping) ship, and the dedup LRU of Level 2
   ships as `CachingMiddleware`; the tool-schema cache and deferred tool
   loading do not.
-- **Auth beyond environment keys.** No credential store, no OAuth refresh.
+- **`CredentialStore` and OAuth refresh** (REQ-AUTH-05/06). The ordered
+  per-vendor environment table, the three-valued credential state and the
+  redaction boundary ship; the application-owned store and the
+  refresh-under-lock do not.
 - **`fetch_url` and the SSRF guard.** Image normalization.
 - **Wire-level differential testing.** The harness the specification requires
   compares against an independently produced reference, and there is no network

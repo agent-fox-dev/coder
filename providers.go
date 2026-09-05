@@ -22,7 +22,7 @@ import "github.com/agentfox/agentkit-go/core"
 // build the registry explicitly:
 //
 //	reg := agentkit.DefaultProviders()
-//	reg.Register(anthropic.Provider())
+//	reg.Register(anthropic.Provider(anthropic.Options{}))
 //	cfg.Providers = reg
 func DefaultProviders() core.ProviderRegistry { return core.ProviderRegistry{} }
 
