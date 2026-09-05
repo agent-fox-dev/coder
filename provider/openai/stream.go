@@ -88,6 +88,11 @@ type Options struct {
 	Attribution   *bool
 	BillingLookup func(string) *core.Model
 	Now           func() time.Time
+	// Credentials is REQ-AUTH-05's application-owned store. When set it is
+	// consulted BEFORE the environment table, because it is the layer that can
+	// hold a refreshed OAuth token and the environment is static. An empty
+	// store falls through, so adding one never breaks a working env setup.
+	Credentials *provider.Credentials
 	// Auth overrides the per-vendor table for a vendor this build does not
 	// know. Nil uses AuthFor(model.Provider).
 	Auth             *provider.VendorAuth
@@ -152,7 +157,11 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	if c.opts.Auth != nil {
 		table = *c.opts.Auth
 	}
-	auth := provider.ResolveAuth(table, env)
+	auth, err := provider.ResolveAuthWith(ctx, m.Provider, c.opts.Credentials, table, env)
+	if err != nil {
+		d.fail(provider.TransportErrorText("openai", ctx, err), err)
+		return
+	}
 
 	base := c.opts.BaseURL
 	if base == "" {

@@ -41,13 +41,18 @@ var VendorAuth = provider.VendorAuth{
 }
 
 type Options struct {
-	BaseURL          string
-	HTTPClient       *http.Client
-	Getenv           func(string) string
-	Retry            provider.RetryPolicy
-	Attribution      *bool
-	BillingLookup    func(string) *core.Model
-	Now              func() time.Time
+	BaseURL       string
+	HTTPClient    *http.Client
+	Getenv        func(string) string
+	Retry         provider.RetryPolicy
+	Attribution   *bool
+	BillingLookup func(string) *core.Model
+	Now           func() time.Time
+	// Credentials is REQ-AUTH-05's application-owned store. When set it is
+	// consulted BEFORE the environment table, because it is the layer that can
+	// hold a refreshed OAuth token and the environment is static. An empty
+	// store falls through, so adding one never breaks a working env setup.
+	Credentials      *provider.Credentials
 	MaxSSEEventBytes int
 }
 
@@ -104,7 +109,11 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	}
 
 	env := provider.Env{Override: req.Options.Env, Getenv: c.opts.Getenv}
-	auth := provider.ResolveAuth(VendorAuth, env)
+	auth, err := provider.ResolveAuthWith(ctx, m.Provider, c.opts.Credentials, VendorAuth, env)
+	if err != nil {
+		d.fail(provider.TransportErrorText("google", ctx, err), err)
+		return
+	}
 
 	base := c.opts.BaseURL
 	if base == "" {
@@ -114,15 +123,22 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 		"content-type": "application/json",
 		"accept":       "text/event-stream",
 	}
-	// Google carries the key in its own header, not in Authorization, and NOT
-	// in the query string: a key in a URL lands in every access log and proxy
-	// trace between here and the endpoint.
-	authHeaders := map[string]*string{}
-	if auth.APIKey != "" {
-		k := auth.APIKey
-		authHeaders["x-goog-api-key"] = &k
+	// Google carries an API key in its own header, not in Authorization, and
+	// NOT in the query string: a key in a URL lands in every access log and
+	// proxy trace between here and the endpoint.
+	//
+	// A credential store that already supplied an Authorization header is left
+	// alone — that is the Vertex/ADC path (NFR-COMPAT-05), and rewriting it
+	// into x-goog-api-key would send an OAuth token under a field that expects
+	// an API key.
+	if auth.Headers == nil {
+		auth.Headers = map[string]*string{}
 	}
-	auth.Headers = authHeaders
+	if auth.APIKey != "" && auth.Headers["Authorization"] == nil {
+		k := auth.APIKey
+		delete(auth.Headers, "x-api-key")
+		auth.Headers["x-goog-api-key"] = &k
+	}
 
 	call := provider.Call{
 		Method:  http.MethodPost,

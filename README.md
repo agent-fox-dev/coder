@@ -118,6 +118,20 @@ inherit the outer project's rules. Without the boundary, a rule the outer
 project wrote about *its* build output silently deletes files from the listing
 of a repository that has never heard of it.
 
+**OAuth refresh is double-checked inside the lock**
+([`provider/credentials.go`](provider/credentials.go)). Without the second
+check, N concurrent turns arriving on an expired token each POST the same
+refresh token, the provider rotates it N times, and N−1 turns are left holding
+a credential the provider has already invalidated. The session does not fail
+cleanly — it fails N−1 times out of N, intermittently, and reads as a flaky
+provider. The first check, outside the lock, exists so the common case (a valid
+token) does not serialize turns that have nothing to coordinate.
+
+Two nearby details: the refresh carries **its own timeout** because it holds
+the per-vendor lock, and a zero `ExpiresAt` means *never expires*, not *expired
+at the epoch* — read the other way it refreshes a plain API key, which has no
+refresh flow, on every turn.
+
 **The SSRF guard validates at connect time, not only at resolution**
 ([`tools/ssrf.go`](tools/ssrf.go)). Checking only the DNS answer leaves a
 TOCTOU window a rebind walks straight through: the name resolves to a public
@@ -300,6 +314,11 @@ confirmed to turn the corresponding test red:
 | Unwire the schema cache from the request path | `TestTheProviderOwnsAPrefixByDefault` |
 | Buffer the response body before decoding | `TestFirstTokenIsEmittedBeforeTheStreamEnds` |
 | Run tool handlers sequentially | `TestParallelToolsUseTrueConcurrency` |
+| Drop the double check inside the refresh lock | `TestConcurrentTurnsRefreshExactlyOnce` |
+| Use a bare expiry check with no validity floor | `TestTheValidityFloorRefreshesBeforeExpiry` |
+| Take one global lock instead of a keyed one | `TestPerVendorLocksDoNotSerializeDifferentVendors` |
+| Never release a refcounted lock entry | `TestVendorLocksAreReleased` |
+| Rewrite a stored bearer into an API-key header | `TestACredentialStoreReachesEveryWire` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
@@ -346,10 +365,6 @@ Stated plainly so nobody reports it as done.
   trust gate; the four plugin categories do not.
 - **OpenAI Responses.** It is a separate wire API, not this one with a flag —
   different message model, tool-call identity, reasoning replay and billing.
-- **`CredentialStore` and OAuth refresh** (REQ-AUTH-05/06). The ordered
-  per-vendor environment table, the three-valued credential state and the
-  redaction boundary ship; the application-owned store and the
-  refresh-under-lock do not.
 - **Image normalization** (REQ-TOOL-14).
 - **Reference bodies for the differential harness.** The harness itself ships
   ([`difftest/`](difftest/), a separate module) and its own suite is

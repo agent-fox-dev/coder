@@ -60,6 +60,11 @@ type Options struct {
 	// (REQ-PROV-05.5). Nil bills a fallback-served response at the requested
 	// model's rates and still records the served name.
 	BillingLookup func(string) *core.Model
+	// Credentials is REQ-AUTH-05's application-owned store. When set it is
+	// consulted BEFORE the environment table, because it is the layer that can
+	// hold a refreshed OAuth token and the environment is static. An empty
+	// store falls through, so adding one never breaks a working env setup.
+	Credentials *provider.Credentials
 	// ToolPrefix is REQ-CACHE-06's per-session schema cache. Nil means this
 	// provider value owns one, which is the right scope in practice: a
 	// registry is built per agent config. Pass one explicitly to share it, or
@@ -165,7 +170,11 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	}
 
 	env := provider.Env{Override: req.Options.Env, Getenv: c.opts.Getenv}
-	auth := provider.ResolveAuth(VendorAuth, env)
+	auth, err := provider.ResolveAuthWith(ctx, m.Provider, c.opts.Credentials, VendorAuth, env)
+	if err != nil {
+		d.fail(provider.TransportErrorText("anthropic", ctx, err), err)
+		return
+	}
 
 	url := provider.ResolveBaseURL(m, auth, defaultBase(c.opts.BaseURL)) + "/v1/messages"
 
