@@ -33,6 +33,11 @@ type request struct {
 	TopP        *float64    `json:"top_p,omitzero"`
 	Stream      bool        `json:"stream"`
 	Thinking    *thinking   `json:"thinking,omitzero"`
+
+	// immediateTools is the count of leading non-deferred tools. It is
+	// unexported and therefore never marshalled; StampCacheControl reads it to
+	// find the last tool eligible for a breakpoint.
+	immediateTools int
 }
 
 type thinking struct {
@@ -83,6 +88,25 @@ type block struct {
 	Source *imageSource `json:"source,omitzero"`
 
 	CacheControl *cacheControl `json:"cache_control,omitzero"`
+
+	// Raw carries a block this build does not model, verbatim. It is how
+	// REQ-PROV-07's server-side compaction blocks are "passed back unchanged
+	// in subsequent turns" without the SDK having to model a beta wire shape
+	// that is expected to change: a compaction block decodes to core.RawBlock
+	// and re-encodes to exactly the bytes that arrived.
+	Raw json.RawMessage `json:"-"`
+}
+
+// MarshalJSON emits Raw verbatim when present, and the modelled fields
+// otherwise. The alias type is required: a defined struct type does not
+// inherit its source type's methods, so json.Marshal(alias(b)) recurses no
+// further.
+func (b block) MarshalJSON() ([]byte, error) {
+	if len(b.Raw) > 0 {
+		return b.Raw, nil
+	}
+	type alias block
+	return json.Marshal(alias(b))
 }
 
 type imageSource struct {
@@ -96,6 +120,12 @@ type tool struct {
 	Description  string          `json:"description,omitzero"`
 	InputSchema  json.RawMessage `json:"input_schema"`
 	CacheControl *cacheControl   `json:"cache_control,omitzero"`
+	// DeferLoading is REQ-CACHE-10's Anthropic arm: a tool that appeared
+	// mid-session is declared at its transcript position instead of being
+	// prepended to the cached prefix. A deferred tool carries NO
+	// cache_control — stamping one would place a breakpoint after the prefix
+	// it was meant to preserve.
+	DeferLoading *bool `json:"defer_loading,omitzero"`
 }
 
 type toolChoice struct {
@@ -156,12 +186,32 @@ func BuildRequest(m *core.Model, req core.Request, retention core.CacheRetention
 		}
 	}
 
-	for _, tw := range req.Tools {
-		raw, err := json.Marshal(tw.InputSchema)
-		if err != nil {
-			return nil, rep, err
+	// REQ-CACHE-10: immediate tools first, deferred tools after. The ORDER is
+	// the mechanism — appending late arrivals keeps the cached prefix byte-
+	// identical, where inserting them anywhere else rewrites it and costs the
+	// whole provider-side cache over one added tool.
+	split := provider.SplitDeferredTools(req.Tools, req.Messages)
+	out.immediateTools = len(split.Immediate)
+	appendTools := func(ts []core.ToolWire, deferred bool) error {
+		for _, tw := range ts {
+			raw, err := json.Marshal(tw.InputSchema)
+			if err != nil {
+				return err
+			}
+			t := tool{Name: tw.Name, Description: tw.Description, InputSchema: raw}
+			if deferred {
+				yes := true
+				t.DeferLoading = &yes
+			}
+			out.Tools = append(out.Tools, t)
 		}
-		out.Tools = append(out.Tools, tool{Name: tw.Name, Description: tw.Description, InputSchema: raw})
+		return nil
+	}
+	if err := appendTools(split.Immediate, false); err != nil {
+		return nil, rep, err
+	}
+	if err := appendTools(split.Deferred, true); err != nil {
+		return nil, rep, err
 	}
 
 	// ToolChoice absent is NOT auto: a provider must not invent a selection
@@ -208,7 +258,11 @@ func StampCacheControl(r *request, retention core.CacheRetention, m *core.Model)
 	for i := range r.System {
 		r.System[i].CacheControl = cc
 	}
-	if n := len(r.Tools); n > 0 {
+	// The breakpoint goes on the last IMMEDIATE tool, not the last tool.
+	// A deferred tool sits after the prefix by construction (REQ-CACHE-10);
+	// stamping it would place the breakpoint past the very content the
+	// deferral exists to keep cached.
+	if n := r.immediateTools; n > 0 && n <= len(r.Tools) {
 		r.Tools[n-1].CacheControl = cc
 	}
 	if n := len(r.Messages); n > 0 {
@@ -376,6 +430,16 @@ func encodeBlock(b core.ContentBlock) block {
 	case core.ToolResultBlock:
 		inner, _ := splitResultContent(v.Content)
 		return block{Type: "tool_result", ToolUseID: v.ToolUseID, Content: inner, IsError: v.IsError}
+	case core.RawBlock:
+		// Replayed verbatim (REQ-PROV-07). Dropping it would be the safe-
+		// looking choice and it is wrong here: a server-side compaction block
+		// the model expects to see again is load-bearing state, and a
+		// transcript that silently loses it re-sends the history the
+		// compaction was paid to remove.
+		if len(v.Raw) == 0 || v.Type == "" {
+			return block{}
+		}
+		return block{Type: v.Type, Raw: v.Raw}
 	}
 	return block{}
 }

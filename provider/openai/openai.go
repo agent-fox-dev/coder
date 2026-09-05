@@ -33,6 +33,13 @@ type request struct {
 	Temperature *float64  `json:"temperature,omitzero"`
 	TopP        *float64  `json:"top_p,omitzero"`
 	Stream      bool      `json:"stream"`
+	// StreamOptions.include_usage is REQUIRED for a streamed request to report
+	// usage at all. Without it OpenAI returns `usage: null` on every chunk,
+	// which REQ-GO-15 forbids as a context anchor and REQ-PROV-05 forbids as a
+	// cost basis — so the field is not optional in practice, and is emitted
+	// unconditionally rather than behind a compat flag nobody has a
+	// reproducing case for.
+	StreamOptions *streamOptions `json:"stream_options,omitzero"`
 
 	// Exactly one of these is emitted, chosen by the compat profile's
 	// UseMaxTokens flag. Sending the wrong one is a 400 on the vendors that
@@ -52,6 +59,10 @@ type request struct {
 // its OWN message with role "tool", not a block inside a user message. This is
 // the asymmetry with Anthropic that makes REQ-LOOP-02's "one user message
 // holding every tool_result" unimplementable as a canonical invariant.
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type message struct {
 	Role string `json:"role"` // system | developer | user | assistant | tool
 
@@ -175,6 +186,8 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
 		Stream:      true,
+
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
 
 	// The rename is a real vendor split, not a preference.

@@ -513,7 +513,12 @@ func (a *Agent) consultStopPolicy(m core.AssistantMessage, results []core.ToolRe
 func (a *Agent) addUsage(u core.Usage) {
 	a.mu.Lock()
 	a.usage = a.usage.Add(u)
+	model := a.cfg.Model
 	a.mu.Unlock()
+	// Level 1 accounting is folded from the SAME reported usage the turn was
+	// billed against (REQ-CACHE-08). Recomputing it from a token estimate here
+	// would make the savings figure disagree with the invoice.
+	a.meter.ObserveTurn(model, u)
 }
 
 // entryFor is the session-log id a message is recorded under. v1 records

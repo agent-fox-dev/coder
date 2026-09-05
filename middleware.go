@@ -212,6 +212,9 @@ type CacheOptions struct {
 	// OnHit and OnMiss emit the REQ-CACHE-05 events.
 	OnHit  func(fingerprint string)
 	OnMiss func(fingerprint string)
+	// Meter accumulates REQ-CACHE-08's session aggregate. Nil disables it;
+	// the middleware works unmetered.
+	Meter *CacheMeter
 }
 
 // CachingMiddleware is Level 2, in-process request deduplication.
@@ -241,6 +244,10 @@ func CachingMiddleware(opts CacheOptions) core.Middleware {
 				if opts.OnHit != nil {
 					opts.OnHit(fp)
 				}
+				opts.Meter.hit(fp)
+				if n := noteFrom(ctx); n != nil {
+					n.Hit, n.Tier, n.Fingerprint = true, "dedup", fp
+				}
 				s := core.NewEventStream(core.StreamOptions{})
 				cp := *msg
 				s.Push(core.MessageEndEvent{Message: cp})
@@ -250,11 +257,18 @@ func CachingMiddleware(opts CacheOptions) core.Middleware {
 			if opts.OnMiss != nil {
 				opts.OnMiss(fp)
 			}
+			opts.Meter.miss(fp)
+			if n := noteFrom(ctx); n != nil {
+				n.Hit, n.Tier, n.Fingerprint = false, "dedup", fp
+			}
 			s := next(ctx, req)
 			// Store only a successful, complete response. Caching an error
 			// would replay a transient failure for the life of the session.
 			if msg := s.Result(); msg != nil && !msg.StopReason.ShortCircuits() {
 				c.put(fp, msg)
+				// Price it NOW, so a later hit credits the exact amount this
+				// response cost rather than an average over the session.
+				opts.Meter.price(fp, msg.Usage.CostUSD)
 			}
 			return s
 		}
@@ -419,7 +433,14 @@ func (noopTracer) StartSpan(_ string, fn func(Span) error) error { return fn(noo
 var NoopTracer Tracer = noopTracer{}
 
 // TracingMiddleware wraps every model call in a span carrying REQ-OBS-01's
-// attributes.
+// attributes, plus REQ-CACHE-09's cache attributes when a cache decision was
+// made inside the span.
+//
+// ORDERING: for the cache attributes to appear, tracing must WRAP caching.
+// Since the last registered middleware is outermost (§5, Axis 1), that means
+// registering TracingMiddleware AFTER CachingMiddleware. Registered the other
+// way round the spans still carry every REQ-OBS-01 attribute and simply omit
+// the cache ones — a missing attribute, never a wrong one.
 func TracingMiddleware(t Tracer) core.Middleware {
 	if t == nil {
 		t = NoopTracer
@@ -427,6 +448,7 @@ func TracingMiddleware(t Tracer) core.Middleware {
 	return func(next core.Handler) core.Handler {
 		return func(ctx context.Context, req core.Request) *core.EventStream {
 			var out *core.EventStream
+			ctx, note := withCacheNote(ctx)
 			_ = t.StartSpan("agentkit.model_call", func(sp Span) error {
 				defer sp.End()
 				out = next(ctx, req)
@@ -445,6 +467,11 @@ func TracingMiddleware(t Tracer) core.Middleware {
 					if msg.StopReason == core.StopReasonError {
 						sp.SetStatus(errors.New(msg.ErrorMessage))
 					}
+				}
+				if note.Fingerprint != "" {
+					attrs["cache.hit"] = note.Hit
+					attrs["cache.tier"] = note.Tier
+					attrs["cache.fingerprint"] = note.Fingerprint
 				}
 				sp.SetAttributes(attrs)
 				return nil
