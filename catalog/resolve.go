@@ -62,6 +62,9 @@ func (e *ResolveError) Error() string {
 			"model id either; known vendors: %s",
 			vendor, e.Spec, e.Spec, strings.Join(e.Vendors, ", "))
 	default:
+		if v, id, ok := strings.Cut(e.Spec, "/"); ok && id == "" && v != "" {
+			return fmt.Sprintf("agentkit: model spec %q names vendor %q but no model id", e.Spec, v)
+		}
 		return fmt.Sprintf("agentkit: cannot determine a vendor for model spec %q; "+
 			"prefix it with a vendor (%s) — an unknown id under a known vendor is fine "+
 			"and clones that vendor's default row",
@@ -75,11 +78,16 @@ func (e *ResolveError) Error() string {
 type MatchKind uint8
 
 const (
-	// MatchExactCanonical: the spec equalled a row's "vendor/id" exactly.
-	MatchExactCanonical MatchKind = iota
-	// MatchVendorAndID: the segment before the first slash named a vendor and
-	// the remainder named one of its models.
-	MatchVendorAndID
+	// MatchCanonical: the spec was a row's canonical "vendor/id".
+	//
+	// This is REQ-CAT-02 rule 2's FIRST TWO stages at once. "Exact-canonical"
+	// and "provider+ID" are the same lookup in this file format, because a
+	// row's canonical name IS its vendor id, a slash, and its model id, and
+	// Parse forbids a slash in a vendor id so the split is unambiguous.
+	// Keeping two constants for one lookup would offer callers a distinction
+	// they could never observe; the stages are collapsed deliberately, not
+	// accidentally.
+	MatchCanonical MatchKind = iota
 	// MatchBareID: the whole spec named exactly one model across all vendors.
 	MatchBareID
 	// MatchSiblingClone: a known vendor, an unknown id — REQ-CAT-03.
@@ -88,10 +96,8 @@ const (
 
 func (k MatchKind) String() string {
 	switch k {
-	case MatchExactCanonical:
-		return "exact-canonical"
-	case MatchVendorAndID:
-		return "vendor+id"
+	case MatchCanonical:
+		return "canonical"
 	case MatchBareID:
 		return "bare-id"
 	case MatchSiblingClone:
@@ -141,44 +147,39 @@ func (r Resolution) ResolvedModel() *core.Model { return r.Model }
 // read as vendor "deepseek-ai". This is not a heuristic about the string: it
 // is a lookup of the prefix in this catalog's vendor set.
 //
-// Rule 2 — matching proceeds exact-canonical, then vendor+id, then bare id,
-// each accepted only when unambiguous. The order is load-bearing: a catalog
-// that carries an OpenRouter row whose own id is literally
+// Rule 2 — matching proceeds exact-canonical, then provider+ID, then bare ID,
+// each accepted only when unambiguous. The first two are one map lookup here
+// (see MatchCanonical), and the order against bare ID is load-bearing: a
+// catalog carrying an OpenRouter row whose own id is literally
 // "anthropic/claude-opus-4-5" must still resolve the spec
-// "anthropic/claude-opus-4-5" to the Anthropic vendor, because vendor+id
-// outranks bare id.
+// "anthropic/claude-opus-4-5" to the Anthropic vendor.
 //
-// A known vendor with an unknown id is not a failure — it is REQ-CAT-03's
-// sibling clone. The only failures are "which vendor?" and "which of these?".
+// REQ-CAT-03's sibling clone is tried only after all three matching rules have
+// failed, which is stricter than trying it as part of the provider+ID stage: a
+// real row that matches the whole spec is a fact, and a clone is a documented
+// guess, so the fact wins. A known vendor with an unknown id is therefore not
+// a failure — the only failures are "which vendor?" and "which of these?".
 func (c *Catalog) Resolve(spec string) (Resolution, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
 		return Resolution{}, &ResolveError{Spec: spec, Err: ErrEmptySpec, Vendors: c.vendorIDs}
 	}
-
-	// Rule 2, pass 1: exact canonical "vendor/id".
-	//
-	// In a catalog whose vendor ids contain no slash (Parse enforces that)
-	// this pass is a fast path that pass 2 would also satisfy, since pass 2
-	// splits at the first slash and takes the whole remainder as the id. It is
-	// kept because REQ-CAT-02 names it first and because it is the pass that
-	// stays correct if a future format ever lets a row declare a canonical
-	// name of its own.
-	if e, ok := c.byCanonical[spec]; ok {
-		return hit(*e, MatchExactCanonical), nil
-	}
-
-	// Rule 1 + rule 2 pass 2: vendor prefix, honoured only for a known vendor.
 	prefix, rest, hasSlash := strings.Cut(spec, "/")
-	if hasSlash && rest != "" && c.KnownVendor(prefix) {
-		v := c.vendors[prefix]
-		if e, ok := c.byCanonical[prefix+"/"+rest]; ok {
-			return hit(*e, MatchVendorAndID), nil
-		}
-		return c.cloneSibling(v, rest), nil
+	vendorPrefix := hasSlash && rest != "" && c.KnownVendor(prefix) // rule 1
+
+	// A known vendor with an empty id ("anthropic/") names no model. Caught
+	// here so the failure is not reported as an unknown vendor, which it is not.
+	if hasSlash && rest == "" && c.KnownVendor(prefix) {
+		return Resolution{}, &ResolveError{Spec: spec, Err: ErrUnresolvedModel, Vendors: c.vendorIDs}
 	}
 
-	// Rule 2 pass 3: bare id, across every vendor, accepted only when unique.
+	// Rule 2, stages 1+2: exact canonical "vendor/id". Reached only when the
+	// prefix is a known vendor, since no canonical key exists otherwise.
+	if e, ok := c.byCanonical[spec]; ok {
+		return hit(*e, MatchCanonical), nil
+	}
+
+	// Rule 2, stage 3: bare id across every vendor, accepted only when unique.
 	if es := c.byBareID[spec]; len(es) == 1 {
 		return hit(es[0], MatchBareID), nil
 	} else if len(es) > 1 {
@@ -189,6 +190,11 @@ func (c *Catalog) Resolve(spec string) (Resolution, error) {
 		return Resolution{}, &ResolveError{
 			Spec: spec, Err: ErrAmbiguousModel, Candidates: cands, Vendors: c.vendorIDs,
 		}
+	}
+
+	// REQ-CAT-03: a known vendor, an id nobody has heard of. Not an error.
+	if vendorPrefix {
+		return c.cloneSibling(c.vendors[prefix], rest), nil
 	}
 
 	// Nothing matched. Distinguish "you named a vendor I do not have" from

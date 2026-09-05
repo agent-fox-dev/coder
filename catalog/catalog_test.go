@@ -51,7 +51,8 @@ const testCatalogJSON = `{
       "default_model": "anthropic/claude-opus-4-5",
       "models": {
         "anthropic/claude-opus-4-5": {"context_window": 200000, "max_tokens": 64000, "cost": {"input": 5, "output": 25}},
-        "deepseek-ai/DeepSeek-V3": {"context_window": 64000, "max_tokens": 8192, "cost": {"input": 0.3, "output": 0.9}}
+        "deepseek-ai/DeepSeek-V3": {"context_window": 64000, "max_tokens": 8192, "cost": {"input": 0.3, "output": 0.9}},
+        "openai/o4-preview": {"context_window": 200000, "max_tokens": 100000, "cost": {"input": 2, "output": 8}}
       }
     }
   }
@@ -161,6 +162,15 @@ func TestGoodCatalogNeverPanics(t *testing.T) {
 	}
 	if got := get().Version(); got != "test-1" {
 		t.Errorf("Version() = %q, want test-1", got)
+	}
+	// Parsed ONCE, not once per call: the accessor memoizes the value, which
+	// is the same property that makes the corrupt case re-panic with the
+	// stored value rather than re-deriving one (P-15).
+	if get() != get() {
+		t.Error("the catalog was re-parsed; onceCatalog must memoize")
+	}
+	if Default() != Default() {
+		t.Error("Default() re-parses the embedded catalog on every call")
 	}
 }
 

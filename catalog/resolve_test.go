@@ -26,8 +26,8 @@ func TestSlashPrefixHonouredOnlyForAKnownVendor(t *testing.T) {
 		if r.Model.Provider != "anthropic" || r.Model.ID != "claude-opus-4-5" {
 			t.Fatalf("resolved %s/%s, want anthropic/claude-opus-4-5", r.Model.Provider, r.Model.ID)
 		}
-		if r.Kind != MatchVendorAndID {
-			t.Errorf("Kind = %s, want vendor+id", r.Kind)
+		if r.Kind != MatchCanonical {
+			t.Errorf("Kind = %s, want canonical", r.Kind)
 		}
 	})
 
@@ -47,6 +47,21 @@ func TestSlashPrefixHonouredOnlyForAKnownVendor(t *testing.T) {
 		}
 		if r.Model.Cloned {
 			t.Error("this is a real catalog row, not a clone")
+		}
+	})
+
+	t.Run("unknown leading segment never becomes a vendor", func(t *testing.T) {
+		// Same shape, but nothing in the catalog matches the whole string. The
+		// prefix must still not be promoted to a vendor: there is no
+		// "deepseek-ai" row to clone from, so this is REQ-CAT-03's
+		// configuration error, not a sibling clone under some other vendor.
+		r, err := c.Resolve("deepseek-ai/DeepSeek-V4")
+		if err == nil {
+			t.Fatalf("resolved to %s/%s (cloned=%v); \"deepseek-ai\" is not a vendor",
+				r.Model.Provider, r.Model.ID, r.Model.Cloned)
+		}
+		if !errors.Is(err, ErrUnknownVendor) {
+			t.Errorf("error = %v, want ErrUnknownVendor", err)
 		}
 	})
 }
@@ -77,8 +92,8 @@ func TestVendorAndIDOutranksBareID(t *testing.T) {
 	if or.Model.Provider != "openrouter" || or.Model.ID != "anthropic/claude-opus-4-5" {
 		t.Fatalf("canonical resolve gave %s/%s", or.Model.Provider, or.Model.ID)
 	}
-	if or.Kind != MatchExactCanonical {
-		t.Errorf("Kind = %s, want exact-canonical", or.Kind)
+	if or.Kind != MatchCanonical {
+		t.Errorf("Kind = %s, want canonical", or.Kind)
 	}
 }
 
@@ -279,11 +294,10 @@ func TestResolutionExposesTheResolvedModel(t *testing.T) {
 
 func TestMatchKindString(t *testing.T) {
 	for k, want := range map[MatchKind]string{
-		MatchExactCanonical: "exact-canonical",
-		MatchVendorAndID:    "vendor+id",
-		MatchBareID:         "bare-id",
-		MatchSiblingClone:   "sibling-clone",
-		MatchKind(99):       "MatchKind(99)",
+		MatchCanonical:    "canonical",
+		MatchBareID:       "bare-id",
+		MatchSiblingClone: "sibling-clone",
+		MatchKind(99):     "MatchKind(99)",
 	} {
 		if got := k.String(); got != want {
 			t.Errorf("MatchKind(%d).String() = %q, want %q", uint8(k), got, want)
@@ -297,5 +311,37 @@ func TestVendorPrefixWithNoIDDoesNotCloneAnEmptyModel(t *testing.T) {
 	c := testCatalog(t)
 	if m, err := c.ResolveModel("anthropic/"); err == nil {
 		t.Fatalf("resolved to id %q; an empty model id is not a model", m.ID)
+	}
+}
+
+// TestAnExactRowBeatsASiblingClone: the test catalog carries an OpenRouter row
+// whose own id is literally "openai/o4-preview", and vendor "openai" has no
+// model "o4-preview". Both readings are available; the exact row is a measured
+// fact and the clone is a documented guess, so the fact wins. An
+// implementation that folds the clone into the provider+ID stage returns the
+// guess here — with OpenAI's price attached to a row that is not OpenAI's.
+func TestAnExactRowBeatsASiblingClone(t *testing.T) {
+	c := testCatalog(t)
+	r, err := c.Resolve("openai/o4-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Kind != MatchBareID || r.Model.Provider != "openrouter" {
+		t.Fatalf("resolved as %s to vendor %q, want a bare-id hit on openrouter",
+			r.Kind, r.Model.Provider)
+	}
+	if r.Model.Cloned {
+		t.Error("resolved to a clone while an exact row existed")
+	}
+}
+
+func TestVendorWithNoModelIDIsReportedAsSuch(t *testing.T) {
+	c := testCatalog(t)
+	_, err := c.ResolveModel("anthropic/")
+	if err == nil {
+		t.Fatal("resolved a spec with an empty model id")
+	}
+	if !strings.Contains(err.Error(), "no model id") {
+		t.Errorf("error = %q; \"anthropic\" is a known vendor, so blaming the vendor misleads", err)
 	}
 }
