@@ -3,7 +3,7 @@
 **Author:** [Platform Engineering]
 **Date:** 2026-09-05
 **Status:** Draft
-**Version:** 0.3.0
+**Version:** 0.3.1
 
 > **Revision note (0.3.0).** This revision incorporates a review of a shipped, zero-dependency
 > Go agent SDK and coding agent of comparable scope and identical constraints
@@ -12,6 +12,9 @@
 > real-world artifact to what this document specifies, and several of its shipped designs
 > **contradict** rather than extend the 0.2.0 draft. Those corrections are marked in place;
 > see [Appendix A](#appendix-a-prior-art-review) for the provenance and the full list.
+>
+> **0.3.1** adds REQ-PROV-11 **rule 2b**, found while implementing the spec: the seven repair
+> rules as written produce an invalid request on the commonest damaged transcript. See §6.2.
 
 ---
 
@@ -400,13 +403,16 @@ The `steering.md` convention used in the existing nightshift codebase is a degen
   |---|---|---|
   | 1 | Compute `same_model = (msg.provider, msg.api, msg.model) == target` per assistant message | Everything below depends on it |
   | 2 | Drop assistant messages whose `stop_reason` is `Error` or `Aborted` | Unsigned thinking blocks and partial tool calls with no results |
+| 2b | Drop any `ToolResultMessage` whose `tool_use_id` no longer exists in the repaired view | **Rule 2 orphans the results that answered the dropped turn.** Every provider 400s on a `tool_result` with no `tool_use` |
   | 3 | When not `same_model`: downgrade signed `ThinkingBlock`s to `TextBlock`s, drop `redacted` thinking blocks, strip `thought_signature` | Replaying another vendor's opaque signature is a hard 400 |
   | 4 | Demote `ThinkingBlock`s with a missing or empty `signature` to plain text; drop if empty | Anthropic rejects unsigned thinking replayed from an aborted stream |
   | 5 | When not `same_model`: rewrite tool-call IDs to the target's format (Anthropic: non-`[A-Za-z0-9_-]` → `_`, truncate 64) and apply the same mapping to every matching `tool_result` | Cross-provider replay rejected on ID format |
   | 6 | At every assistant→user boundary and at the end, insert a synthetic `ToolResultMessage{content: "No result provided", is_error: true}` for any `tool_use` with no matching result | Every provider 400s on an unanswered `tool_use` |
   | 7 | Replace `ImageBlock`s when `model.Input` lacks `image` (REQ-CAT-05) | 400 on an unsupported modality |
 
-  An orphaned `tool_use` is what every cancellation, crashed tool and killed process leaves behind. Repairing the view at serialization time — rather than on load, or by refusing to persist — keeps the durable log complete while guaranteeing a valid request. Rule 2 is lossy by design: the partial text of an aborted turn stays visible in the UI transcript and the session log but is invisible to the model on the next turn. Token accounting applies the same exclusion (REQ-GO-15).
+  **Rule 2b is not symmetry, it is a hole.** Rule 2 drops an aborted assistant message *including its `tool_use` blocks*, but the `ToolResultMessage`s that answered them are separate canonical messages and survive rule 2 untouched. Without 2b the pass emits an invalid request on the single commonest damaged transcript there is — Ctrl-C during a tool batch, then resume — which is to say it creates the exact failure it exists to prevent, and only on the resume path, which no single-process test exercises. This was found by implementing the seven rules literally and watching the test go red.
+
+An orphaned `tool_use` is what every cancellation, crashed tool and killed process leaves behind. Repairing the view at serialization time — rather than on load, or by refusing to persist — keeps the durable log complete while guaranteeing a valid request. Rule 2 is lossy by design: the partial text of an aborted turn stays visible in the UI transcript and the session log but is invisible to the model on the next turn. Token accounting applies the same exclusion (REQ-GO-15).
 - **REQ-PROV-12 (compatibility profiles):** "OpenAI-compatible" is not a base-URL swap. Each model resolves a **compatibility profile** — a struct of named quirk flags — inferred from `model.Provider` + `model.BaseURL` and overridable key-by-key from the catalog row's `Compat` field. The `openai-completions` profile must cover at minimum:
 
   | Flag | Effect | Vendors requiring the non-default |

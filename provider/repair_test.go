@@ -281,7 +281,7 @@ func TestRepairIsIdempotent(t *testing.T) {
 	in := core.Messages{
 		core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}},
 		core.AssistantMessage{
-			Content: core.Content{tu(t, "call_1", "read"), core.ThinkingBlock{Thinking: "x"}},
+			Content:    core.Content{tu(t, "call_1", "read"), core.ThinkingBlock{Thinking: "x"}},
 			StopReason: core.StopReasonToolUse, Provider: "acme", API: targetAPI, Model: "m1",
 		},
 	}
