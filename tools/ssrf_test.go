@@ -350,13 +350,14 @@ func TestTheResponseIsCappedAt512KB(t *testing.T) {
 
 	select {
 	case n := <-wrote:
-		if n >= total {
-			t.Fatalf("the server wrote all %d bytes; the client read the whole body into "+
-				"memory and only then truncated it", n)
-		}
-		if n > 4<<20 {
-			t.Fatalf("the server got %d bytes out before the client stopped reading, far "+
-				"past the %d cap", n, FetchResponseCap)
+		// The DISCRIMINATING bound is "not all of it": an uncapped client reads
+		// exactly `total`, a capped one stops early. How MUCH earlier depends
+		// on socket buffering and on how fast the runner notices the close, so
+		// a tight second bound measures the machine rather than the code — an
+		// earlier version asserted 4 MiB and flaked under -race at 4.26 MiB.
+		if n >= total/2 {
+			t.Fatalf("the server got %d of %d bytes out; the client read the whole body "+
+				"into memory and only then truncated it", n, total)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the server handler never finished")
