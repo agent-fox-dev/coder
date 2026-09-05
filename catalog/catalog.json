@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026-09-05",
+  "note": "SNAPSHOT. Every number below was correct on catalog_version and is stale the moment a vendor changes a price or ships a model. Regenerating this file is the REQ-CAT-06 ritual, and two fields must be diffed per model on every regeneration because they change the request body: thinking_level_map (REQ-PROV-15 -- an entry that silently disappears turns a clamped request into a 400, and an entry that silently appears sends a level the model does not know) and cost, including the vendor of fallback-served rows (REQ-PROV-05.5 -- dropping it bills a fallback at the wrong rate, silently). Everything else in a row is a capability hint the clamp and the budget gate can survive being slightly wrong about. This catalog is NOT an allowlist: an unknown id under a known vendor clones that vendor's default_model row (REQ-CAT-03), so a model released after this snapshot works without an SDK release.",
+  "vendors": {
+    "anthropic": {
+      "name": "Anthropic",
+      "api": "anthropic-messages",
+      "base_url": "https://api.anthropic.com",
+      "headers": { "anthropic-version": "2023-06-01" },
+      "default_model": "claude-sonnet-4-5",
+      "models": {
+        "claude-opus-4-5": {
+          "name": "Claude Opus 4.5",
+          "context_window": 200000,
+          "max_tokens": 64000,
+          "cost": { "input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "thinking_level_map": {
+            "off": "disabled",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          },
+          "note": "Effort-style reasoning control: the wire value is the effort token. 'minimal' is present-and-null because this row's effort ladder starts at 'low' -- see REQ-PROV-15 and ruling P-28: present-null and absent are the SAME at runtime, and the distinction exists only so the REQ-CAT-06 diff can tell 'we checked, it is unsupported' from 'we never looked'. xhigh and max are absent: they are opt-in. Cache write is the 5-minute rate (1.25x input); cache read is 0.1x input."
+        },
+        "claude-sonnet-4-5": {
+          "name": "Claude Sonnet 4.5",
+          "context_window": 200000,
+          "max_tokens": 64000,
+          "cost": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "thinking_level_map": {
+            "off": "disabled",
+            "minimal": "1024",
+            "low": "4096",
+            "medium": "16384",
+            "high": "32768"
+          },
+          "note": "Budget-style reasoning control: the wire value is a thinking token budget, not an effort token, which is why the map is deliberately opaque to everything above the adapter. 1024 is the vendor minimum. A 1M-token context window exists behind a beta header at premium pricing; this row is the un-beta'd shape, because sending max_tokens sized for 1M against a 200k request is the exact REQ-CAT-04 failure. Vendor default_model: the clone template for unknown anthropic ids."
+        },
+        "claude-haiku-4-5": {
+          "name": "Claude Haiku 4.5",
+          "context_window": 200000,
+          "max_tokens": 64000,
+          "cost": { "input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "thinking_level_map": {
+            "off": "disabled",
+            "minimal": "1024",
+            "low": "4096",
+            "medium": "16384",
+            "high": "32768"
+          },
+          "note": "Same budget-style control as sonnet-4-5 at the small-model price point."
+        }
+      }
+    },
+    "openai": {
+      "name": "OpenAI",
+      "api": "openai-completions",
+      "base_url": "https://api.openai.com/v1",
+      "default_model": "gpt-4o",
+      "models": {
+        "gpt-4o": {
+          "name": "GPT-4o",
+          "context_window": 128000,
+          "max_tokens": 16384,
+          "cost": { "input": 2.5, "output": 10.0, "cache_read": 1.25, "cache_write": 0.0 },
+          "input": ["text", "image"],
+          "reasoning": false,
+          "compat": {
+            "max_tokens_field": "max_tokens",
+            "supports_temperature": true,
+            "supports_parallel_tool_calls": true
+          },
+          "note": "No thinking_level_map at all: absent means unsupported (REQ-PROV-15), and ClampThinkingLevel therefore reports 'omit the key' rather than sending a level this model would 400 on. Cache write is free on this vendor; cache read is half of input. Vendor default_model: the clone template for unknown openai ids."
+        },
+        "gpt-4o-mini": {
+          "name": "GPT-4o mini",
+          "context_window": 128000,
+          "max_tokens": 16384,
+          "cost": { "input": 0.15, "output": 0.6, "cache_read": 0.075, "cache_write": 0.0 },
+          "input": ["text", "image"],
+          "reasoning": false,
+          "compat": {
+            "max_tokens_field": "max_tokens",
+            "supports_temperature": true,
+            "supports_parallel_tool_calls": true
+          }
+        },
+        "o3": {
+          "name": "o3",
+          "context_window": 200000,
+          "max_tokens": 100000,
+          "cost": { "input": 2.0, "output": 8.0, "cache_read": 0.5, "cache_write": 0.0 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "compat": {
+            "max_tokens_field": "max_completion_tokens",
+            "supports_temperature": false,
+            "supports_parallel_tool_calls": true,
+            "reasoning_effort_field": "reasoning_effort"
+          },
+          "thinking_level_map": {
+            "off": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          },
+          "note": "'off' is present-and-null: this model cannot be asked not to reason, and recording that explicitly is what makes the REQ-CAT-06 diff able to distinguish a checked fact from an unfilled row. It changes nothing at runtime (ruling P-28). 'minimal', 'xhigh' and 'max' are absent, so requesting max clamps DOWN to high -- REQ-PROV-15's own worked example. max_tokens_field is max_completion_tokens and temperature is rejected: that is what compat exists for, and a sibling clone of this row would inherit both."
+        }
+      }
+    }
+  }
+}
