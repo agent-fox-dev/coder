@@ -42,7 +42,7 @@ left to be discovered.
 | `catalog` | Embedded model catalog, resolution, sibling-cloning, `max_tokens` and thinking-level clamping. |
 | `session` | Append-only JSONL log, damage-tolerant loader, branch tree, resume fold. |
 | `skills` | Skill manifests (hand-rolled TOML subset), progressive disclosure, project context files, and the default-off trust gate. |
-| `tools` | Built-in tools, path containment, bounded accumulator, process control, glob, and a layered gitignore engine. |
+| `tools` | Built-in tools, path containment, bounded accumulator, process control, glob, a layered gitignore engine, and `fetch_url` behind an SSRF guard. |
 | `provider` | Send-time transcript repair, HTTP transport + retry, credential resolution, header precedence, cost arithmetic, SSE decoding — everything shared by every wire API. |
 | `provider/{anthropic,openai,google,ollama,faux}` | One wire API each, encode and decode. |
 | `difftest` | Separate module: the NFR-TEST-06/07 differential harness — canonicalizing comparator, key-order side channel, divergence ledger, exit machine. |
@@ -117,6 +117,23 @@ shallower one; a vendored dependency that is itself a git checkout does not
 inherit the outer project's rules. Without the boundary, a rule the outer
 project wrote about *its* build output silently deletes files from the listing
 of a repository that has never heard of it.
+
+**The SSRF guard validates at connect time, not only at resolution**
+([`tools/ssrf.go`](tools/ssrf.go)). Checking only the DNS answer leaves a
+TOCTOU window a rebind walks straight through: the name resolves to a public
+address for the check and to `169.254.169.254` for the connect, and the SDK
+fetches the cloud instance credentials on the attacker's behalf. The
+`Dialer.Control` check runs on the concrete address the kernel is about to
+connect to, and it is the one that actually holds.
+
+Two more that look like details and are not. **Every resolved address must
+pass, not merely the one we would have picked** — a name answering with one
+public and one private address *is* the attack, and "connect to the first
+permitted one" hands over a retry loop. And **an address is unmapped before
+classification**: `netip`'s own predicates unwrap `::ffff:10.0.0.1`, but
+`netip.Prefix.Contains` never matches across address families, so every range
+in the reserved table is reachable through its IPv4-mapped spelling unless you
+unmap first.
 
 **Compaction applies its checkpoint before estimating.** The naive reading
 oscillates: the compacted request reports small usage → the threshold passes →
@@ -275,12 +292,30 @@ confirmed to turn the corresponding test red:
 | Let a ledger entry cover any kind at its path | `TestClassificationAndStaleEntries` |
 | Treat a stale ledger entry as clean | `TestAStaleLedgerEntryExitsThree` |
 | Report a dark run as a pass | `TestADarkRunPrintsNoTally` |
+| Classify an address without unmapping 4-in-6 | `TestIPv4MappedIPv6IsUnmappedBeforeClassification` |
+| Validate only the first resolved address | `TestTheGuardRefusesEveryResolvedAddressNotJustTheFirst` |
+| Skip per-hop scheme re-validation | `TestARedirectToHTTPIsBlockedWhenHTTPIsNotAllowed` |
+| Read the whole body, then truncate | `TestTheResponseIsCappedAt512KB` |
+| Keep caller headers across a cross-host redirect | `TestCallerHeadersAreDroppedOnACrossHostRedirect` |
+| Unwire the schema cache from the request path | `TestTheProviderOwnsAPrefixByDefault` |
+| Buffer the response body before decoding | `TestFirstTokenIsEmittedBeforeTheStreamEnds` |
+| Run tool handlers sequentially | `TestParallelToolsUseTrueConcurrency` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
-Two attempts **failed to discriminate**, which is worth stating because a
+Six attempts **failed to discriminate**, which is worth stating because a
 mutation that does not distinguish the two implementations proves nothing
-about the test.
+about the test. Four came from one sitting on the SSRF guard, and each was a
+test that passed for a reason other than the one it claimed:
+
+| It looked like it tested | It actually passed because |
+|---|---|
+| 4-in-6 unmapping | the addresses chosen were ones `netip` already unwraps |
+| an https→http redirect refusal | the https URL pointed at a plain-HTTP server, so hop 1 died in the handshake |
+| the 512 KB read cap | slicing after an unbounded read produces an identical body |
+| header stripping across hosts | both hops dialled the same server, so the second never happened |
+
+All four were rewritten to fail against their mutation.
 
 The original abort test cancelled *before* the batch, where correct and broken
 implementations behave identically. It now cancels mid-batch, where the broken
@@ -315,7 +350,7 @@ Stated plainly so nobody reports it as done.
   per-vendor environment table, the three-valued credential state and the
   redaction boundary ship; the application-owned store and the
   refresh-under-lock do not.
-- **`fetch_url` and the SSRF guard.** Image normalization.
+- **Image normalization** (REQ-TOOL-14).
 - **Reference bodies for the differential harness.** The harness itself ships
   ([`difftest/`](difftest/), a separate module) and its own suite is
   mutation-verified. It has no scenarios, because NFR-TEST-06.3 forbids
