@@ -192,6 +192,45 @@ results.
 **Ollama reports failure inside a 200.** A top-level `error` string on an
 otherwise ordinary chunk. The transport layer cannot see it.
 
+## Performance budgets
+
+Four numeric budgets now have a benchmark **and a threshold test that fails the
+build** — a `Benchmark` function alone prints a number nobody reads, and
+NFR-PERF-09 is explicit that a budget which cannot fail does not constrain
+anything.
+
+| Budget | Measured | Threshold |
+|---|---|---|
+| NFR-PERF-01 loop overhead per turn | ~48 µs | < 1 ms |
+| NFR-PERF-06 cache hit over a direct return | ~0.8 µs | < 0.5 ms |
+| NFR-PERF-07 `cache_control` stamping, 128 tools / 1000 messages | ~47 ns | < 1 ms |
+| NFR-PERF-03 schemas serialized on a steady-state request | 0 | 0 |
+
+NFR-PERF-03 is asserted as a **count**, not a duration. "Computed once per
+session" has an exact answer, and a count does not flake on a busy runner.
+NFR-PERF-04 (true concurrency) and NFR-PERF-05 (first token before the body
+ends) are structural, and are pinned by tests that **deadlock** rather than by
+stopwatches — the broken implementation cannot reach the assertion at all.
+
+The budget file is `//go:build !race`: the detector inflates every measurement
+by roughly an order of magnitude, so a threshold loose enough to survive it is
+too loose to catch anything.
+
+**Writing these found two things.**
+
+REQ-CACHE-06's tool-schema cache was implemented, unit-tested, and attached to
+no provider — so every request re-serialized every schema, ~0.9 ms of a ~1.4 ms
+build at 128 tools. Same shape as the session log that was built, tested and
+never written to. It is wired now, and `TestASteadyStateRequestSerializesNoSchemas`
+is the assertion that was missing.
+
+NFR-PERF-01's "per turn" is under-specified. The REQ-GO-15 estimate and the
+REQ-PROV-11 repair pass are both O(history), so a turn 500 messages deep costs
+~1.7x a first turn. Both are well inside the budget; the depth term is reported
+by `BenchmarkLoopTurnAtDepth` and deliberately given **no** threshold, because
+inventing one the requirement does not state is the unenforceable rigour
+NFR-PERF-09 objects to.
+
 ## Testing
 
 `go test -race ./...` is the default gate for the root module;
@@ -288,9 +327,6 @@ Stated plainly so nobody reports it as done.
   it against *truth*, and the weaker claim is the honest one until then.
 - **`docs/PROVIDERS.md`** (NFR-COMPAT-07): the ledger of pinned API versions
   and capture dates. It has nothing to record until the harness has a corpus.
-- **Benchmarks.** Four numeric performance budgets have no acceptance
-  mechanism. Per the specification's own instruction, a budget with no
-  benchmark behind it constrains nothing.
 
 `search_files` (REQ-TOOL-05's grep tool, with `rg --json` acceleration) is not
 built. The ignore engine underneath it is, and `find_files` uses it.

@@ -61,9 +61,40 @@ type SyncReport struct {
 	Marshalled int
 }
 
-// Sync reconciles the current tool list against the cached prefix and returns
-// the serialized schemas in the same order.
+// Marshaller renders one tool's schema into its provider's dialect. It is a
+// parameter rather than a fixed json.Marshal because the dialects differ:
+// Gemini strips keywords and upper-cases types, and a cache keyed on the
+// canonical form would hand a provider the wrong bytes.
+type Marshaller func(*schema.Schema) (json.RawMessage, error)
+
+// Sync reconciles against the cached prefix using plain JSON Schema.
 func (p *ToolPrefix) Sync(tools []core.ToolWire) ([]json.RawMessage, SyncReport, error) {
+	return p.SyncWith(tools, func(s *schema.Schema) (json.RawMessage, error) {
+		return json.Marshal(s)
+	})
+}
+
+// SyncWith reconciles the current tool list against the cached prefix and
+// returns the serialized schemas, in the provider's own dialect, in order.
+//
+// A nil receiver is a working no-op that marshals every time. That is what
+// lets a provider hold an optional prefix without branching at the call site,
+// and what keeps BuildRequest usable from a test with no session behind it.
+func (p *ToolPrefix) SyncWith(tools []core.ToolWire, marshal Marshaller) ([]json.RawMessage, SyncReport, error) {
+	if p == nil {
+		var rep SyncReport
+		out := make([]json.RawMessage, len(tools))
+		for i, t := range tools {
+			raw, err := marshal(t.InputSchema)
+			if err != nil {
+				return nil, rep, err
+			}
+			rep.Marshalled++
+			out[i] = raw
+		}
+		return out, rep, nil
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.by == nil {
@@ -82,7 +113,7 @@ func (p *ToolPrefix) Sync(tools []core.ToolWire) ([]json.RawMessage, SyncReport,
 			continue
 		}
 
-		raw, err := json.Marshal(t.InputSchema)
+		raw, err := marshal(t.InputSchema)
 		if err != nil {
 			return nil, rep, err
 		}

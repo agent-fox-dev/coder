@@ -60,6 +60,14 @@ type Options struct {
 	// (REQ-PROV-05.5). Nil bills a fallback-served response at the requested
 	// model's rates and still records the served name.
 	BillingLookup func(string) *core.Model
+	// ToolPrefix is REQ-CACHE-06's per-session schema cache. Nil means this
+	// provider value owns one, which is the right scope in practice: a
+	// registry is built per agent config. Pass one explicitly to share it, or
+	// to read its reconciliation reports.
+	ToolPrefix *provider.ToolPrefix
+	// OnToolPrefixSync reports each reconciliation, so an embedder can feed
+	// REQ-CACHE-11's prefix-invalidation counter.
+	OnToolPrefixSync func(provider.SyncReport)
 	// Now is injectable for deterministic timestamps in tests.
 	Now func() time.Time
 	// MaxSSEEventBytes bounds one accumulated SSE event; zero is the default.
@@ -68,11 +76,17 @@ type Options struct {
 
 // Provider returns the registry entry (REQ-PROV-09).
 func Provider(opts Options) core.APIProvider {
-	c := &client{opts: opts}
+	c := &client{opts: opts, prefix: opts.ToolPrefix}
+	if c.prefix == nil {
+		c.prefix = &provider.ToolPrefix{}
+	}
 	return core.APIProvider{API: API, Stream: c.Stream}
 }
 
-type client struct{ opts Options }
+type client struct {
+	opts   Options
+	prefix *provider.ToolPrefix
+}
 
 func (c *client) now() time.Time {
 	if c.opts.Now != nil {
@@ -95,9 +109,12 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 		retention = *r
 	}
 
-	body, rep, err := BuildRequest(m, req, retention)
+	body, rep, sync, err := BuildRequestCached(m, req, retention, c.prefix)
 	if err != nil {
 		return core.ErrorStream(nil, fmt.Errorf("anthropic: building request: %w", err))
+	}
+	if fn := c.opts.OnToolPrefixSync; fn != nil {
+		fn(sync)
 	}
 	if rep.Changed() && o.Warnf != nil {
 		o.Warnf("anthropic: %s", rep.String())
