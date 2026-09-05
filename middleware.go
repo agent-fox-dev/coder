@@ -403,34 +403,16 @@ func (l *lru) len() int {
 // small interfaces plus a no-op default resolve it, and the OTel binding
 // becomes the host's — which is where it belongs anyway, since the host
 // already has a tracer configured.
-type Span interface {
-	SetAttributes(kv map[string]any)
-	SetStatus(err error)
-	AddEvent(name string, kv map[string]any)
-	End()
-}
+// Span, Tracer and NoopTracer are aliases of the core declarations. They moved
+// to core when REQ-OBS-02 put a span around every tool call: AgentConfig has to
+// hold a Tracer, and a tracer reachable only through Axis 1 middleware cannot
+// see a tool.
+type Span = core.Span
 
-// Tracer starts spans. StartSpan is callback-scoped and deliberately does NOT
-// take a context.Context: cancellation belongs to the work the callback closes
-// over, not to the tracing of it.
-type Tracer interface {
-	StartSpan(name string, fn func(Span) error) error
-}
+type Tracer = core.Tracer
 
-type noopSpan struct{}
-
-func (noopSpan) SetAttributes(map[string]any)    {}
-func (noopSpan) SetStatus(error)                 {}
-func (noopSpan) AddEvent(string, map[string]any) {}
-func (noopSpan) End()                            {}
-
-type noopTracer struct{}
-
-func (noopTracer) StartSpan(_ string, fn func(Span) error) error { return fn(noopSpan{}) }
-
-// NoopTracer is the shared, fieldless default. An untraced run neither
-// inspects nor retains what it is handed.
-var NoopTracer Tracer = noopTracer{}
+// NoopTracer is core.NoopTracer.
+var NoopTracer = core.NoopTracer
 
 // TracingMiddleware wraps every model call in a span carrying REQ-OBS-01's
 // attributes, plus REQ-CACHE-09's cache attributes when a cache decision was

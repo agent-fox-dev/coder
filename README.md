@@ -118,6 +118,21 @@ inherit the outer project's rules. Without the boundary, a rule the outer
 project wrote about *its* build output silently deletes files from the listing
 of a repository that has never heard of it.
 
+**The audit trail records an arguments HASH, never the arguments**
+([`audit.go`](audit.go)). REQ-OBS-05 says hash, and the word is the design: an
+audit trail is precisely the artifact that gets shipped to a log aggregator and
+retained for years, while tool arguments routinely carry file contents,
+credentials and personal data. A hash correlates the same call across sessions
+without making the audit log the largest copy of the data it describes.
+`server_name` is derived from the REQ-SEC-08 tool-name prefix, so it is right
+for any tool following the convention and *empty* — rather than wrong — for one
+that is not.
+
+**Session end fires on every exit**, clean, errored or aborted. A hook that
+fires only on the happy path is worse than none: an auditor cannot then
+distinguish a session that ended badly from one still running, which is the
+case they most need to see.
+
 **OAuth refresh is double-checked inside the lock**
 ([`provider/credentials.go`](provider/credentials.go)). Without the second
 check, N concurrent turns arriving on an expired token each POST the same
@@ -319,10 +334,14 @@ confirmed to turn the corresponding test red:
 | Take one global lock instead of a keyed one | `TestPerVendorLocksDoNotSerializeDifferentVendors` |
 | Never release a refcounted lock entry | `TestVendorLocksAreReleased` |
 | Rewrite a stored bearer into an API-key header | `TestACredentialStoreReachesEveryWire` |
+| Record tool arguments instead of their hash | `TestTheAuditTrailHashesArgumentsRatherThanRecordingThem` |
+| Fire session-end only on a clean run | `TestSessionStartAndEndFireOnEveryExit` |
+| Infer an MCP server from an unprefixed tool name | `TestMCPServerOf` |
+| Let a panicking observer unwind the run | `TestAPanickingAuditHookDoesNotTakeTheRunWithIt` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
-Six attempts **failed to discriminate**, which is worth stating because a
+Eight attempts **failed to discriminate**, which is worth stating because a
 mutation that does not distinguish the two implementations proves nothing
 about the test. Four came from one sitting on the SSRF guard, and each was a
 test that passed for a reason other than the one it claimed:
@@ -334,7 +353,10 @@ test that passed for a reason other than the one it claimed:
 | the 512 KB read cap | slicing after an unbounded read produces an identical body |
 | header stripping across hosts | both hops dialled the same server, so the second never happened |
 
-All four were rewritten to fail against their mutation.
+All four were rewritten to fail against their mutation. Two more came from the
+audit work: a `MCPServerOf` table with no local tool name containing the
+separator, and a panic mutation that still called `recover()` and so still
+swallowed the panic it was meant to release.
 
 The original abort test cancelled *before* the batch, where correct and broken
 implementations behave identically. It now cancels mid-batch, where the broken
