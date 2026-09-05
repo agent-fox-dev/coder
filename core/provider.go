@@ -114,18 +114,18 @@ type RequestOptions struct {
 // Model is REQ-PROV-10's descriptor. Provider is a VENDOR id used only for
 // credential resolution and catalog lookup; API selects the implementation.
 type Model struct {
-	ID            string                    `json:"id"`
-	Name          string                    `json:"name"`
-	API           API                       `json:"api"`
-	Provider      string                    `json:"provider"`
-	BaseURL       string                    `json:"base_url"`
-	Headers       map[string]*string        `json:"headers,omitzero"`
-	Compat        json.RawMessage           `json:"compat,omitzero"`
-	ContextWindow int                       `json:"context_window"`
-	MaxTokens     int                       `json:"max_tokens"`
-	Cost          Cost                      `json:"cost"`
-	Input         []string                  `json:"input"` // modalities: "text","image"
-	Reasoning     bool                      `json:"reasoning"`
+	ID            string             `json:"id"`
+	Name          string             `json:"name"`
+	API           API                `json:"api"`
+	Provider      string             `json:"provider"`
+	BaseURL       string             `json:"base_url"`
+	Headers       map[string]*string `json:"headers,omitzero"`
+	Compat        json.RawMessage    `json:"compat,omitzero"`
+	ContextWindow int                `json:"context_window"`
+	MaxTokens     int                `json:"max_tokens"`
+	Cost          Cost               `json:"cost"`
+	Input         []string           `json:"input"` // modalities: "text","image"
+	Reasoning     bool               `json:"reasoning"`
 	// ThinkingLevelMap distinguishes present-null ("explicitly unsupported")
 	// from absent. Both mean unsupported for clamping; the distinction is
 	// catalog-authoring metadata for the REQ-CAT-06 diff, not a runtime

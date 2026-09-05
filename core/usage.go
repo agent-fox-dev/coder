@@ -22,8 +22,8 @@ type Usage struct {
 	InputTokens  int64
 	OutputTokens int64
 	// ReasoningTokens is a SUBSET of OutputTokens, not an addend.
-	ReasoningTokens int64
-	CacheReadTokens int64
+	ReasoningTokens  int64
+	CacheReadTokens  int64
 	CacheWriteTokens int64
 	// CacheWrite1hTokens is a SUBSET of CacheWriteTokens (REQ-PROV-05.3).
 	CacheWrite1hTokens int64
@@ -58,7 +58,7 @@ func (u *Usage) SetField(f UsageField, v int64) {
 	u.Set |= f
 }
 
-func (u *Usage) SetCost(v float64) { u.CostUSD = v; u.Set |= UsageCostUSD }
+func (u *Usage) SetCost(v float64)    { u.CostUSD = v; u.Set |= UsageCostUSD }
 func (u Usage) Has(f UsageField) bool { return u.Set&f != 0 }
 
 // Add sums two usages field-wise and ORs their presence masks. The session

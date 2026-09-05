@@ -70,9 +70,9 @@ type SessionSnapshot struct {
 	// ProducerID must be compared BEFORE Revision: revisions from two
 	// producers are unordered, and a snapshot restored into a new Agent
 	// restarts the counter.
-	ProducerID string     `json:"producer_id"`
-	Revision   uint64     `json:"revision"`
-	Phase      Phase      `json:"phase"`
+	ProducerID string `json:"producer_id"`
+	Revision   uint64 `json:"revision"`
+	Phase      Phase  `json:"phase"`
 	// Idle false means the snapshot is consistent, not complete (REQ-LIFE-07).
 	Idle      bool       `json:"idle"`
 	SessionID string     `json:"session_id"`

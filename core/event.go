@@ -190,11 +190,11 @@ func (ToolExecutionEndEvent) EventType() EventType    { return EvToolExecutionEn
 func (ToolResultEvent) EventType() EventType          { return EvToolResult }
 func (ErrorEvent) EventType() EventType               { return EvError }
 
-func (TextDeltaEvent) Class() EventClass      { return ClassIncremental }
-func (ThinkingDeltaEvent) Class() EventClass  { return ClassIncremental }
-func (ToolInputDeltaEvent) Class() EventClass { return ClassIncremental }
+func (TextDeltaEvent) Class() EventClass           { return ClassIncremental }
+func (ThinkingDeltaEvent) Class() EventClass       { return ClassIncremental }
+func (ToolInputDeltaEvent) Class() EventClass      { return ClassIncremental }
 func (ToolExecutionUpdateEvent) Class() EventClass { return ClassIncremental }
-func (MessageUpdateEvent) Class() EventClass  { return ClassSnapshot }
+func (MessageUpdateEvent) Class() EventClass       { return ClassSnapshot }
 
 func (AgentStartEvent) Class() EventClass         { return ClassAuthoritative }
 func (AgentDoneEvent) Class() EventClass          { return ClassAuthoritative }
@@ -268,27 +268,27 @@ func (e ToolResultEvent) clone() Event {
 func (e ErrorEvent) clone() Event { return e }
 
 // size is an approximate payload cost used only by MaxPendingBytes.
-func (e AgentStartEvent) size() int             { return len(e.SessionID) + len(e.Model) + 64 }
-func (e AgentDoneEvent) size() int              { return 256 }
-func (e TurnStartEvent) size() int              { return 32 }
-func (e TurnEndEvent) size() int                { return contentSize(e.Message.Content) + 128 }
-func (e MessageStartEvent) size() int           { return contentSize(e.Message.Content) + 64 }
-func (e MessageUpdateEvent) size() int          { return contentSize(e.Message.Content) + 64 }
-func (e MessageEndEvent) size() int             { return contentSize(e.Message.Content) + 64 }
-func (e TextStartEvent) size() int              { return 32 }
-func (e TextDeltaEvent) size() int              { return len(e.Delta) + 32 }
-func (e TextEndEvent) size() int                { return len(e.Text) + 32 }
-func (e ThinkingStartEvent) size() int          { return 32 }
-func (e ThinkingDeltaEvent) size() int          { return len(e.Delta) + 32 }
-func (e ThinkingEndEvent) size() int            { return len(e.Thinking) + len(e.Signature) + 32 }
-func (e ToolCallStartEvent) size() int          { return len(e.ToolUseID) + len(e.Name) + 32 }
-func (e ToolInputDeltaEvent) size() int         { return len(e.Delta) + 32 }
-func (e ToolCallEndEvent) size() int            { return len(e.Block.Input) + 64 }
-func (e ToolExecutionStartEvent) size() int     { return len(e.Name) + 32 }
-func (e ToolExecutionUpdateEvent) size() int    { return len(e.Chunk) + 32 }
-func (e ToolExecutionEndEvent) size() int       { return contentSize(e.Result) + 64 }
-func (e ToolResultEvent) size() int             { return contentSize(e.Message.Content) + 64 }
-func (e ErrorEvent) size() int                  { return len(e.Message) + 32 }
+func (e AgentStartEvent) size() int          { return len(e.SessionID) + len(e.Model) + 64 }
+func (e AgentDoneEvent) size() int           { return 256 }
+func (e TurnStartEvent) size() int           { return 32 }
+func (e TurnEndEvent) size() int             { return contentSize(e.Message.Content) + 128 }
+func (e MessageStartEvent) size() int        { return contentSize(e.Message.Content) + 64 }
+func (e MessageUpdateEvent) size() int       { return contentSize(e.Message.Content) + 64 }
+func (e MessageEndEvent) size() int          { return contentSize(e.Message.Content) + 64 }
+func (e TextStartEvent) size() int           { return 32 }
+func (e TextDeltaEvent) size() int           { return len(e.Delta) + 32 }
+func (e TextEndEvent) size() int             { return len(e.Text) + 32 }
+func (e ThinkingStartEvent) size() int       { return 32 }
+func (e ThinkingDeltaEvent) size() int       { return len(e.Delta) + 32 }
+func (e ThinkingEndEvent) size() int         { return len(e.Thinking) + len(e.Signature) + 32 }
+func (e ToolCallStartEvent) size() int       { return len(e.ToolUseID) + len(e.Name) + 32 }
+func (e ToolInputDeltaEvent) size() int      { return len(e.Delta) + 32 }
+func (e ToolCallEndEvent) size() int         { return len(e.Block.Input) + 64 }
+func (e ToolExecutionStartEvent) size() int  { return len(e.Name) + 32 }
+func (e ToolExecutionUpdateEvent) size() int { return len(e.Chunk) + 32 }
+func (e ToolExecutionEndEvent) size() int    { return contentSize(e.Result) + 64 }
+func (e ToolResultEvent) size() int          { return contentSize(e.Message.Content) + 64 }
+func (e ErrorEvent) size() int               { return len(e.Message) + 32 }
 
 func contentSize(c Content) int {
 	n := 0

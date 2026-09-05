@@ -44,7 +44,7 @@ left to be discovered.
 | `skills` | Skill manifests (hand-rolled TOML subset), progressive disclosure, project context files, and the default-off trust gate. |
 | `tools` | Built-in tools, path containment, bounded accumulator, process control, glob + ignore. |
 | `provider` | Send-time transcript repair, HTTP transport + retry, credential resolution, header precedence, cost arithmetic, SSE decoding — everything shared by every wire API. |
-| `provider/{anthropic,openai,google,ollama,faux}` | One wire API each. Anthropic is full duplex; the other three encode only. |
+| `provider/{anthropic,openai,google,ollama,faux}` | One wire API each, encode and decode. |
 | `.` (root) | `Agent`, the loop, the batch executor, stop policies, the argument pipeline, compaction, Axis 1 middleware, `SubagentTool`, session resume. |
 
 ## The parts worth reading
@@ -139,6 +139,42 @@ message-per-result shape carries over, the `tool_call_id` keying does not,
 because the native Ollama tool message has no id field. Amended in 0.3.2 with
 the positional-pairing consequences spelled out.
 
+## Four wires, one conformance suite
+
+Anthropic, OpenAI, Google and Ollama all decode into the same canonical
+message, and [`provider/conformance_test.go`](provider/conformance_test.go)
+runs one set of fixtures — the same logical turn, four dialects — through all
+of them. The requirements it pins are stated once about "a provider", so they
+are tested once against every provider rather than four times in four
+dialects.
+
+The traps it catches are per-wire and would each pass a single-provider suite:
+
+**Cached tokens are netted out of input exactly once.** The OpenAI family and
+Google report a prompt total *inclusive* of cached tokens and must subtract;
+Anthropic reports input *exclusive* of them and must not. Both mistakes are
+silent and comparable in size — one overstates cost by up to ~90% on a
+well-cached loop, the other understates it by the same — so the netting lives
+in each decoder and the outcome is pinned centrally.
+
+**The cached count lives in three places.** `prompt_tokens_details.cached_tokens`
+(OpenAI, OpenRouter), `prompt_cache_hit_tokens` (DeepSeek), a top-level
+`cached_tokens` (Moonshot). Reading only the first is correct on OpenAI and
+silently full-prices every cached token on the two vendors whose caching is the
+reason to use them.
+
+**Gemini reports reasoning tokens beside output, not inside it.** Copying that
+shape through under-reports output by exactly the reasoning volume — the more
+the model thinks, the larger the error.
+
+**Ollama and Gemini synthesize tool-call ids.** Neither wire carries one;
+results pair positionally. The streaming and whole-response paths must
+synthesize the *same* id, or a replayed transcript stops matching its own
+results.
+
+**Ollama reports failure inside a 200.** A top-level `error` string on an
+otherwise ordinary chunk. The transport layer cannot see it.
+
 ## Testing
 
 `go test -race ./...` is the default gate. Tests were **mutation-verified**
@@ -161,13 +197,26 @@ confirmed to turn the corresponding test red:
 | Clamp an overlong `Retry-After` instead of abandoning | `TestOverlongServerDelayIsAbandonedNotClamped` |
 | Close a truncated JSON string instead of dropping it | `TestATruncatedMemberIsDroppedNotClosed` |
 | Dispatch a partially accumulated SSE event at EOF | `TestATruncatedFinalEventIsDiscardedNotDispatched` |
+| Skip the cache-token subtraction on OpenAI | `TestCachedTokensAreNettedOutOfInputExactlyOnce` |
+| Read only the nested `cached_tokens` arm | `TestTheCachedCountIsReadFromAllThreePlaces` |
+| Report Gemini thoughts beside output | `TestGeminiThoughtsAreInsideOutputNotBesideIt` |
+| Continue one text block across a Gemini function call | `TestTextAfterAToolCallStartsANewBlock` |
+| Ignore Ollama's error string inside a 200 | `TestOllamaReportsErrorsInsideA200Body` |
+| Synthesize tool-call ids from a global counter | `TestStreamingAndWholeResponsesAgree` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
-One test **failed to discriminate** and was replaced: the original abort test
-cancelled *before* the batch, which correct and broken implementations handle
-identically. It now cancels mid-batch, where the broken one runs 1 of 3
-handlers.
+Two attempts **failed to discriminate**, which is worth stating because a
+mutation that does not distinguish the two implementations proves nothing
+about the test.
+
+The original abort test cancelled *before* the batch, where correct and broken
+implementations behave identically. It now cancels mid-batch, where the broken
+one runs 1 of 3 handlers.
+
+The first id-synthesis mutation changed the streaming and whole-response paths
+identically, so the test that compares them stayed green. Replacing it with a
+global counter — the shape the real bug takes — turned it red.
 
 The dependency gate carries a third test asserting the cgo probe is armed:
 with `CGO_ENABLED=0` the toolchain excludes cgo files by build constraint, so
@@ -190,12 +239,6 @@ Stated plainly so nobody reports it as done.
   trust gate; the four plugin categories do not.
 - **OpenAI Responses.** It is a separate wire API, not this one with a flag —
   different message model, tool-call identity, reasoning replay and billing.
-- **Response decoding for OpenAI, Google and Ollama.** Those three implement
-  the request-building half only: `BuildRequest` is exported so the exact bytes
-  can be captured offline, but they have no `Stream`, so they cannot be
-  registered and run. Anthropic is complete in both directions, and the shared
-  layer it now sits on — transport retry, auth, headers, cost, SSE — is what
-  the remaining three need wiring to rather than reimplementing.
 - **Caching levels 2 and 3.** Level 0 (`prompt_cache_key`) and Level 1
   (Anthropic `cache_control` stamping) ship, and the dedup LRU of Level 2
   ships as `CachingMiddleware`; the tool-schema cache and deferred tool

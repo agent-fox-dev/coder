@@ -1,7 +1,6 @@
 package anthropic
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -151,55 +150,25 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	env := provider.Env{Override: req.Options.Env, Getenv: c.opts.Getenv}
 	auth := provider.ResolveAuth(VendorAuth, env)
 
-	base := c.opts.BaseURL
-	if m.BaseURL != "" {
-		base = m.BaseURL
-	}
-	if auth.BaseURL != "" {
-		base = auth.BaseURL
-	}
-	if base == "" {
-		base = DefaultBaseURL
-	}
-	url := strings.TrimRight(base, "/") + "/v1/messages"
+	url := provider.ResolveBaseURL(m, auth, defaultBase(c.opts.BaseURL)) + "/v1/messages"
 
-	newReq := func() (*http.Request, error) {
-		r, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
-		if err != nil {
-			return nil, err
-		}
-		plan := provider.PlanFor(m, auth, req.Options, c.opts.Attribution, env)
-		// Wire-protocol headers sit at the AUTH layer, so a caller can still
-		// override them through RequestOptions.Headers and suppress them with
-		// a nil (REQ-AUTH-02) — a gateway that speaks Messages under its own
-		// version header needs exactly that.
-		if plan.Auth == nil {
-			plan.Auth = map[string]*string{}
-		}
-		setDefault(plan.Auth, "content-type", "application/json")
-		setDefault(plan.Auth, "accept", "text/event-stream")
-		setDefault(plan.Auth, "anthropic-version", APIVersion)
-		if len(c.opts.Betas) > 0 {
-			setDefault(plan.Auth, "anthropic-beta", strings.Join(c.opts.Betas, ","))
-		}
-		plan.Apply(r)
-		return r, nil
+	headers := map[string]string{
+		"content-type":      "application/json",
+		"accept":            "text/event-stream",
+		"anthropic-version": APIVersion,
+	}
+	if len(c.opts.Betas) > 0 {
+		headers["anthropic-beta"] = strings.Join(c.opts.Betas, ",")
 	}
 
-	hc := c.opts.HTTPClient
-	if t := req.Options.Transport; t != nil {
-		hc = &http.Client{Transport: t}
+	call := provider.Call{
+		Method: http.MethodPost, URL: url, Body: raw, Headers: headers,
+		Auth: auth, Model: m, Options: req.Options,
+		Attribution: c.opts.Attribution, Env: env,
+		Client: c.opts.HTTPClient, Retry: c.opts.Retry,
 	}
 
-	policy := c.opts.Retry
-	if v := req.Options.MaxRetries; v != nil {
-		policy.MaxRetries = *v
-	}
-	if v := req.Options.MaxRetryDelayMs; v != nil {
-		policy.MaxRetryDelay = time.Duration(*v) * time.Millisecond
-	}
-
-	resp, err := provider.Do(ctx, hc, newReq, policy)
+	resp, err := call.Do(ctx)
 	if err != nil {
 		d.fail(transportError(ctx, err), err)
 		return
@@ -227,12 +196,13 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	d.finish(m, c.opts.BillingLookup)
 }
 
-func setDefault(m map[string]*string, k, v string) {
-	if _, ok := m[k]; ok {
-		return
+// defaultBase is the compiled-in fallback, kept as a function so the zero
+// Options value works without a constructor.
+func defaultBase(configured string) string {
+	if configured != "" {
+		return configured
 	}
-	val := v
-	m[k] = &val
+	return DefaultBaseURL
 }
 
 // transportError renders a transport failure as text the SEMANTIC retry layer
@@ -243,10 +213,7 @@ func transportError(ctx context.Context, err error) string {
 	if errors.Is(err, provider.ErrRetryDelayTooLong) {
 		return err.Error()
 	}
-	if ctx.Err() != nil {
-		return "Request was aborted"
-	}
-	return "anthropic: " + err.Error()
+	return provider.TransportErrorText("anthropic", ctx, err)
 }
 
 // statusError builds the error text for a non-2xx response.
@@ -256,18 +223,13 @@ func transportError(ctx context.Context, err error) string {
 // provider's prose loses the retry for a gateway that returns a 503 with an
 // empty body.
 func statusError(resp *http.Response) string {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	detail := strings.TrimSpace(string(body))
-	var we wireError
-	if json.Unmarshal(body, &we) == nil {
-		if s := we.String(); s != "" {
-			detail = s
+	return provider.StatusError("anthropic", resp, func(body []byte) string {
+		var we wireError
+		if json.Unmarshal(body, &we) == nil {
+			return we.String()
 		}
-	}
-	if detail == "" {
-		detail = http.StatusText(resp.StatusCode)
-	}
-	return fmt.Sprintf("anthropic: HTTP %d: %s", resp.StatusCode, detail)
+		return ""
+	})
 }
 
 // ---------------------------------------------------------------- decode state
@@ -488,7 +450,7 @@ func (d *decodeState) finish(m *core.Model, lookup func(string) *core.Model) {
 func (d *decodeState) fail(text string, err error) {
 	final := d.partial
 	final.Usage = d.usage
-	if text == "Request was aborted" {
+	if text == provider.AbortText {
 		final.StopReason = core.StopReasonAborted
 		final.ErrorMessage = text
 		d.s.Push(core.MessageEndEvent{Message: final})

@@ -213,7 +213,7 @@ func TestBatchTerminatesIsAnAnd(t *testing.T) {
 		votes []bool
 		want  bool
 	}{
-		{nil, false},              // an empty batch never terminates
+		{nil, false}, // an empty batch never terminates
 		{[]bool{true}, true},
 		{[]bool{true, false}, false}, // FAILS on OR semantics
 		{[]bool{true, true}, true},

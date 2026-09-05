@@ -120,10 +120,10 @@ func Opt(name string, s *Schema) Field  { return Field{Name: name, Schema: s} }
 
 // desc is variadic so both String() and String("...") read well; the §7
 // sketches use both spellings. Only the first element is used.
-func String(desc ...string) *Schema  { return prim(TypeString, desc) }
-func Int(desc ...string) *Schema     { return prim(TypeInteger, desc) }
-func Number(desc ...string) *Schema  { return prim(TypeNumber, desc) }
-func Bool(desc ...string) *Schema    { return prim(TypeBoolean, desc) }
+func String(desc ...string) *Schema { return prim(TypeString, desc) }
+func Int(desc ...string) *Schema    { return prim(TypeInteger, desc) }
+func Number(desc ...string) *Schema { return prim(TypeNumber, desc) }
+func Bool(desc ...string) *Schema   { return prim(TypeBoolean, desc) }
 
 func prim(t Type, desc []string) *Schema {
 	s := &Schema{Type: t}
@@ -161,11 +161,11 @@ func ConstNull() *Schema { return &Schema{Const: json.RawMessage("null"), HasCon
 
 // Modifiers mutate and return the receiver. That is safe because every
 // combinator above returns a freshly allocated Schema.
-func (s *Schema) Nullable_() *Schema             { s.Nullable = true; return s }
-func (s *Schema) Describe(d string) *Schema      { s.Description = d; return s }
-func (s *Schema) Min(v float64) *Schema          { s.Minimum = &v; return s }
-func (s *Schema) Max(v float64) *Schema          { s.Maximum = &v; return s }
-func (s *Schema) MinItemsN(n int) *Schema        { s.MinItems = &n; return s }
+func (s *Schema) Nullable_() *Schema        { s.Nullable = true; return s }
+func (s *Schema) Describe(d string) *Schema { s.Description = d; return s }
+func (s *Schema) Min(v float64) *Schema     { s.Minimum = &v; return s }
+func (s *Schema) Max(v float64) *Schema     { s.Maximum = &v; return s }
+func (s *Schema) MinItemsN(n int) *Schema   { s.MinItems = &n; return s }
 func (s *Schema) Closed() *Schema {
 	s.AdditionalProperties = &AdditionalProperties{Allowed: false}
 	return s
@@ -294,8 +294,8 @@ type ValidationError struct {
 	Args   jsonx.OrderedObject
 }
 
-func (e *ValidationError) Error() string          { return renderValidationError(e) }
-func (e *ValidationError) Is(target error) bool   { return target == ErrArgumentValidation }
+func (e *ValidationError) Error() string        { return renderValidationError(e) }
+func (e *ValidationError) Is(target error) bool { return target == ErrArgumentValidation }
 
 // DeleteOptionalNulls is REQ-TOOL-11 step 2. Constrained sampling forces the
 // model to emit every declared property, so optional fields arrive as explicit
