@@ -3,7 +3,7 @@
 **Author:** [Platform Engineering]
 **Date:** 2026-09-05
 **Status:** Draft
-**Version:** 0.3.1
+**Version:** 0.3.2
 
 > **Revision note (0.3.0).** This revision incorporates a review of a shipped, zero-dependency
 > Go agent SDK and coding agent of comparable scope and identical constraints
@@ -15,6 +15,9 @@
 >
 > **0.3.1** adds REQ-PROV-11 **rule 2b**, found while implementing the spec: the seven repair
 > rules as written produce an invalid request on the commonest damaged transcript. See §6.2.
+>
+> **0.3.2** corrects REQ-LOOP-02's wire table: Ollama's native API and Gemini's `generateContent`
+> pair tool results **positionally**, with no id on the wire at all. See §6.1.
 
 ---
 
@@ -307,7 +310,18 @@ The `steering.md` convention used in the existing nightshift codebase is a degen
   | Anthropic | Scan forward over consecutive `ToolResultMessage`s and emit them as ONE `{"role": "user"}` message whose content holds all N `tool_result` blocks. Splitting them across messages silently degrades parallel tool call quality. Non-`tool_result` content on those results must be displaced into sibling blocks positioned **after** every `tool_result` block — Anthropic rejects the interleaved mix. |
   | OpenAI (Chat Completions / Responses) | Emit N separate `{"role": "tool", "tool_call_id": ...}` messages, one per result. Grouping is not representable. |
   | Google Gemini | Emit one `functionResponse` part per result. |
-  | OpenRouter / Ollama | Follow the OpenAI-compatible shape. |
+  | OpenRouter | Follow the OpenAI-compatible shape. |
+| Ollama (native `/api/chat`) | Emit N separate `{"role":"tool"}` messages — but the native tool message has **no `tool_call_id`**, so results pair to the preceding assistant turn's calls **by position**. The message-per-result shape carries over from OpenAI; the id keying does not. |
+
+**Positional pairing is a third failure mode, not a variant of the first two.** On Ollama's native
+  API — and on Gemini's classic `generateContent`, where neither `functionCall` nor `functionResponse`
+  carries an id — results are matched by position (and at best by name). Three consequences follow, and
+  none of them can be fixed inside a provider: the ORDER of results is load-bearing, so a reorder
+  silently swaps two answers; a PARTIAL batch is inexpressible, which is what makes REQ-PROV-11 rule 6's
+  synthetic results load-bearing rather than defensive on these wires; and `is_error` has nowhere to go.
+  Two parallel calls to the SAME tool remain ambiguous even where a `tool_name` field exists. A canonical
+  layer keyed on `tool_use_id` is still correct — it is the only representation that can *survive* these
+  wires — but callers must know that identity is reconstructed, not transmitted.
 
   The provider-independent layer must never assume a grouping. A loop or storage layer that flattens results into content blocks of a shared user message discards `is_error`, tool name, timestamp and usage, and is unimplementable for three of the five first-class providers.
 - **REQ-LOOP-03:** Tool handler exceptions must be caught and converted to `ToolResultMessage{is_error: true}`. The loop continues rather than aborting.
