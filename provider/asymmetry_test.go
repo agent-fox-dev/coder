@@ -7,6 +7,7 @@ import (
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider/anthropic"
+	"github.com/agentfox/agentkit-go/provider/google"
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/schema"
 )
@@ -371,5 +372,136 @@ func TestRepairRunsInsideTheProviderNotTheLoop(t *testing.T) {
 	j, _ := json.Marshal(body)
 	if !strings.Contains(string(j), "tool_result") {
 		t.Fatal("no synthetic tool_result reached the wire")
+	}
+}
+
+// TestThreeWireShapesFromOneTranscript extends the asymmetry to the third
+// case, which is the one that settles the argument.
+//
+// With two providers it is possible to believe one shape is "canonical" and
+// the other an exception. Gemini is neither: tool results are functionResponse
+// PARTS, one per result, grouped into a single user-role content. So the three
+// first-class wire APIs give three genuinely different answers to "how are N
+// tool results carried" —
+//
+//	Anthropic  1 user message,  N tool_result BLOCKS
+//	OpenAI     N tool messages, 1 result each
+//	Gemini     1 user content,  N functionResponse PARTS
+//
+// No canonical grouping can be right for all three. That is the whole reason
+// REQ-LOOP-02 had to be corrected from a loop invariant to a provider concern.
+func TestThreeWireShapesFromOneTranscript(t *testing.T) {
+	amodel := &core.Model{ID: "claude-x", API: anthropic.API, Provider: "anthropic", MaxTokens: 4096}
+	omodel := &core.Model{ID: "gpt-x", API: openai.API, Provider: "openai", MaxTokens: 4096}
+	gmodel := &core.Model{ID: "gemini-x", API: google.API, Provider: "google", MaxTokens: 4096}
+
+	ab, _, err := anthropic.BuildRequest(amodel, req(t), core.CacheRetentionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ob, _, err := openai.BuildRequest(omodel, req(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gb, _, err := google.BuildRequest(gmodel, req(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Anthropic: one message carrying three tool_result blocks.
+	var a struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	mustUnmarshal(t, ab, &a)
+	aCarriers, aBlocks := 0, 0
+	for _, m := range a.Messages {
+		n := 0
+		for _, b := range m.Content {
+			if b.Type == "tool_result" {
+				n++
+			}
+		}
+		if n > 0 {
+			aCarriers, aBlocks = aCarriers+1, n
+		}
+	}
+
+	// OpenAI: three separate role:"tool" messages.
+	var o struct {
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+	}
+	mustUnmarshal(t, ob, &o)
+	oToolMsgs := 0
+	for _, m := range o.Messages {
+		if m.Role == "tool" {
+			oToolMsgs++
+		}
+	}
+
+	// Gemini: one user content carrying three functionResponse parts.
+	var g struct {
+		Contents []struct {
+			Role  string `json:"role"`
+			Parts []struct {
+				FunctionResponse *struct {
+					Name string `json:"name"`
+				} `json:"functionResponse"`
+			} `json:"parts"`
+		} `json:"contents"`
+	}
+	mustUnmarshal(t, gb, &g)
+	gCarriers, gParts := 0, 0
+	for _, c := range g.Contents {
+		n := 0
+		for _, p := range c.Parts {
+			if p.FunctionResponse != nil {
+				n++
+			}
+		}
+		if n > 0 {
+			gCarriers, gParts = gCarriers+1, n
+			if c.Role != "user" {
+				t.Errorf("Gemini function responses must ride on a %q content, got %q", "user", c.Role)
+			}
+		}
+	}
+
+	if aCarriers != 1 || aBlocks != 3 {
+		t.Errorf("Anthropic: %d carrier(s) with %d blocks, want 1 and 3", aCarriers, aBlocks)
+	}
+	if oToolMsgs != 3 {
+		t.Errorf("OpenAI: %d tool messages, want 3", oToolMsgs)
+	}
+	if gCarriers != 1 || gParts != 3 {
+		t.Errorf("Gemini: %d carrier(s) with %d parts, want 1 and 3", gCarriers, gParts)
+	}
+
+	// Gemini uses "model", never "assistant". Sending "assistant" is a silent
+	// 400 that no type in the SDK can catch.
+	for _, c := range g.Contents {
+		if c.Role == "assistant" {
+			t.Fatal(`Gemini uses role "model" for assistant turns; "assistant" is rejected`)
+		}
+	}
+
+	t.Logf("one transcript, three wire shapes: Anthropic %d messages, OpenAI %d messages, Gemini %d contents",
+		len(a.Messages), len(o.Messages), len(g.Contents))
+}
+
+func mustUnmarshal(t *testing.T, v any, into any) {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, into); err != nil {
+		t.Fatal(err)
 	}
 }

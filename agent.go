@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/session"
 )
 
 // Agent holds its own config, tool registry, history and middleware chain. It
@@ -57,6 +58,13 @@ type Agent struct {
 	cfg     core.AgentConfig
 	tools   []core.Tool
 	history *core.ConversationHistory
+	// rec is the single write path for anything that must survive a restart
+	// (REQ-SESS-03). It is never nil: with no SessionStore configured it is a
+	// recorder over a nil store, which still updates history. That uniformity
+	// is what stops the persisted and non-persisted paths drifting apart —
+	// the bug where a session log is built, tested, and never actually
+	// written to during a run.
+	rec *session.Recorder
 
 	// running is the run slot (REQ-LOOP-15). It is claimed BEFORE the queues
 	// are drained, under this one lock: claiming after draining lets a
@@ -113,6 +121,7 @@ func NewAgentWithHistory(cfg core.AgentConfig, h *core.ConversationHistory) (*Ag
 
 func newAgent(cfg core.AgentConfig, h *core.ConversationHistory) *Agent {
 	a := &Agent{producerID: newID("prod"), cfg: cfg, history: h}
+	a.rec = session.NewRecorder(cfg.SessionStore, h, cfg.OnPersistError)
 	a.tools = append(a.tools, cfg.ToolPolicy.CustomTools...)
 	return a
 }
@@ -274,56 +283,24 @@ func (a *Agent) SetModel(m *core.Model) error {
 		return fmt.Errorf("agentkit: SetModel(nil)")
 	}
 	a.mu.Lock()
-	store := a.cfg.SessionStore
 	a.cfg.Model = m
+	rec := a.rec
 	a.mu.Unlock()
 
-	if store == nil {
-		return nil
-	}
-	return a.appendEntry(core.Entry{
-		Type:        core.EntryModelChange,
-		ModelChange: &core.ModelChangeEntry{Provider: m.Provider, API: m.API, ModelID: m.ID},
-	})
+	_, err := rec.RecordModelChange(m.Provider, m.API, m.ID)
+	return err
 }
 
 // SetThinkingLevel changes the reasoning level mid-session and logs it
 // (REQ-SESS-03).
 func (a *Agent) SetThinkingLevel(l core.ThinkingLevel) error {
 	a.mu.Lock()
-	store := a.cfg.SessionStore
 	a.cfg.ThinkingLevel = l
+	rec := a.rec
 	a.mu.Unlock()
 
-	if store == nil {
-		return nil
-	}
-	return a.appendEntry(core.Entry{
-		Type:           core.EntryThinkingLevelChange,
-		ThinkingChange: &core.ThinkingLevelChangeEntry{Level: l},
-	})
-}
-
-// appendEntry writes to the session store and surfaces the error rather than
-// discarding it (REQ-SESS-08). Silent persistence failure is prohibited for an
-// embeddable library.
-func (a *Agent) appendEntry(e core.Entry) error {
-	a.mu.Lock()
-	store, onErr := a.cfg.SessionStore, a.cfg.OnPersistError
-	a.mu.Unlock()
-	if store == nil {
-		return nil
-	}
-	if e.Timestamp.IsZero() {
-		e.Timestamp = time.Now()
-	}
-	if err := store.Append(e); err != nil {
-		if onErr != nil {
-			onErr(err)
-		}
-		return err
-	}
-	return nil
+	_, err := rec.RecordThinkingLevel(l)
+	return err
 }
 
 // ------------------------------------------------------------------- queues

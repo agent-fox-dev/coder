@@ -145,9 +145,18 @@ func (a *Agent) runLoop(ctx context.Context, s *core.EventStream, initial *core.
 		runErr      error
 	)
 
+	// record is the ONLY path a message enters the run by. It goes through the
+	// recorder, so history and the durable log advance together and cannot
+	// drift: a message in history that never reached the log is exactly the
+	// state that makes a resumed session lose the last turn (REQ-SESS-01).
 	record := func(msgs ...core.Message) {
 		for _, m := range msgs {
-			a.history.Record(a.entryFor(m), m)
+			if _, err := a.rec.RecordMessage(m); err != nil {
+				// Persistence failures are surfaced, never swallowed
+				// (REQ-SESS-08), but they do not abort the run: losing the
+				// log is bad, losing the turn in flight is worse.
+				a.fireError(fmt.Errorf("agentkit: persisting message: %w", err))
+			}
 			newMessages = append(newMessages, m)
 		}
 	}

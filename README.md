@@ -13,11 +13,12 @@ go run ./examples/agentdemo
 ```
 
 The demo drives the real loop against a scripted provider with no network, and
-prints five behaviours that the specification originally got wrong.
+prints seven behaviours — five the specification originally got wrong, plus a
+kill-and-resume across two "processes" and three concurrent delegations.
 
 ## Status
 
-This implements the core of [`agent-kit-prd.md`](agent-kit-prd.md) v0.3.0.
+This implements the core of [`agent-kit-prd.md`](agent-kit-prd.md) v0.3.2.
 It is a working library with a thorough test suite; it is not a finished
 product. [What is not built](#what-is-not-built) is stated below rather than
 left to be discovered.
@@ -29,10 +30,11 @@ left to be discovered.
 | `core` | Canonical vocabulary and every interface seam: messages, content blocks, events, `EventStream`, `Tool`, `ProviderClient`. |
 | `catalog` | Embedded model catalog, resolution, sibling-cloning, `max_tokens` and thinking-level clamping. |
 | `session` | Append-only JSONL log, damage-tolerant loader, branch tree, resume fold. |
+| `skills` | Skill manifests (hand-rolled TOML subset), progressive disclosure, project context files, and the default-off trust gate. |
 | `tools` | Built-in tools, path containment, bounded accumulator, process control, glob + ignore. |
 | `provider` | Send-time transcript repair shared by every wire API. |
-| `provider/{anthropic,openai,faux}` | One wire API each. |
-| `.` (root) | `Agent`, the loop, the batch executor, stop policies, the argument pipeline, compaction. |
+| `provider/{anthropic,openai,google,ollama,faux}` | One wire API each. |
+| `.` (root) | `Agent`, the loop, the batch executor, stop policies, the argument pipeline, compaction, Axis 1 middleware, `SubagentTool`, session resume. |
 
 ## The parts worth reading
 
@@ -48,10 +50,26 @@ passes every Anthropic-only test.
 **One `ToolResultMessage` per call, and coalescing is the provider's job.**
 The specification called "all tool results in a single user message" a *loop*
 invariant and named splitting them the most common implementation mistake.
-Half right: it is an Anthropic **wire** rule, and on OpenAI the single-message
-form is not representable at all. `TestToolResultShapeAsymmetry` hands one
-transcript to both providers and gets **3 Anthropic messages and 6 OpenAI
-messages** out.
+It is an Anthropic **wire** rule. One canonical transcript with three parallel
+tool calls produces three genuinely different bodies:
+
+| Provider | Shape |
+|---|---|
+| Anthropic | 1 user message, 3 `tool_result` **blocks** |
+| OpenAI | 3 `role:"tool"` **messages**, keyed by `tool_call_id` |
+| Gemini | 1 user content, 3 `functionResponse` **parts** |
+
+With two providers you can still believe one shape is canonical and the other
+an exception. The third settles it. `TestThreeWireShapesFromOneTranscript`
+pins all three.
+
+Worse on two of those wires: **Ollama's native API and Gemini's
+`generateContent` carry no id at all**, so results pair *positionally*. Order
+is load-bearing, a partial batch is inexpressible (which is what makes the
+repair pass's synthetic results load-bearing rather than defensive), and
+`is_error` has nowhere to go. The canonical layer keyed on `tool_use_id` is
+still right — it is the only representation that survives these wires — but
+identity there is reconstructed, not transmitted.
 
 **`max_tokens` with tool calls executes none of them.** Streamed arguments are
 salvage-repaired into valid JSON, so a truncated `edit_file` whose
@@ -88,7 +106,7 @@ call. On OpenAI, where arguments ride as a JSON string, that changes the text
 the model is conditioned on and shifts the prompt-cache prefix — a silent cache
 miss on every later turn, visible only in the bill.
 
-## One correction to the specification
+## Two corrections to the specification
 
 Implementation found a hole in `REQ-PROV-11`, the send-time repair pass, and
 the PRD has been amended.
@@ -104,6 +122,12 @@ damaged transcript there is**: Ctrl-C during a tool batch, then resume.
 `TestRepairRule2bDropsResultOrphanedByRule2` red. The bug is reachable only on
 the resume path, which no single-process test exercises.
 
+The second is REQ-LOOP-02's wire table, which said "OpenRouter / Ollama:
+follow the OpenAI-compatible shape". Only three-quarters true: the
+message-per-result shape carries over, the `tool_call_id` keying does not,
+because the native Ollama tool message has no id field. Amended in 0.3.2 with
+the positional-pairing consequences spelled out.
+
 ## Testing
 
 `go test -race ./...` is the default gate. Tests were **mutation-verified**
@@ -118,6 +142,9 @@ confirmed to turn the corresponding test red:
 | Remove repair rule 2b | `TestRepairRule2bDropsResultOrphanedByRule2` |
 | Estimate on full history | `TestCompactionDoesNotOscillate` |
 | Add a cgo dependency | `TestNoCgoOutsideStdlib` |
+| Leave the session log unwired | `TestARunIsPersistedAsItHappens` |
+| Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
+| Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
 One test **failed to discriminate** and was replaced: the original abort test
 cancelled *before* the batch, which correct and broken implementations handle
@@ -140,12 +167,19 @@ Stated plainly so nobody reports it as done.
 - **MCP client and server.** Requires `mcp-go`, which under the dependency
   policy must live in a nested module, which requires a tagged root release
   first. An ordering constraint, not a defect.
-- **Skills, project context files, plugins.** `TrustProject` exists on the
-  config and gates nothing yet.
-- **Three of five wire APIs**: OpenAI Responses, Google, Ollama. Constants are
-  reserved.
-- **Caching levels 0, 2 and 3.** Anthropic `cache_control` stamping ships
-  (it is the dominant cost); the dedup LRU, schema cache and deferred tool
+- **Plugins** (§6.6). Skills and project context files now ship, with the
+  trust gate; the four plugin categories do not.
+- **OpenAI Responses.** It is a separate wire API, not this one with a flag —
+  different message model, tool-call identity, reasoning replay and billing.
+- **Provider response decoding.** All five providers implement the
+  request-building half: `BuildRequest` is exported so the exact bytes can be
+  captured offline, but there is no HTTP transport, no SSE/NDJSON decoding, no
+  usage/cost computation and no transport retry layer. Consequently
+  REQ-PROV-17's streaming-vs-whole byte-identity conformance test cannot be
+  written yet — only the encode direction is pinned.
+- **Caching levels 2 and 3.** Level 0 (`prompt_cache_key`) and Level 1
+  (Anthropic `cache_control` stamping) ship, and the dedup LRU of Level 2
+  ships as `CachingMiddleware`; the tool-schema cache and deferred tool
   loading do not.
 - **Auth beyond environment keys.** No credential store, no OAuth refresh.
 - **`fetch_url` and the SSRF guard.** Image normalization.
