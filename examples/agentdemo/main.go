@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	agentkit "github.com/agentfox/agentkit-go"
@@ -21,6 +22,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/faux"
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/session"
 )
 
 func main() {
@@ -29,6 +31,8 @@ func main() {
 	demoTruncatedToolCalls()
 	demoWireAsymmetry()
 	demoTranscriptRepair()
+	demoKillAndResume()
+	demoDelegation()
 }
 
 func rule(title string) {
@@ -354,4 +358,151 @@ func newAgent(p *faux.Provider) *agentkit.Agent {
 func fail(err error) {
 	fmt.Fprintf(os.Stderr, "agentdemo: %v\n", err)
 	os.Exit(1)
+}
+
+// ---------------------------------------------------------------------------
+
+func demoKillAndResume() {
+	rule("6. A session survives the process (REQ-SESS-01/02)")
+	fmt.Println("The durable unit is an append-only JSONL log, not a serialized message")
+	fmt.Println("array. Resuming is a FOLD over that log: it recovers the model, the")
+	fmt.Print("reasoning level and the branch, and the agent is CONSTRUCTED from them.\n\n")
+
+	dir, err := os.MkdirTemp("", "agentkit-demo-*")
+	if err != nil {
+		fail(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "session.jsonl")
+
+	// ---- Process 1.
+	store1, _, err := agentkit.OpenSession(path, session.Options{Durability: session.DurabilityPerEntry})
+	if err != nil {
+		fail(err)
+	}
+	p1 := faux.New(faux.Turn{
+		Blocks:     []core.ContentBlock{faux.FauxText("Paris.")},
+		StopReason: core.StopReasonStop,
+	})
+	a1 := newAgentWithStore(p1, store1)
+	if _, err := a1.Run(context.Background(), "What is the capital of France?"); err != nil {
+		fail(err)
+	}
+	fmt.Printf("  process 1 asked a question and got: %q\n", "Paris.")
+	_ = store1.Close()
+	fmt.Print("  ...process 1 exits.\n\n")
+
+	// ---- Process 2 reopens the same path.
+	store2, resume, err := agentkit.OpenSession(path, session.Options{Durability: session.DurabilityPerEntry})
+	if err != nil {
+		fail(err)
+	}
+	defer store2.Close()
+
+	fmt.Printf("  process 2 folded the log: %d messages recovered\n", len(resume.Messages))
+	fmt.Printf("  recovered provenance triple: provider=%q api=%q model=%q\n",
+		resume.Provider, resume.API, resume.ModelID)
+	fmt.Println("    (all THREE matter: two of them makes same_model false on the first")
+	fmt.Println("     post-resume request and silently strips every signed thinking block)")
+
+	p2 := faux.New(faux.Turn{
+		Blocks:     []core.ContentBlock{faux.FauxText("It has about 2.1 million people.")},
+		StopReason: core.StopReasonStop,
+	})
+	cfg := baseConfig(p2)
+	cfg.SessionStore = store2
+	a2, err := agentkit.NewAgentFromSession(cfg, resume,
+		func(string, core.API, string) (*core.Model, error) { return faux.Model(), nil })
+	if err != nil {
+		fail(err)
+	}
+	res, err := a2.Run(context.Background(), "And its population?")
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("\n  process 2 answered a follow-up: %q\n", res.FinalText())
+
+	sent := p2.Requests()[0].Messages
+	fmt.Printf("  the resumed request carried %d messages — the earlier turns survived.\n", len(sent))
+}
+
+// ---------------------------------------------------------------------------
+
+func demoDelegation() {
+	rule("7. Delegation hands out a FRESH child per call (REQ-MULTI-02/04)")
+	fmt.Println("SubagentTool takes a FACTORY, not an agent. A single shared child looks")
+	fmt.Println("correct and fails under exactly the condition delegation exists for: two")
+	fmt.Print("parallel calls, where the second finds the run slot taken.\n\n")
+
+	parent := faux.New(
+		faux.Turn{
+			Blocks: []core.ContentBlock{
+				faux.FauxToolCall("c1", "researcher", `{"prompt":"look up A"}`),
+				faux.FauxToolCall("c2", "researcher", `{"prompt":"look up B"}`),
+				faux.FauxToolCall("c3", "researcher", `{"prompt":"look up C"}`),
+			},
+			StopReason: core.StopReasonToolUse,
+		},
+		faux.Turn{Blocks: []core.ContentBlock{faux.FauxText("All three done.")},
+			StopReason: core.StopReasonStop},
+	)
+	cfg := baseConfig(parent)
+	cfg.ParallelTools = true
+	a, err := agentkit.NewAgent(cfg)
+	if err != nil {
+		fail(err)
+	}
+
+	var childPrompts []string
+	factory := func(ctx context.Context) (*agentkit.Agent, error) {
+		p := faux.New(faux.Turn{
+			Blocks:     []core.ContentBlock{faux.FauxText("found it")},
+			StopReason: core.StopReasonStop,
+		})
+		child, err := agentkit.NewAgent(baseConfig(p))
+		if err != nil {
+			return nil, err
+		}
+		return child, nil
+	}
+	if err := a.RegisterTool(agentkit.SubagentTool(a, factory,
+		agentkit.SubagentOptions{Name: "researcher"})); err != nil {
+		fail(err)
+	}
+
+	res, err := a.Run(context.Background(), "research three things in parallel")
+	if err != nil {
+		fail(err)
+	}
+	for _, m := range res.Messages {
+		if tr, ok := m.(core.ToolResultMessage); ok {
+			status := "ok"
+			if tr.IsError {
+				status = "ERROR"
+			}
+			childPrompts = append(childPrompts, fmt.Sprintf("%s=%s", tr.ToolUseID, status))
+		}
+	}
+	fmt.Printf("  three concurrent delegations: %s\n", strings.Join(childPrompts, "  "))
+	fmt.Printf("  parent: %q\n", res.FinalText())
+	fmt.Println("\n  With a shared child agent the second and third would be ErrBusy.")
+}
+
+func baseConfig(p *faux.Provider) core.AgentConfig {
+	return core.AgentConfig{
+		Model:        faux.Model(),
+		SystemPrompt: "You are a helpful assistant.",
+		StopPolicy:   agentkit.StopAfterTurns(8),
+		Providers:    core.ProviderRegistry{faux.API: p.APIProvider()},
+	}
+}
+
+func newAgentWithStore(p *faux.Provider, store core.SessionStore) *agentkit.Agent {
+	cfg := baseConfig(p)
+	cfg.SessionStore = store
+	a, err := agentkit.NewAgent(cfg)
+	if err != nil {
+		fail(err)
+	}
+	return a
 }
