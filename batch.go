@@ -63,8 +63,12 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 	// ---- Phase 1: prepare, strictly sequential.
 	for i, c := range calls {
 		i, c := i, c
-		s.Push(core.ToolCallStartEvent{BlockIndex: i, ToolUseID: c.ID, Name: c.Name})
-		s.Push(core.ToolCallEndEvent{BlockIndex: i, Block: c})
+		// No ToolCallStart/ToolCallEnd here. Those describe the MODEL emitting
+		// a tool call and are the provider's to push as it streams; the loop
+		// owns the EXECUTION triple (ToolExecutionStart/Update/End) and the
+		// finalized ToolResultEvent. REQ-LOOP-05 names the call events and
+		// REQ-OBS-06 names the execution ones — emitting both duplicates every
+		// call in any UI driven by the stream (ruling C19).
 
 		tool, known := byName[c.Name]
 		if !known {

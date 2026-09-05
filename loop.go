@@ -431,9 +431,9 @@ func (a *Agent) callModel(ctx context.Context, out *core.EventStream, view core.
 // transcript and the UI stay well-formed and the model can re-issue.
 func (a *Agent) synthesizeTruncated(s *core.EventStream, calls []core.ToolUseBlock) []core.ToolResultMessage {
 	out := make([]core.ToolResultMessage, 0, len(calls))
-	for i, c := range calls {
-		s.Push(core.ToolCallStartEvent{BlockIndex: i, ToolUseID: c.ID, Name: c.Name})
-		s.Push(core.ToolCallEndEvent{BlockIndex: i, Block: c})
+	for _, c := range calls {
+		// The execution triple only; the provider already emitted the call
+		// events as the model streamed them (ruling C19).
 		s.Push(core.ToolExecutionStartEvent{ToolUseID: c.ID, Name: c.Name})
 
 		text := fmt.Sprintf(maxTokensToolText, c.Name)
