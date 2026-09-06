@@ -163,6 +163,30 @@ not cancel the numeric `5`. Tearing a transport down cancels everything still
 in flight before waiting for it — otherwise one slow handler holds the
 shutdown open and then writes to a pipe that is already gone.
 
+**`search_files` has two backends and one declared contract**
+([`tools/search.go`](tools/search.go)). `rg --json` when it is on PATH,
+otherwise a complete native implementation — not a "fall back to `regexp`",
+which would return `node_modules`. REQ-TOOL-05 asks for a parity test pinning
+the fallback against whichever backend is present, and writing it is what
+found four places where the two disagreed: ripgrep only honours `.gitignore`
+inside a git repository, it parallelizes so truncation kept whichever N
+finished first, it emits each line once so two matches a line apart each lost
+the other from their context, and its `--stats` "searches" counts files that
+MATCHED — reporting 0 for a query that scanned the whole tree. A fifth came out
+of mutation testing: passing `--glob` lets ripgrep's dialect *narrow* the file
+set, and a post-filter can only remove matches, never recover a file ripgrep
+was told not to open.
+
+**Images are normalized at the history boundary, not inside tools**
+([`imagex/`](imagex/), [`images.go`](images.go)). REQ-TOOL-14's rule is that
+every image entering history is re-processed whichever tool produced it, and
+there is exactly one place they all pass through. It runs *after* the
+post-tool hook, because that hook is the one path that can add an image without
+any tool knowing. The budget is measured on **base64**, not decoded bytes:
+base64 is 4/3 the size of what it encodes, so budgeting the bytes ships an
+image a third over the limit it was checked against and nothing in the
+provider's error mentions base64.
+
 **A remote server's `endpoint` event may not leave its origin**
 ([`mcp/httpsse.go`](mcp/httpsse.go)). In the 2024-11-05 transport the server
 names the URL its client should POST to. Every POST carries the configured
@@ -173,16 +197,59 @@ against the stream's own URL and then checked: same scheme, same host, same
 port, or we do not send. Relative endpoints (`/messages?sessionId=…`) are the
 common case and are precisely what the rule makes safe.
 
-**The remote transports auto-negotiate, but only on the server's own answer.**
-`transport` unset POSTs as 2025-03-26 and falls back to 2024-11-05 when the
-server rejects the POST with 405/404/400 — the spec's own backwards-
-compatibility procedure, so an operator does not have to know which revision a
-third-party server implements. A 5xx or a transport failure never triggers the
-fallback: that is a working server having a bad day, and silently changing
-which revision we speak because of one turns a transient failure into a
-permanent misconfiguration. The fallback swaps the transport under a read loop
-that is parked inside the old one, so `Receive` carries a generation counter to
-tell "the transport under me was exchanged" from "the session ended".
+**The default tool set is platform-stable, `powershell` included**
+([`tools/powershell.go`](tools/powershell.go)). REQ-TOOL-06 asks for the second
+shell dialect as a *separately named* tool registered on every platform, with
+the platform check deferred to execution — and the reason is the tool list, not
+PowerShell. That list is the head of the cached prompt prefix, so a set that
+differed between a Linux runner and a Windows box would give each a different
+prefix hash and neither would ever hit the other's provider-side cache. The
+symptom would be a bill, not an error.
+
+**The edit fallback is a match key, never an output**
+([`tools/fold.go`](tools/fold.go)). REQ-TOOL-04d's whitespace-tolerant pass
+runs *only* after exact matching has failed for the whole batch, matches at
+line granularity, and splices whole **original** lines back — so every line the
+edit did not touch keeps its exact bytes, curly quotes and trailing spaces
+included. A pass that emitted its own fold would turn a one-line edit into a
+whole-file ASCII-ification nobody asked for. Trailing whitespace is folded and
+*leading* whitespace is not: indentation is semantic in Go, Python, YAML and
+Makefiles alike, and trimming it would let an edit match at the wrong nesting
+level. NFKC is not in the standard library, so this is a hand-rolled fold over
+the confusable set — the cost REQ-TOOL-04d says to pay deliberately.
+
+**MCP is pinned to `2026-07-28`, modern-only.** That revision removed the
+`initialize` handshake, protocol-level sessions and `Mcp-Session-Id`, `ping`,
+the HTTP GET stream and SSE resumability, and server-initiated requests.
+Version, identity and capabilities travel in every request's `_meta`;
+`server/discover` replaces the handshake as an *optional* probe; sampling
+becomes Multi Round-Trip Requests, where the server returns
+`resultType: "input_required"` and the client answers by **retrying** with
+`inputResponses` and the server's opaque `requestState`. The spec allows a
+*dual-era* implementation that also speaks the handshake — this one does not,
+by the decision recorded in PRD 0.4.0, and the cost is that a server which has
+not migrated is unreachable. A legacy `initialize` is answered with an error
+that NAMES the versions we speak, because a legacy client has no fall-forward
+mechanism and that message is the only diagnostic its user will ever see.
+
+**The MRTR retry loop is bounded.** The old server-initiated model made an
+unbounded exchange impossible by construction — the server asked, the client
+answered, the call continued. MRTR turns that into "the client retries the
+whole request", so a server returning `input_required` every time would hold a
+client forever. Three rounds, then an error.
+
+**Notifications are opt-in.** `subscriptions/listen` replaced the GET stream: a
+client names the types it wants and the server MUST NOT send one it did not
+name. A connection with no subscription receives nothing — which is why the
+tool cache also honours the `ttlMs` hint every list result now carries, since a
+client that never subscribed has no other way to learn its cache went stale.
+
+**Routing headers are derived from the body, never accepted from a caller.**
+Every POST carries `MCP-Protocol-Version`, `Mcp-Method` and — for `tools/call`
+and `resources/read` — `Mcp-Name`, base64-sentinel-encoded when the value is
+not header-safe ASCII. A server MUST reject a request whose headers disagree
+with its body (`-32020`), because two sources of truth is exactly the split
+that lets a gateway route on one request while the server executes another.
 
 **Pagination cursors name an entry, not an index.** Unregister a tool between
 two pages and an index-based cursor silently skips whatever moved into its
@@ -469,8 +536,6 @@ confirmed to turn the corresponding test red:
 | Serve MCP over HTTP with no API key | `TestHTTPModeRequiresAnAPIKey` |
 | Check the HTTP method before authenticating | `TestAuthenticationRunsBeforeTheMethodCheck` |
 | Resynchronize after a malformed MCP frame | `TestAMalformedFrameTearsTheConnectionDown` |
-| Answer a method before the MCP handshake completes | `TestAMethodBeforeInitializeIsRefused` |
-| Always answer `initialize` with our newest version | `TestTheServerEchoesAProtocolVersionItSpeaks` |
 | Advertise `listChanged` without ever sending it | `TestRegisteringAToolNotifiesConnectedClients` |
 | Notify a session that has not finished initializing | `TestNoNotificationBeforeTheHandshakeCompletes` |
 | Answer a request the client cancelled | `TestACancelledRequestStopsTheHandlerAndGoesUnanswered` |
@@ -481,14 +546,12 @@ confirmed to turn the corresponding test red:
 | Resume a listing AT the cursor's entry | `TestListingPagesAndResumesAfterTheCursor` |
 | Accept a cursor this server never issued | `TestAFabricatedCursorIsRefused` |
 | Bind MCP HTTP mode to every interface | `TestHTTPModeBindsLoopback` |
-| POST where a server's `endpoint` event points, off-origin | `TestAnEndpointOnAnotherOriginIsRefused` |
-| Compare endpoint origins without the port | `TestAnEndpointOnAnotherOriginIsRefused` |
-| Fall back to the older revision on a 5xx | `TestAutoDoesNotSwitchRevisionOnAServerError` |
-| Kill the session when the auto transport swaps | `TestAutoFallsBackToTheOlderRevision` |
-| Echo an unbounded server-chosen session id | `TestAnOversizedSessionIDIsRefused` |
-| Treat a 404 for a live session as any other error | `TestA404ForAKnownSessionIsDistinguishable` |
-| Treat 405 on the standalone GET as fatal | `TestAServerWithoutAStandaloneStreamStillWorks` |
 | Read an SSE-answered POST as JSON | `TestStreamableHTTPAcceptsAnSSEAnsweredPOST` |
+| Serve a request that carries no `_meta` version | `TestARequestWithoutProtocolVersionMetaIsRefused` |
+| Reject an old version without naming the supported set | `TestAnUnsupportedVersionIsRejectedWithTheSupportedList` |
+| Answer a legacy `initialize` with a bare method-not-found | `TestALegacyInitializeGetsADiagnosticNamingTheSupportedVersions` |
+| Keep answering `ping` after the revision removed it | `TestPingIsGone` |
+| Omit `server/discover` | `TestServerDiscoverAdvertisesVersionsAndCapabilities` |
 | Buffer an unbounded `data:` field | `TestAnOversizedSSELineIsRefused` |
 | Dispatch an event the stream ended in the middle of | `TestAStreamThatEndsMidEventIsAnError` |
 | Send `Bearer ` when the token variable is unset | `TestAHeaderThatResolvesToNothingIsDroppedNotSentBlank` |
@@ -505,6 +568,36 @@ confirmed to turn the corresponding test red:
 | Let a panicking observer unwind the run | `TestAPanickingAuditHookDoesNotTakeTheRunWithIt` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
+| Search without the ignore engine | `TestSearchSkipsIgnoredAndBinaryFiles` |
+| Let a nested repo's rules leak outward | `TestANestedRepositorysRulesDoNotLeakOutward` |
+| Read `case_sensitive` as a plain bool | `TestSmartCaseIsTheDefault` |
+| Let `rg` and the native backend disagree | `TestTheTwoBackendsAgree` |
+| Inherit ripgrep's glob dialect | `TestTheFileGlobUsesAgentKitsDialect` |
+| Forward an animated PNG to the provider | `TestAnimatedPNGIsRefused` |
+| Budget an image on decoded bytes, not base64 | `TestTheBudgetIsMeasuredOnBase64NotOnBytes` |
+| Re-encode an image that already fits | `TestAConformingImageIsReturnedByteForByte` |
+| Drop the alpha channel instead of compositing | `TestATransparentPNGIsFlattenedOntoWhite` |
+| Downscale by sampling rather than averaging | `TestDownscalingAveragesRatherThanSampling` |
+| Normalize images before the post-tool hook | `TestNormalizationRunsAfterThePostToolHook` |
+| Delete a tool's image when normalization fails | `TestANormalizationFailureKeepsTheOriginalBlock` |
+| Sort tool guidelines instead of first-seen order | `TestGuidelinesAreDeduplicatedPreservingFirstSeenOrder` |
+| Keep built-in blocks under a custom system prompt | `TestGoldenCustomSystemPrompt` |
+| Send the raw `SystemPrompt` instead of the assembled one | `TestTheAssembledPromptReachesTheProvider` |
+| Drop a caller's stop sequences silently | `TestAStopSequenceEitherTakesEffectOrIsReported` |
+| Nest a Responses tool under `function` | `TestAToolIsFlatNotNested` |
+| Collapse the composite `callId\|itemId` | `TestTheToolCallIdentityIsComposite` |
+| Reference the composite id from a tool output | `TestAFunctionCallOutputReferencesOnlyTheCallID` |
+| Lose the reasoning chain between turns | `TestReasoningIsReplayedWithItsItemIDAndEncryptedContent` |
+| Share compat keys between two wire APIs | `TestTheCompatProfileKeysAreDisjointFromChatCompletions` |
+| Seed tool arguments from the item placeholder | `TestAPlaceholderArgumentStringIsNotSeededIntoTheDeltas` |
+| Bump a pinned API version without the ledger | `TestTheProviderLedgerMatchesTheCode` |
+| Route `run_command` through a shell | `TestRunCommandDoesNotGoThroughAShell` |
+| Register `powershell` only where it runs | `TestPowerShellIsRegisteredOnEveryPlatform` |
+| Probe the platform at registration rather than on call | `TestPowerShellDefersItsPlatformCheckToExecution` |
+| Let a folded match beat an exact one | `TestAnExactMatchIsNeverOverriddenByAFoldedOne` |
+| Write the fold back instead of the original lines | `TestUntouchedLinesKeepTheirExactBytes` |
+| Fold leading whitespace away | `TestTrailingWhitespaceIsToleratedButLeadingIsNot` |
+| Apply the rescuable half of a batch | `TestAPartiallyRescuedBatchIsRejected` |
 
 Twelve attempts **failed to discriminate**, which is worth stating because a
 mutation that does not distinguish the two implementations proves nothing
@@ -552,9 +645,6 @@ Also included: `FuzzRepairAlwaysSendable` (432k executions clean),
 
 Stated plainly so nobody reports it as done.
 
-- **OpenAI Responses.** It is a separate wire API, not this one with a flag —
-  different message model, tool-call identity, reasoning replay and billing.
-- **Image normalization** (REQ-TOOL-14).
 - **Reference bodies for the differential harness.** The harness itself ships
   ([`difftest/`](difftest/), a separate module) and its own suite is
   mutation-verified. It has no scenarios, because NFR-TEST-06.3 forbids
@@ -564,22 +654,35 @@ Stated plainly so nobody reports it as done.
   exits 1, which is NFR-TEST-07.3's required answer rather than a bug. The
   unit suite pins the wire format against *regression*; only a reference pins
   it against *truth*, and the weaker claim is the honest one until then.
-- **SSE stream resumption.** All three of REQ-MCP-CLIENT-02's transports ship
-  — stdio against a real subprocess, and both HTTP revisions against real
-  `httptest` servers. What is *not* built is reconnecting a dropped event
-  stream with `Last-Event-ID`: an optional part of the 2025-03-26 spec that
-  needs a retry policy and duplicate suppression to be worth anything. The
-  decoder therefore parses `id:` and discards it, rather than storing an id it
-  would never send and implying support that is not there.
+- **The legacy MCP era.** AgentKit speaks `2026-07-28` and nothing else, so it
+  cannot talk to a server that has not migrated — which today is most of them.
+  This is a decision, not an oversight (PRD 0.4.0), and reversing it means
+  implementing the handshake era rather than setting a flag.
+- **MCP surface AgentKit never had.** Prompts, completions, elicitation,
+  resource subscriptions and the Tasks extension are defined by the revision
+  and not implemented here; `subscriptions/listen` ships, but only the
+  list-changed filters have producers.
 - **Plugin implementations.** The four categories, the registry, discovery, the
   lint and `validate-plugins` ship; no first-party plugin does. That is the
   intended shape — a plugin is the embedder's code — but it means the
   categories have no in-tree user yet.
-- **`docs/PROVIDERS.md`** (NFR-COMPAT-07): the ledger of pinned API versions
-  and capture dates. It has nothing to record until the harness has a corpus.
+- **A vendor capture behind the request goldens.**
+  [`docs/PROVIDERS.md`](docs/PROVIDERS.md) ships and is checked against the
+  code by a test, so a pin bump that forgets the ledger fails. Its capture-date
+  column is empty, and that is the honest state: `testdata/golden/request_*.json`
+  were produced by AgentKit, so they pin the wire format against *regression*
+  and say nothing about whether it still matches the vendor. Only a capture, or
+  the `difftest` harness above, pins it against *truth*.
+- **WebP normalization.** REQ-TOOL-14 downscales JPEG, PNG and GIF; the
+  standard library has no WebP decoder and REQ-GO-11 forbids the module that
+  does, so a WebP image is reported unsupported and kept as-is — which is what
+  REQ-TOOL-14.5 asks for on any failure, and a format providers accept anyway.
 
-`search_files` (REQ-TOOL-05's grep tool, with `rg --json` acceleration) is not
-built. The ignore engine underneath it is, and `find_files` uses it.
+All five wire APIs ship, including `openai-responses` as a separate
+implementation rather than `openai-completions` with a flag — the two differ in
+the message model, the tool-call identity model, reasoning replay, the caching
+parameters and the billing model, and a flag would branch on itself in every
+one of those places.
 
 ## License
 

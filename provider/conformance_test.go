@@ -15,6 +15,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/google"
 	"github.com/agentfox/agentkit-go/provider/ollama"
 	"github.com/agentfox/agentkit-go/provider/openai"
+	"github.com/agentfox/agentkit-go/provider/openairesponses"
 )
 
 // This file is the CROSS-PROVIDER conformance suite.
@@ -99,6 +100,22 @@ func cases() []wireCase {
 		`{"model":"llama-test","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":100,"eval_count":42}`,
 	}, "\n") + "\n"
 
+	// The Responses wire is EVENT-TYPED and item-addressed, so the same
+	// logical turn looks nothing like the Chat Completions one: text and the
+	// tool call are separate output items, and their arguments arrive as
+	// deltas on an item that was announced with an empty argument string.
+	resp := sse(
+		[2]string{"response.created", `{"type":"response.created","response":{"id":"resp_1","model":"gpt-resp-test","status":"in_progress"}}`},
+		[2]string{"response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`},
+		[2]string{"response.output_text.delta", `{"type":"response.output_text.delta","output_index":0,"delta":"Hello"}`},
+		[2]string{"response.output_item.done", `{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}}`},
+		[2]string{"response.output_item.added", `{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"edit_file","arguments":""}}`},
+		[2]string{"response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"{\"zebra\":"}`},
+		[2]string{"response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"1,\"apple\":2}"}`},
+		[2]string{"response.output_item.done", `{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"edit_file","arguments":"{\"zebra\":1,\"apple\":2}"}}`},
+		[2]string{"response.completed", `{"type":"response.completed","response":{"id":"resp_1","model":"gpt-resp-test","status":"completed","usage":{"input_tokens":1000,"output_tokens":42,"total_tokens":1042,"input_tokens_details":{"cached_tokens":900}}}}`},
+	)
+
 	key := func(string) string { return "test-key" }
 
 	return []wireCase{
@@ -142,6 +159,19 @@ func cases() []wireCase {
 			decode:     google.DecodeResponse,
 			cacheRead:  900,
 			truncateAt: `data: {"responseId":"resp_1","modelVersion":"gemini-test","candidates":[{"content":{"role":"model","parts":[{"functionCall"`,
+		},
+		{
+			name:     "openai-responses",
+			model:    model("gpt-resp-test", openairesponses.API, "openai"),
+			provider: openairesponses.Provider(openairesponses.Options{Getenv: key}),
+			stream:   resp,
+			whole: `{"id":"resp_1","model":"gpt-resp-test","status":"completed","output":[` +
+				`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]},` +
+				`{"type":"function_call","id":"fc_1","call_id":"call_1","name":"edit_file","arguments":"{\"zebra\":1,\"apple\":2}"}],` +
+				`"usage":{"input_tokens":1000,"output_tokens":42,"total_tokens":1042,"input_tokens_details":{"cached_tokens":900}}}`,
+			decode:     openairesponses.DecodeResponse,
+			cacheRead:  900,
+			truncateAt: "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1",
 		},
 		{
 			name:     "ollama-chat",
@@ -544,7 +574,7 @@ func TestTextAfterAToolCallStartsANewBlock(t *testing.T) {
 // TestOllamaReportsErrorsInsideA200Body is the failure shape that wire's
 // native API actually produces, and that the transport layer cannot see.
 func TestOllamaReportsErrorsInsideA200Body(t *testing.T) {
-	c := cases()[3]
+	c := caseNamed(t, "ollama-chat")
 	msg, _ := drive(t, c, 200, `{"error":"model \"nope\" not found, try pulling it first"}`+"\n")
 	if msg.StopReason != core.StopReasonError {
 		t.Fatalf("stop reason = %q, want error: Ollama returns 200 with a top-level "+
@@ -599,6 +629,21 @@ func TestACredentialStoreReachesEveryWire(t *testing.T) {
 	}
 }
 
+// caseNamed selects by NAME, not by index. An index broke silently the moment
+// a fifth wire was inserted ahead of the one it meant — the test kept running,
+// against the wrong provider, and reported a failure about Ollama that had
+// nothing to do with Ollama.
+func caseNamed(t *testing.T, name string) wireCase {
+	t.Helper()
+	for _, c := range cases() {
+		if c.name == name {
+			return c
+		}
+	}
+	t.Fatalf("no wire case named %q", name)
+	return wireCase{}
+}
+
 func withCredentials(t *testing.T, api string, creds *provider.Credentials) core.APIProvider {
 	t.Helper()
 	none := func(string) string { return "" }
@@ -611,7 +656,54 @@ func withCredentials(t *testing.T, api string, creds *provider.Credentials) core
 		return google.Provider(google.Options{Getenv: none, Credentials: creds})
 	case string(ollama.API):
 		return ollama.Provider(ollama.Options{Getenv: none, Credentials: creds})
+	case string(openairesponses.API):
+		return openairesponses.Provider(openairesponses.Options{Getenv: none, Credentials: creds})
 	}
 	t.Fatalf("no constructor for %q", api)
 	return core.APIProvider{}
+}
+
+// TestAStopSequenceEitherTakesEffectOrIsReported.
+//
+// The property is not "every wire sends stop_sequences": the Responses API has
+// no such parameter, so no implementation can. It is that a caller's stop
+// condition is never SILENTLY inert — either it reaches the wire, or the
+// provider says it could not send it.
+//
+// This exists because two providers dropped the field with neither, until the
+// NFR-TEST-08 request golden made the omission visible. That is the failure a
+// per-provider test set cannot catch: each provider's own tests pass, and the
+// field is simply absent from half the bodies.
+func TestAStopSequenceEitherTakesEffectOrIsReported(t *testing.T) {
+	const marker = "STOP-MARKER-42"
+	for _, c := range cases() {
+		t.Run(c.name, func(t *testing.T) {
+			var body []byte
+			var warnings []string
+			req := core.Request{
+				StopSequences: []string{marker},
+				Options: core.RequestOptions{
+					Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						body, _ = io.ReadAll(r.Body)
+						return &http.Response{StatusCode: 200, Header: http.Header{},
+							Body: io.NopCloser(strings.NewReader(c.stream))}, nil
+					}),
+				},
+			}
+			c.provider.Stream(context.Background(), c.model, req, core.ProviderStreamOptions{
+				Warnf: func(f string, a ...any) { warnings = append(warnings, fmt.Sprintf(f, a...)) },
+			}).Result()
+
+			if strings.Contains(string(body), marker) {
+				return
+			}
+			for _, w := range warnings {
+				if strings.Contains(w, "stop") {
+					return // not sent, and said so
+				}
+			}
+			t.Fatalf("the stop sequence neither reached the wire nor was reported.\n"+
+				"body = %s\nwarnings = %v", body, warnings)
+		})
+	}
 }

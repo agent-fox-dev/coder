@@ -56,8 +56,16 @@ func ApplyEdits(content string, edits []Edit) (string, int, error) {
 	}
 
 	// ---- Phase 2: not found.
+	//
+	// REQ-TOOL-04d's fallback hangs off this phase, and only this phase. An
+	// edit that was FOUND exactly is never re-matched leniently: the fold
+	// exists to rescue a batch that would otherwise be rejected outright, not
+	// to widen matching for one that already works.
 	for i, e := range edits {
 		if !strings.Contains(content, e.OldString) {
+			if out, n, ok := applyEditsFolded(content, edits); ok {
+				return out, n, nil
+			}
 			return "", 0, &EditError{Phase: "not_found", Index: i,
 				Text: fmt.Sprintf("edits[%d]: the string to replace was not found in the file.", i)}
 		}
@@ -156,4 +164,60 @@ func Restore(s string, bom bool, ending LineEnding) string {
 		s = "\ufeff" + s
 	}
 	return s
+}
+
+// applyEditsFolded is REQ-TOOL-04d's whitespace-tolerant pass.
+//
+// It runs only after exact matching has failed for the batch, and it reports
+// failure by returning ok=false rather than its own error: the caller then
+// emits the ORIGINAL phase-ordered rejection. A second, differently-worded
+// error from a fallback the model never asked for would tell it to fix the
+// wrong thing.
+//
+// Matching is per LINE BLOCK and the splice puts back whole ORIGINAL lines, so
+// every line outside a matched block keeps its exact bytes — the curly quotes
+// and trailing spaces that made the fold necessary in the first place survive
+// untouched. The fold is only ever a key.
+func applyEditsFolded(content string, edits []Edit) (string, int, bool) {
+	lines := strings.Split(content, "\n")
+	folded := foldLines(lines)
+
+	type block struct {
+		idx        int
+		start, end int // line range, half-open
+	}
+	blocks := make([]block, 0, len(edits))
+
+	for i, e := range edits {
+		needle := foldLines(strings.Split(e.OldString, "\n"))
+		start, end, count := findFoldedBlock(folded, needle)
+		// Every edit must match, and match exactly once. A batch where the
+		// fold rescues some edits and not others is not a batch the model
+		// meant, and applying the subset would be the silent partial
+		// application REQ-TOOL-04's phases exist to prevent.
+		if count != 1 {
+			return "", 0, false
+		}
+		blocks = append(blocks, block{idx: i, start: start, end: end})
+	}
+
+	sort.Slice(blocks, func(a, b int) bool { return blocks[a].start < blocks[b].start })
+	for k := 1; k < len(blocks); k++ {
+		if blocks[k-1].end > blocks[k].start {
+			return "", 0, false // overlapping blocks: same rejection as an exact overlap
+		}
+	}
+
+	// Splice right to left so earlier ranges stay valid.
+	out := append([]string(nil), lines...)
+	for k := len(blocks) - 1; k >= 0; k-- {
+		b := blocks[k]
+		replacement := strings.Split(edits[b.idx].NewString, "\n")
+		out = append(out[:b.start], append(replacement, out[b.end:]...)...)
+	}
+	joined := strings.Join(out, "\n")
+	if joined == content {
+		return "", 0, false // no-op, rejected exactly as the exact path rejects one
+	}
+	return joined, len(edits), true
 }

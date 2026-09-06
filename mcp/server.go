@@ -45,6 +45,14 @@ type ServerOptions struct {
 	// page: pagination costs a round trip, and a server with nine tools
 	// should not make its client pay for one.
 	PageSize int
+	// ListTTLMs is the ttlMs hint on every cacheable result (2026-07-28).
+	// Zero means "immediately stale", which is the honest answer for a
+	// registry a host can mutate at any moment through RegisterTool.
+	ListTTLMs int64
+	// CacheScope is "public" or "private". Empty means private: a tool list
+	// can encode which tools THIS caller may see, and a shared intermediary
+	// caching it publicly would serve one tenant's inventory to another.
+	CacheScope string
 }
 
 // Server is the AgentKit MCP server (REQ-MCP-SERVER-01..07).
@@ -246,16 +254,17 @@ func (s *Server) liveSessionsLocked() []*serverSession {
 	return out
 }
 
+// notifyAll delivers a change notification to every session that OPTED IN to
+// that type on a subscriptions/listen stream.
+//
+// 2026-07-28 inverted this. There is no longer a stream you open to receive
+// whatever the server feels like sending: a client names the types it wants,
+// and the server MUST NOT send one it did not name. A session with no listen
+// stream gets nothing at all, which is why a client that wants live updates
+// has to ask.
 func notifyAll(sessions []*serverSession, method string) {
 	for _, sess := range sessions {
-		// Only a session that finished initialize: the spec forbids traffic
-		// other than ping and logging before the handshake completes, and a
-		// list_changed arriving mid-handshake is a notification about a list
-		// the client has not yet been told exists.
-		if !sess.ready() {
-			continue
-		}
-		sess.send(Message{JSONRPC: Version, Method: method})
+		sess.notify(method, nil)
 	}
 }
 
@@ -266,11 +275,12 @@ type serverSession struct {
 	corr   *correlator
 	sendMu sync.Mutex
 
-	// initialized gates every method other than initialize and ping. The
-	// handshake is where the protocol version and the capability sets are
-	// agreed; answering tools/call before it means acting on a request whose
-	// wire contract was never settled.
-	initialized atomic.Bool
+	// sub is the filter this session opted in to, nil until it sends a
+	// subscriptions/listen. subID is that request's id, which tags every
+	// notification on the stream.
+	subMu sync.Mutex
+	sub   *SubscriptionFilter
+	subID ID
 
 	// inflight maps a request id to its cancellation. Cancellation is a
 	// notification, so it arrives on the SAME read loop that is not blocked on
@@ -289,7 +299,50 @@ type inflightRequest struct {
 	cancelled atomic.Bool
 }
 
-func (sess *serverSession) ready() bool { return sess.initialized.Load() }
+// notify sends one change notification if this session subscribed to its type.
+func (sess *serverSession) notify(method string, params any) {
+	sess.subMu.Lock()
+	sub := sess.sub
+	id := sess.subID
+	sess.subMu.Unlock()
+	if sub == nil || !subscribedTo(*sub, method) {
+		return
+	}
+	raw, err := json.Marshal(withSubscriptionID(params, id))
+	if err != nil {
+		return
+	}
+	sess.send(Message{JSONRPC: Version, Method: method, Params: raw})
+}
+
+// subscribedTo maps a notification method onto the filter field that opts in
+// to it. An unknown method is NOT sent: the rule is an allowlist, so a
+// notification type added later cannot leak to a client that never asked.
+func subscribedTo(f SubscriptionFilter, method string) bool {
+	switch method {
+	case MethodToolsChanged:
+		return f.ToolsListChanged
+	case MethodResourcesChanged:
+		return f.ResourcesListChanged
+	case MethodResourcesUpdated:
+		return len(f.ResourceSubscriptions) > 0
+	}
+	return false
+}
+
+// withSubscriptionID tags a notification with the stream it belongs to, so a
+// client running several can tell them apart.
+func withSubscriptionID(params any, id ID) map[string]any {
+	out := map[string]any{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err == nil {
+			_ = json.Unmarshal(raw, &out)
+		}
+	}
+	out["_meta"] = map[string]any{MetaSubscriptionID: id}
+	return out
+}
 
 func (sess *serverSession) track(key string, cancel context.CancelFunc) *inflightRequest {
 	req := &inflightRequest{cancel: cancel}
@@ -319,58 +372,72 @@ func (sess *serverSession) cancelRequest(key string) bool {
 
 type sessionKey struct{}
 
-// ErrNoBackChannel is returned by RequestSampling when the handler is running
-// on a transport that has none.
+// ErrNoBackChannel is retained as the error a handler gets if it asks for
+// input on a transport that cannot carry the retry.
 //
-// HTTP mode is request/response: there is no channel back to the client
-// between a request and its reply, so a sampling request cannot be expressed
-// at all. Failing with this rather than hanging is the difference between a
-// handler that reports the limitation and one that times out.
-var ErrNoBackChannel = errors.New("mcp: this transport has no back-channel for " +
-	"server-initiated requests (sampling needs stdio or a streaming transport)")
+// It is nearly unreachable now: MRTR needs no back-channel at all, because the
+// server answers and the CLIENT comes back. That is the point of the redesign
+// — the old model needed a stream the server could push a request onto, and
+// HTTP had none between a request and its reply.
+var ErrNoBackChannel = errors.New("mcp: this transport cannot carry a multi-round-trip retry")
 
-// RequestSampling asks the CLIENT to sample, from inside a tool handler
-// (REQ-MCP-CLIENT-08's server half).
-func RequestSampling(ctx context.Context, p SamplingParams) (SamplingResult, error) {
-	sess, ok := ctx.Value(sessionKey{}).(*serverSession)
-	if !ok || sess == nil {
-		return SamplingResult{}, ErrNoBackChannel
-	}
+// inputResponsesKey carries an MRTR retry's answers to the handler.
+type inputResponsesKey struct{}
+
+// MRTRContext is what a handler sees on a retry.
+type MRTRContext struct {
+	// Responses are the client's answers, keyed as the server keyed its
+	// requests.
+	Responses map[string]json.RawMessage
+	// RequestState is whatever the handler put in it last time. The client is
+	// required to treat it as opaque and hand it back unchanged.
+	RequestState string
+}
+
+// InputFrom returns the MRTR answers on a retry, and false on a first attempt.
+//
+// A handler that needs client-side work reads this FIRST: if the answers are
+// there, it is being re-invoked and should finish; if they are not, it returns
+// NeedInput and will be called again.
+func InputFrom(ctx context.Context) (MRTRContext, bool) {
+	v, ok := ctx.Value(inputResponsesKey{}).(MRTRContext)
+	return v, ok
+}
+
+// InputRequiredError is how a handler asks the client for something
+// (REQ-MCP-CLIENT-08, amended in 0.4.0).
+//
+// It is an ERROR value because a handler's signature returns (result, error)
+// and this is neither an ordinary result nor a failure. invoke recognises it
+// and turns it into the wire's InputRequiredResult.
+type InputRequiredError struct {
+	Requests     map[string]InputRequest
+	RequestState string
+}
+
+func (e *InputRequiredError) Error() string {
+	return fmt.Sprintf("mcp: handler needs %d client input(s) before it can complete",
+		len(e.Requests))
+}
+
+// NeedInput builds the error a handler returns to request input.
+//
+// state is handed back verbatim on the retry. It exists because the server
+// keeps NOTHING between the two calls — there is no session — so anything the
+// handler wants to remember has to travel through the client.
+func NeedInput(state string, requests map[string]InputRequest) error {
+	return &InputRequiredError{Requests: requests, RequestState: state}
+}
+
+// NeedSampling is the common case: ask the client to sample.
+func NeedSampling(state, key string, p SamplingParams) error {
 	raw, err := json.Marshal(p)
 	if err != nil {
-		return SamplingResult{}, err
+		return err
 	}
-	id, ch, err := sess.corr.next()
-	if err != nil {
-		return SamplingResult{}, err
-	}
-	msg, err := json.Marshal(Message{JSONRPC: Version, ID: id, Method: MethodSampling, Params: raw})
-	if err != nil {
-		sess.corr.forget(id)
-		return SamplingResult{}, err
-	}
-	sess.sendMu.Lock()
-	err = sess.tr.Send(msg)
-	sess.sendMu.Unlock()
-	if err != nil {
-		sess.corr.forget(id)
-		return SamplingResult{}, err
-	}
-
-	select {
-	case resp := <-ch:
-		if resp.Error != nil {
-			return SamplingResult{}, resp.Error
-		}
-		var out SamplingResult
-		if err := decodeParams(resp.Result, &out, wire.Limits{}); err != nil {
-			return SamplingResult{}, err
-		}
-		return out, nil
-	case <-ctx.Done():
-		sess.corr.forget(id)
-		return SamplingResult{}, ctx.Err()
-	}
+	return NeedInput(state, map[string]InputRequest{
+		key: {Method: MethodSampling, Params: raw},
+	})
 }
 
 // Serve runs the protocol over one transport until it ends (REQ-MCP-SERVER-02,
@@ -485,13 +552,18 @@ func (s *Server) Serve(ctx context.Context, tr Transport) error {
 	}
 }
 
-// handleNotification processes the two notifications a client sends us.
+// handleNotification processes the one notification a client still sends.
+//
+// notifications/initialized is gone with the handshake. On Streamable HTTP
+// notifications/cancelled is gone too — closing the response stream IS the
+// cancellation signal — so this path is stdio's alone.
 func (s *Server) handleNotification(sess *serverSession, m *Message) {
 	switch m.Method {
-	case MethodInitialized:
-		sess.initialized.Store(true)
 	case MethodCancelled:
-		var p CancelledParams
+		var p struct {
+			RequestID json.RawMessage `json:"requestId"`
+			Reason    string          `json:"reason,omitzero"`
+		}
 		if err := decodeParams(m.Params, &p, s.opts.Limits); err != nil {
 			s.warnf("undecodable cancellation: %v", err)
 			return
@@ -526,47 +598,49 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 
 	// Initialize-first, on connection-oriented transports only.
 	//
-	// HTTP mode is stateless per request: there is no connection for a
-	// handshake to be a property of, so there is nothing to enforce against
-	// and pretending otherwise would mean rejecting every HTTP call or
-	// inventing a session id the client never asked for. The API key is that
-	// mode's gate (REQ-MCP-SERVER-07).
-	if sess != nil && !sess.ready() && !allowedBeforeInit(m.Method) {
-		return nil, Errorf(CodeInvalidRequest,
-			"%q was called before the initialize handshake completed; send "+
-				"initialize and then notifications/initialized first", m.Method)
+	// 2026-07-28 has no handshake to enforce ordering against. What replaces
+	// it is a PER-REQUEST check: the version and capabilities arrive in
+	// `_meta` on every request, and a request that names a version we do not
+	// speak is rejected on its own rather than failing a connection nobody
+	// opened.
+	_ = sess
+	if rpcErr := s.checkVersion(m); rpcErr != nil {
+		return nil, rpcErr
 	}
 
 	switch m.Method {
 	case MethodInitialize:
-		var p InitializeParams
-		if err := decodeParams(m.Params, &p, s.opts.Limits); err != nil {
-			return nil, Errorf(CodeInvalidParams, "%v", err)
+		// Recognised, never implemented. A legacy client has no fall-forward
+		// mechanism, so this error message is the only diagnostic its user
+		// will ever see — naming the versions we speak is the difference
+		// between "method not found" and an actionable report. The spec makes
+		// this a SHOULD; dropping legacy support is our decision, so the
+		// resulting failure should not be mute.
+		return nil, &Error{
+			Code: CodeUnsupportedProtocolVersion,
+			Message: "this server implements MCP " + ProtocolVersion + ", which removed the " +
+				"initialize handshake; send requests directly with _meta instead",
+			Data: mustJSON(UnsupportedVersionData{
+				Supported: SupportedProtocolVersions(), Requested: "initialize (pre-2026-07-28)",
+			}),
 		}
-		if err := p.Validate(); err != nil {
-			return nil, Errorf(CodeInvalidParams, "%v", err)
-		}
-		caps := ServerCapabilities{}
-		caps.Tools = &struct {
-			ListChanged bool `json:"listChanged,omitzero"`
-		}{ListChanged: true}
-		caps.Resources = &struct {
-			Subscribe   bool `json:"subscribe,omitzero"`
-			ListChanged bool `json:"listChanged,omitzero"`
-		}{ListChanged: true}
-		return InitializeResult{
-			// REQ-MCP-SERVER-06: echo the client's version when we speak it,
-			// otherwise name ours. Always answering with our own turns a
-			// version a client explicitly asked for into one it has to detect
-			// we ignored.
-			ProtocolVersion: NegotiateProtocol(p.ProtocolVersion),
-			Capabilities:    caps,
-			ServerInfo:      s.opts.Info,
-			Instructions:    s.opts.Instructions,
+
+	case MethodDiscover:
+		// REQ-MCP-SERVER-06.1: servers MUST implement this.
+		s.mu.RLock()
+		caps := s.capabilities()
+		s.mu.RUnlock()
+		return DiscoverResult{
+			ResultType:        ResultComplete,
+			SupportedVersions: SupportedProtocolVersions(),
+			Capabilities:      caps,
+			Instructions:      s.opts.Instructions,
+			Meta:              &ResultMeta{ServerInfo: &s.opts.Info},
+			CacheHints:        s.cacheHints(),
 		}, nil
 
-	case MethodPing:
-		return struct{}{}, nil
+	case MethodSubscriptionsListen:
+		return s.listen(ctx, m)
 
 	case MethodToolsList:
 		var p ToolsListParams
@@ -575,7 +649,9 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 		}
 		s.mu.RLock()
 		names, next, perr := s.page(s.toolOrder, p.Cursor)
-		out := ToolsListResult{Tools: make([]ToolDefinition, 0, len(names)), NextCursor: next}
+		out := ToolsListResult{ResultType: ResultComplete, Meta: &ResultMeta{ServerInfo: &s.opts.Info},
+			CacheHints: s.cacheHints(),
+			Tools:      make([]ToolDefinition, 0, len(names)), NextCursor: next}
 		for _, n := range names {
 			out.Tools = append(out.Tools, s.tools[n].def)
 		}
@@ -596,15 +672,48 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 		if !ok {
 			return nil, Errorf(CodeMethodNotFound, "no tool named %q", p.Name)
 		}
+		// An MRTR retry carries the client's answers; a first attempt does not.
+		// Handing the handler the same context either way would make it
+		// impossible to tell which call this is.
+		if len(p.InputResponses) > 0 || p.RequestState != "" {
+			raw := make(map[string]json.RawMessage, len(p.InputResponses))
+			for k, v := range p.InputResponses {
+				b, merr := json.Marshal(v)
+				if merr != nil {
+					return nil, Errorf(CodeInvalidParams, "inputResponses[%q]: %v", k, merr)
+				}
+				raw[k] = b
+			}
+			ctx = context.WithValue(ctx, inputResponsesKey{},
+				MRTRContext{Responses: raw, RequestState: p.RequestState})
+		}
+
 		res, err := s.invoke(ctx, t, p)
 		if err != nil {
+			// A handler asking for input is neither a result nor a failure.
+			var need *InputRequiredError
+			if errors.As(err, &need) {
+				out := InputRequiredResult{
+					ResultType:   ResultInputRequired,
+					RequestState: need.RequestState,
+					Meta:         &ResultMeta{ServerInfo: &s.opts.Info},
+				}
+				if len(need.Requests) > 0 {
+					out.InputRequests = make(map[string]json.RawMessage, len(need.Requests))
+					for k, v := range need.Requests {
+						out.InputRequests[k] = mustJSON(v)
+					}
+				}
+				return out, nil
+			}
 			// A handler failure is a TOOL error, not a protocol error: the
 			// caller's model should see it and react, where a JSON-RPC error
 			// says the call never happened.
-			return ToolsCallResult{IsError: true,
+			return ToolsCallResult{ResultType: ResultComplete, IsError: true,
 				Content: []Content{{Type: "text", Text: err.Error()}}}, nil
 		}
 		res.Content = CapContent(res.Content)
+		res.ResultType = ResultComplete
 		return res, nil
 
 	case MethodResourcesList:
@@ -614,7 +723,9 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 		}
 		s.mu.RLock()
 		uris, next, perr := s.page(s.resOrder, p.Cursor)
-		out := ResourcesListResult{Resources: make([]Resource, 0, len(uris)), NextCursor: next}
+		out := ResourcesListResult{ResultType: ResultComplete, Meta: &ResultMeta{ServerInfo: &s.opts.Info},
+			CacheHints: s.cacheHints(),
+			Resources:  make([]Resource, 0, len(uris)), NextCursor: next}
 		for _, u := range uris {
 			out.Resources = append(out.Resources, s.resources[u].res)
 		}
@@ -627,6 +738,8 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 	case MethodResourceTemplatesList:
 		s.mu.RLock()
 		out := ResourceTemplatesListResult{
+			ResultType: ResultComplete, Meta: &ResultMeta{ServerInfo: &s.opts.Info},
+			CacheHints:        s.cacheHints(),
 			ResourceTemplates: make([]ResourceTemplate, 0, len(s.templates)),
 		}
 		for _, t := range s.templates {
@@ -645,10 +758,166 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 	return nil, Errorf(CodeMethodNotFound, "method %q is not implemented", m.Method)
 }
 
-// allowedBeforeInit is the pre-handshake allowlist. ping is here because a
-// client may legitimately probe liveness before it commits to a handshake.
-func allowedBeforeInit(method string) bool {
-	return method == MethodInitialize || method == MethodPing
+// checkVersion is REQ-MCP-SERVER-06.2.
+//
+// The version lives in the request's `_meta`, and a request that omits it is
+// not interpretable: without a handshake there is no earlier moment at which
+// it could have been agreed. Rejecting is the only honest answer — guessing
+// "probably the current one" is how a client speaking something else gets
+// served silently wrong semantics.
+func (s *Server) checkVersion(m *Message) *Error {
+	if m.Method == MethodInitialize {
+		return nil // answered with its own diagnostic below
+	}
+	// Read `_meta` WITHOUT binding the whole params object. Binding it here
+	// would decode every request twice — once against a probe struct that
+	// cannot know the method's own fields, and again in the handler — and the
+	// probe would reject the fields it does not model.
+	version, err := metaProtocolVersion(m.Params, s.opts.Limits)
+	if err != nil {
+		return Errorf(CodeInvalidParams, "%v", err)
+	}
+	if version == "" {
+		return &Error{
+			Code: CodeUnsupportedProtocolVersion,
+			Message: "every request must carry " + MetaProtocolVersion + " in _meta; " +
+				"this revision has no handshake in which to have agreed one",
+			Data: mustJSON(UnsupportedVersionData{Supported: SupportedProtocolVersions()}),
+		}
+	}
+	if !Supports(version) {
+		return &Error{
+			Code:    CodeUnsupportedProtocolVersion,
+			Message: "unsupported protocol version",
+			Data: mustJSON(UnsupportedVersionData{
+				Supported: SupportedProtocolVersions(), Requested: version,
+			}),
+		}
+	}
+	return nil
+}
+
+// metaProtocolVersion pulls one field out of a params object, bounds intact,
+// without binding the rest.
+func metaProtocolVersion(params []byte, limits wire.Limits) (string, error) {
+	if len(params) == 0 {
+		return "", nil
+	}
+	v, err := wire.Parse(params, limits)
+	if err != nil {
+		return "", err
+	}
+	meta, ok := v.Object[MetaKey]
+	if !ok {
+		return "", nil
+	}
+	ver, ok := meta.Object[MetaProtocolVersion]
+	if !ok {
+		return "", nil
+	}
+	return ver.String, nil
+}
+
+// capabilities is what this server advertises. Callers hold s.mu.
+func (s *Server) capabilities() ServerCapabilities {
+	caps := ServerCapabilities{}
+	caps.Tools = &struct {
+		ListChanged bool `json:"listChanged,omitzero"`
+	}{ListChanged: true}
+	caps.Resources = &struct {
+		Subscribe   bool `json:"subscribe,omitzero"`
+		ListChanged bool `json:"listChanged,omitzero"`
+	}{ListChanged: true}
+	return caps
+}
+
+// cacheHints is the freshness hint attached to every cacheable result.
+// stampRead fills in the fields every result owes the 2026-07-28 wire, so a
+// handler written by a host does not have to know about them.
+func (s *Server) stampRead(res ResourcesReadResult) ResourcesReadResult {
+	res.ResultType = ResultComplete
+	if res.Meta == nil {
+		res.Meta = &ResultMeta{ServerInfo: &s.opts.Info}
+	}
+	res.CacheHints = s.cacheHints()
+	return res
+}
+
+func (s *Server) cacheHints() CacheHints {
+	scope := s.opts.CacheScope
+	if scope == "" {
+		// Private by default. A tool list can encode which tools THIS caller is
+		// allowed to see, and a shared intermediary caching it publicly would
+		// serve one tenant's inventory to another.
+		scope = CachePrivate
+	}
+	return CacheHints{TTLMs: s.opts.ListTTLMs, CacheScope: scope}
+}
+
+func mustJSON(v any) json.RawMessage {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+// listen implements subscriptions/listen (REQ-MCP-SERVER-06.5).
+//
+// The request does not return until the subscription ends. That is the whole
+// design: its RESPONSE STREAM is the channel, so the notifications flow on the
+// still-open response of this request, and the result that finally arrives
+// means the server tore the subscription down.
+//
+// It therefore blocks a dispatch goroutine for the life of the stream, which
+// is only safe because Serve dispatches each request on its own goroutine.
+func (s *Server) listen(ctx context.Context, m *Message) (any, *Error) {
+	sess, _ := ctx.Value(sessionKey{}).(*serverSession)
+	if sess == nil {
+		// HTTP mode answers one request per connection and returns; there is
+		// no session object to hang a long-lived stream on. Saying so beats
+		// holding the request open forever and returning nothing.
+		return nil, Errorf(CodeInvalidRequest,
+			"subscriptions/listen needs a connection-oriented transport")
+	}
+	var p SubscriptionsListenParams
+	if err := decodeParams(m.Params, &p, s.opts.Limits); err != nil {
+		return nil, Errorf(CodeInvalidParams, "%v", err)
+	}
+	if !p.Notifications.Any() {
+		// A stream that opted into nothing would stay open forever delivering
+		// nothing, which is indistinguishable from a hung server.
+		return nil, Errorf(CodeInvalidParams,
+			"subscriptions/listen must opt in to at least one notification type")
+	}
+
+	sess.subMu.Lock()
+	if sess.sub != nil {
+		sess.subMu.Unlock()
+		return nil, Errorf(CodeInvalidRequest, "this session already has a subscription")
+	}
+	filter := p.Notifications
+	sess.sub, sess.subID = &filter, m.ID
+	sess.subMu.Unlock()
+
+	defer func() {
+		sess.subMu.Lock()
+		sess.sub = nil
+		sess.subMu.Unlock()
+	}()
+
+	// Acknowledge, then block. The ack is what tells the client the stream is
+	// live; without it a client cannot distinguish "subscribed and quiet" from
+	// "the request never arrived".
+	sess.send(Message{JSONRPC: Version, Method: MethodSubscriptionsAck,
+		Params: mustJSON(withSubscriptionID(nil, m.ID))})
+
+	<-ctx.Done()
+	id := m.ID
+	return SubscriptionsListenResult{
+		ResultType: ResultComplete,
+		Meta:       &ResultMeta{ServerInfo: &s.opts.Info, SubscriptionID: &id},
+	}, nil
 }
 
 // readResource resolves a URI against the exact registrations first, then the
@@ -668,7 +937,7 @@ func (s *Server) readResource(ctx context.Context, uri string) (any, *Error) {
 		if err != nil {
 			return nil, Errorf(CodeInternalError, "%v", err)
 		}
-		return res, nil
+		return s.stampRead(res), nil
 	}
 
 	for _, t := range templates {
@@ -680,8 +949,11 @@ func (s *Server) readResource(ctx context.Context, uri string) (any, *Error) {
 		if err != nil {
 			return nil, Errorf(CodeInternalError, "%v", err)
 		}
-		return res, nil
+		return s.stampRead(res), nil
 	}
+	// -32602, not -32002: 2026-07-28 moved resource-not-found onto the
+	// JSON-RPC Invalid Params code, because a URI the server does not host is
+	// a bad parameter and not a protocol-level condition.
 	return nil, Errorf(CodeInvalidParams, "no resource at %q", uri)
 }
 
@@ -738,7 +1010,13 @@ func (s *Server) invoke(ctx context.Context, t registeredTool, p ToolsCallParams
 			// for every other one.
 			err = fmt.Errorf("mcp: handler for %q panicked: %v", p.Name, r)
 		}
-		s.audit(p, err != nil || res.IsError)
+		// An input request is not a failed call: the handler has not finished
+		// and will be called again. Auditing it as an error would double-count
+		// every MRTR flow as a failure plus a success.
+		var need *InputRequiredError
+		if !errors.As(err, &need) {
+			s.audit(p, err != nil || res.IsError)
+		}
 	}()
 	return t.handler(ctx, p.Arguments)
 }
@@ -782,6 +1060,11 @@ type HTTPOptions struct {
 	Headers []string
 	// MaxBodyBytes bounds a request body. Zero uses the wire default.
 	MaxBodyBytes int64
+	// AllowedOrigins is the Origin allowlist. Empty REFUSES every request that
+	// carries an Origin header at all, which is the safe default for a server
+	// whose whole audience is local processes: a browser always sends one, a
+	// local MCP client never does.
+	AllowedOrigins []string
 }
 
 // ErrNoAPIKey is REQ-MCP-SERVER-07's refusal.
@@ -812,8 +1095,16 @@ func (s *Server) HTTPHandler(opts HTTPOptions) (http.Handler, error) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		// 2026-07-28 removed the GET endpoint: POST is the only verb.
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// Origin validation, against DNS rebinding. A browser page on any
+		// origin can POST to a localhost server; without this check that page
+		// reaches every tool the server exposes.
+		if !s.originAllowed(r, opts.AllowedOrigins) {
+			http.Error(w, "forbidden origin", http.StatusForbidden)
 			return
 		}
 
@@ -834,8 +1125,24 @@ func (s *Server) HTTPHandler(opts HTTPOptions) (http.Handler, error) {
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
+		// Header/body agreement (-32020). The headers exist so a gateway can
+		// route without parsing the body; if the two disagree, the gateway and
+		// the server are acting on different requests, which is the exact
+		// split this check exists to prevent.
+		if mismatch := validateRoutingHeaders(r.Header, &m); mismatch != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			writeRPC(w, Message{JSONRPC: Version, ID: m.ID, Error: mismatch})
+			return
+		}
 
 		result, rpcErr := s.dispatch(r.Context(), &m)
+		if rpcErr != nil && rpcErr.Code == CodeUnsupportedProtocolVersion {
+			// The spec pins the status for this one: 400, so an intermediary
+			// that never reads the body still sees a client error.
+			w.WriteHeader(http.StatusBadRequest)
+			writeRPC(w, Message{JSONRPC: Version, ID: m.ID, Error: rpcErr})
+			return
+		}
 		out := Message{JSONRPC: Version, ID: m.ID, Error: rpcErr}
 		if rpcErr == nil {
 			raw, merr := json.Marshal(result)
@@ -868,6 +1175,85 @@ func (s *Server) authorized(r *http.Request, key string, headers []string) bool 
 		}
 	}
 	return false
+}
+
+// originAllowed implements the DNS-rebinding defence.
+func (s *Server) originAllowed(r *http.Request, allowed []string) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// No Origin: not a browser request. A native MCP client does not send
+		// one, and the spec only requires rejecting a PRESENT and invalid one.
+		return true
+	}
+	for _, a := range allowed {
+		if a == "*" || strings.EqualFold(a, origin) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateRoutingHeaders is 2026-07-28's server-side header check.
+//
+// A missing required header is as much a mismatch as a wrong one: the point is
+// that an intermediary and the server agree, and an absent header means the
+// intermediary routed on nothing.
+func validateRoutingHeaders(h http.Header, m *Message) *Error {
+	if got := h.Get(HeaderProtocolVersion); got == "" {
+		return Errorf(CodeHeaderMismatch, "missing required header %s", HeaderProtocolVersion)
+	} else if want := bodyProtocolVersion(m); want != "" && got != want {
+		return Errorf(CodeHeaderMismatch,
+			"%s header %q does not match the body's %s %q",
+			HeaderProtocolVersion, got, MetaProtocolVersion, want)
+	}
+	if got := h.Get(HeaderMethod); got == "" {
+		return Errorf(CodeHeaderMismatch, "missing required header %s", HeaderMethod)
+	} else if got != m.Method {
+		return Errorf(CodeHeaderMismatch,
+			"%s header %q does not match the body method %q", HeaderMethod, got, m.Method)
+	}
+
+	want := bodyName(m)
+	if want == "" {
+		return nil // this method has no Mcp-Name source field
+	}
+	got := h.Get(HeaderName)
+	if got == "" {
+		return Errorf(CodeHeaderMismatch, "missing required header %s for %s",
+			HeaderName, m.Method)
+	}
+	if DecodeHeaderValue(got) != want {
+		return Errorf(CodeHeaderMismatch,
+			"%s header %q does not match the body value %q", HeaderName, got, want)
+	}
+	return nil
+}
+
+func bodyProtocolVersion(m *Message) string {
+	var p struct {
+		Meta struct {
+			ProtocolVersion string `json:"io.modelcontextprotocol/protocolVersion"`
+		} `json:"_meta"`
+	}
+	_ = json.Unmarshal(m.Params, &p)
+	return p.Meta.ProtocolVersion
+}
+
+// bodyName is the Mcp-Name source field: params.name or params.uri, depending
+// on the method.
+func bodyName(m *Message) string {
+	var p struct {
+		Name string `json:"name"`
+		URI  string `json:"uri"`
+	}
+	_ = json.Unmarshal(m.Params, &p)
+	switch m.Method {
+	case MethodToolsCall:
+		return p.Name
+	case MethodResourcesRead:
+		return p.URI
+	}
+	return ""
 }
 
 func writeRPC(w http.ResponseWriter, m Message) {

@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -151,64 +152,123 @@ func TestAMalformedTemplateIsRejectedAtRegistration(t *testing.T) {
 	}
 }
 
-// ---- REQ-MCP-SERVER-06: handshake ordering and version negotiation
+// ---- REQ-MCP-SERVER-06: per-request version, server/discover
 
-// TestAMethodBeforeInitializeIsRefused. The handshake is where the protocol
-// version and the capability sets are agreed; answering tools/call before it
-// means acting on a request whose wire contract was never settled.
-func TestAMethodBeforeInitializeIsRefused(t *testing.T) {
+// TestARequestWithoutProtocolVersionMetaIsRefused.
+//
+// 2026-07-28 has no handshake in which a version could have been agreed, so a
+// request that omits it is not interpretable. Guessing "probably the current
+// one" is how a client speaking something else gets served silently wrong
+// semantics — the failure the handshake used to prevent, moved to every
+// request.
+func TestARequestWithoutProtocolVersionMetaIsRefused(t *testing.T) {
 	raw := rawPeer(t, echoServer(t))
 
-	raw.write(t, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	raw.write(t, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
 	m := raw.read(t)
 	if m.Error == nil {
-		t.Fatal("tools/list before the handshake must be refused")
+		t.Fatal("a request with no _meta must be refused")
 	}
-	if !strings.Contains(m.Error.Message, "initialize") {
-		t.Fatalf("the refusal must name the missing step; got %q", m.Error.Message)
+	if m.Error.Code != mcp.CodeUnsupportedProtocolVersion {
+		t.Fatalf("code = %d, want %d", m.Error.Code, mcp.CodeUnsupportedProtocolVersion)
+	}
+	if !strings.Contains(m.Error.Message, mcp.MetaProtocolVersion) {
+		t.Fatalf("the refusal must name the missing field; got %q", m.Error.Message)
 	}
 
-	// ping is exempt: a client may probe liveness before committing.
-	raw.write(t, `{"jsonrpc":"2.0","id":2,"method":"ping"}`)
+	// And the same request WITH _meta is answered.
+	raw.write(t, req("2", mcp.MethodToolsList))
 	if m := raw.read(t); m.Error != nil {
-		t.Fatalf("ping must be answered before the handshake; got %v", m.Error)
+		t.Fatalf("a request carrying _meta must be answered; got %v", m.Error)
 	}
 }
 
-// TestTheServerEchoesAProtocolVersionItSpeaks is REQ-MCP-SERVER-06.
+// TestAnUnsupportedVersionIsRejectedWithTheSupportedList is REQ-MCP-SERVER-06.2.
 //
-// Always answering with our own newest turns a version the client explicitly
-// asked for into one it has to notice we ignored.
-func TestTheServerEchoesAProtocolVersionItSpeaks(t *testing.T) {
-	for _, tc := range []struct{ asked, want string }{
-		{mcp.ProtocolVersion, mcp.ProtocolVersion},
-		{mcp.LegacyProtocolVersion, mcp.LegacyProtocolVersion},
-		{"1999-01-01", mcp.ProtocolVersion},
-	} {
-		raw := rawPeer(t, echoServer(t))
-		raw.write(t, fmt.Sprintf(
-			`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":%q,"capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`,
-			tc.asked))
-		m := raw.read(t)
-		if m.Error != nil {
-			t.Fatalf("initialize(%s): %v", tc.asked, m.Error)
-		}
-		var res mcp.InitializeResult
-		must(t, json.Unmarshal(m.Result, &res))
-		if res.ProtocolVersion != tc.want {
-			t.Fatalf("client asked for %q: want %q, got %q", tc.asked, tc.want, res.ProtocolVersion)
-		}
+// The `supported` list is the only negotiation the protocol still has: without
+// it a client that guessed wrong has nothing to retry with.
+func TestAnUnsupportedVersionIsRejectedWithTheSupportedList(t *testing.T) {
+	raw := rawPeer(t, echoServer(t))
+	raw.write(t, fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{%q:"1999-01-01",%q:{}}}}`,
+		mcp.MetaProtocolVersion, mcp.MetaClientCapabilities))
+
+	m := raw.read(t)
+	if m.Error == nil || m.Error.Code != mcp.CodeUnsupportedProtocolVersion {
+		t.Fatalf("want %d, got %+v", mcp.CodeUnsupportedProtocolVersion, m.Error)
+	}
+	var data mcp.UnsupportedVersionData
+	must(t, json.Unmarshal(m.Error.Data, &data))
+	if len(data.Supported) == 0 || data.Supported[0] != mcp.ProtocolVersion {
+		t.Fatalf("supported = %v, want it to name %s", data.Supported, mcp.ProtocolVersion)
+	}
+	if data.Requested != "1999-01-01" {
+		t.Fatalf("requested = %q, want the version the client actually asked for", data.Requested)
 	}
 }
 
-// TestInitializeWithoutAVersionIsRefused. A client that names no version has
-// not asked for one, and answering with ours as though it had agreed makes a
-// mismatch invisible.
-func TestInitializeWithoutAVersionIsRefused(t *testing.T) {
+// TestServerDiscoverAdvertisesVersionsAndCapabilities is REQ-MCP-SERVER-06.1:
+// servers MUST implement it.
+func TestServerDiscoverAdvertisesVersionsAndCapabilities(t *testing.T) {
 	raw := rawPeer(t, echoServer(t))
-	raw.write(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
-	if m := raw.read(t); m.Error == nil {
-		t.Fatal("initialize without protocolVersion must be refused")
+	raw.write(t, req("1", mcp.MethodDiscover))
+
+	m := raw.read(t)
+	if m.Error != nil {
+		t.Fatalf("server/discover: %v", m.Error)
+	}
+	var res mcp.DiscoverResult
+	must(t, json.Unmarshal(m.Result, &res))
+	if len(res.SupportedVersions) == 0 || res.SupportedVersions[0] != mcp.ProtocolVersion {
+		t.Fatalf("supportedVersions = %v", res.SupportedVersions)
+	}
+	if res.ResultType != mcp.ResultComplete {
+		t.Fatalf("resultType = %q, want %q", res.ResultType, mcp.ResultComplete)
+	}
+	if res.Capabilities.Tools == nil {
+		t.Fatal("a server with tools must advertise the tools capability")
+	}
+	if res.Meta == nil || res.Meta.ServerInfo == nil {
+		t.Fatal("a server SHOULD identify itself in each result's _meta")
+	}
+}
+
+// TestALegacyInitializeGetsADiagnosticNamingTheSupportedVersions.
+//
+// A legacy client has no fall-forward mechanism: it cannot retry with a newer
+// version because it does not implement one. This error message is the only
+// thing its user will ever see, so answering "method not found" would be
+// technically correct and useless. Dropping legacy support is our decision
+// (PRD 0.4.0), which is exactly why the resulting failure must not be mute.
+func TestALegacyInitializeGetsADiagnosticNamingTheSupportedVersions(t *testing.T) {
+	raw := rawPeer(t, echoServer(t))
+	raw.write(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"old","version":"1"}}}`)
+
+	m := raw.read(t)
+	if m.Error == nil {
+		t.Fatal("initialize must be refused: this revision removed the handshake")
+	}
+	if m.Error.Code == mcp.CodeMethodNotFound {
+		t.Fatal("a bare method-not-found tells a legacy client's user nothing")
+	}
+	if !strings.Contains(m.Error.Message, mcp.ProtocolVersion) {
+		t.Fatalf("the refusal must name the version we DO speak; got %q", m.Error.Message)
+	}
+	var data mcp.UnsupportedVersionData
+	must(t, json.Unmarshal(m.Error.Data, &data))
+	if len(data.Supported) == 0 {
+		t.Fatal("the error must carry the supported list")
+	}
+}
+
+// TestPingIsGone. 2026-07-28 removed it; answering it would be implementing a
+// method the revision does not define.
+func TestPingIsGone(t *testing.T) {
+	raw := rawPeer(t, echoServer(t))
+	raw.write(t, req("1", "ping"))
+	m := raw.read(t)
+	if m.Error == nil || m.Error.Code != mcp.CodeMethodNotFound {
+		t.Fatalf("ping must be method-not-found; got %+v", m.Error)
 	}
 }
 
@@ -222,6 +282,7 @@ func TestInitializeWithoutAVersionIsRefused(t *testing.T) {
 func TestRegisteringAToolNotifiesConnectedClients(t *testing.T) {
 	s := echoServer(t)
 	conn := connected(t, s)
+	subscribe(t, conn)
 
 	before, err := conn.ListTools(context.Background())
 	must(t, err)
@@ -252,6 +313,7 @@ func TestRegisteringAToolNotifiesConnectedClients(t *testing.T) {
 func TestUnregisteringAToolNotifiesConnectedClients(t *testing.T) {
 	s := echoServer(t)
 	conn := connected(t, s)
+	subscribe(t, conn)
 	before, err := conn.ListTools(context.Background())
 	must(t, err)
 
@@ -288,7 +350,7 @@ func TestNoNotificationBeforeTheHandshakeCompletes(t *testing.T) {
 	// reading, so an answered ping proves the session is registered — without
 	// it this test races the goroutine and would pass whether or not the
 	// handshake is checked.
-	raw.write(t, `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	raw.write(t, req("1", mcp.MethodToolsList))
 	if m := raw.read(t); m.Error != nil {
 		t.Fatalf("ping: %v", m.Error)
 	}
@@ -300,7 +362,7 @@ func TestNoNotificationBeforeTheHandshakeCompletes(t *testing.T) {
 
 	// Nothing may have been written. Prove it by asking a question and
 	// checking the FIRST thing back is that question's answer.
-	raw.write(t, `{"jsonrpc":"2.0","id":2,"method":"ping"}`)
+	raw.write(t, req("2", mcp.MethodToolsList))
 	m := raw.read(t)
 	if m.Method != "" {
 		t.Fatalf("a notification reached an un-initialized session: %s", m.Method)
@@ -332,7 +394,7 @@ func TestACancelledRequestStopsTheHandlerAndGoesUnanswered(t *testing.T) {
 
 	raw := rawPeer(t, s)
 	raw.handshake(t)
-	raw.write(t, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"slow","arguments":{}}}`)
+	raw.write(t, req("7", mcp.MethodToolsCall, `"name":"slow"`, `"arguments":{}`))
 
 	select {
 	case <-entered:
@@ -350,7 +412,7 @@ func TestACancelledRequestStopsTheHandlerAndGoesUnanswered(t *testing.T) {
 
 	// Now ask something else. If a response for id 7 were sent, it would
 	// arrive before this one's.
-	raw.write(t, `{"jsonrpc":"2.0","id":8,"method":"ping"}`)
+	raw.write(t, req("8", mcp.MethodToolsList))
 	m := raw.read(t)
 	if m.ID.Key() != mcp.NumberID(8).Key() {
 		t.Fatalf("a cancelled request must go unanswered; got a reply for %s first", m.ID)
@@ -364,7 +426,7 @@ func TestACancellationForAnUnknownIDIsIgnored(t *testing.T) {
 	raw := rawPeer(t, echoServer(t))
 	raw.handshake(t)
 	raw.write(t, `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":999}}`)
-	raw.write(t, `{"jsonrpc":"2.0","id":3,"method":"ping"}`)
+	raw.write(t, req("3", mcp.MethodToolsList))
 	if m := raw.read(t); m.Error != nil {
 		t.Fatalf("an unknown cancellation must be ignored, not fatal: %v", m.Error)
 	}
@@ -394,8 +456,8 @@ func TestAStringAndANumericRequestIDDoNotCollideWhenCancelling(t *testing.T) {
 
 	raw := rawPeer(t, s)
 	raw.handshake(t)
-	raw.write(t, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"slow","arguments":{"who":"number"}}}`)
-	raw.write(t, `{"jsonrpc":"2.0","id":"5","method":"tools/call","params":{"name":"slow","arguments":{"who":"string"}}}`)
+	raw.write(t, req("5", mcp.MethodToolsCall, `"name":"slow"`, `"arguments":{"who":"number"}`))
+	raw.write(t, req(`"5"`, mcp.MethodToolsCall, `"name":"slow"`, `"arguments":{"who":"string"}`))
 	raw.write(t, `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"5"}}`)
 
 	// The string call is cancelled and goes unanswered; the numeric one runs
@@ -432,7 +494,7 @@ func TestShutdownCancelsInFlightHandlers(t *testing.T) {
 
 	raw := rawPeer(t, s)
 	raw.handshake(t)
-	raw.write(t, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"park","arguments":{}}}`)
+	raw.write(t, req("1", mcp.MethodToolsCall, `"name":"park"`, `"arguments":{}`))
 	select {
 	case <-entered:
 	case <-time.After(2 * time.Second):
@@ -490,14 +552,14 @@ func TestTheLastPageCarriesNoCursor(t *testing.T) {
 	raw := rawPeer(t, s)
 	raw.handshake(t)
 
-	raw.write(t, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	raw.write(t, req("1", mcp.MethodToolsList))
 	var first mcp.ToolsListResult
 	must(t, json.Unmarshal(raw.read(t).Result, &first))
 	if first.NextCursor == "" {
 		t.Fatal("with 4 tools and a page size of 2 the first page must carry a cursor")
 	}
 
-	raw.write(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"cursor":%q}}`, first.NextCursor))
+	raw.write(t, req("2", mcp.MethodToolsList, fmt.Sprintf(`"cursor":%q`, first.NextCursor)))
 	var second mcp.ToolsListResult
 	must(t, json.Unmarshal(raw.read(t).Result, &second))
 	if second.NextCursor != "" {
@@ -523,11 +585,11 @@ func TestAFabricatedCursorIsRefused(t *testing.T) {
 		}))
 	raw := rawPeer(t, s)
 	raw.handshake(t)
-	raw.write(t, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":"a"}}`)
+	raw.write(t, req("1", mcp.MethodToolsList, `"cursor":"a"`))
 	if m := raw.read(t); m.Error == nil {
 		t.Fatal("a cursor this server did not issue must be refused")
 	}
-	raw.write(t, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"cursor":"n:gone"}}`)
+	raw.write(t, req("2", mcp.MethodToolsList, `"cursor":"n:gone"`))
 	if m := raw.read(t); m.Error == nil {
 		t.Fatal("a cursor naming an entry that no longer exists must be refused, " +
 			"not silently restarted from the top")
@@ -546,7 +608,7 @@ func TestPageSizeZeroReturnsEverythingInOnePage(t *testing.T) {
 	}
 	raw := rawPeer(t, s)
 	raw.handshake(t)
-	raw.write(t, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	raw.write(t, req("1", mcp.MethodToolsList))
 	var res mcp.ToolsListResult
 	must(t, json.Unmarshal(raw.read(t).Result, &res))
 	if len(res.Tools) != 9 || res.NextCursor != "" {
@@ -659,11 +721,34 @@ func TestHTTPModeBindsLoopback(t *testing.T) {
 
 // ---- helpers
 
-// connected returns a fully handshaken client for srv.
+// subscribe opens a tool-change subscription and waits for it to be live.
+//
+// 2026-07-28 made notifications OPT-IN: a client that has not sent
+// subscriptions/listen receives nothing, which is the change these two tests
+// have to account for. Under the old model, opening a connection was enough.
+func subscribe(t *testing.T, conn *mcp.ServerConnection) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = conn.SubscribeToolChanges(ctx) }()
+
+	// Wait for the acknowledgement rather than sleeping: the subscription is
+	// live only once the server has recorded the filter, and registering a
+	// tool before then is a race the test would lose intermittently.
+	deadline := time.Now().Add(2 * time.Second)
+	for !conn.Subscribed() {
+		if time.Now().After(deadline) {
+			t.Fatal("the subscription was never acknowledged")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// connected returns a client for srv.
 func connected(t *testing.T, srv *mcp.Server) *mcp.ServerConnection {
 	t.Helper()
 	conn := pair(t, srv, mcp.ServerConfig{Name: "s"}, mcp.ConnectionOptions{})
-	must(t, conn.Initialize(context.Background()))
+	must(t, conn.Discover(context.Background()))
 	return conn
 }
 
@@ -731,15 +816,23 @@ func (p *peer) read(t *testing.T) mcp.Message {
 	return mcp.Message{}
 }
 
-func (p *peer) handshake(t *testing.T) {
-	t.Helper()
-	p.write(t, fmt.Sprintf(
-		`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":%q,"capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`,
-		mcp.ProtocolVersion))
-	if m := p.read(t); m.Error != nil {
-		t.Fatalf("initialize: %v", m.Error)
-	}
-	p.write(t, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+// handshake is a NO-OP at 2026-07-28 and kept as a named call so a reader of
+// these tests sees where a handshake used to be. There is nothing to send: the
+// version and capabilities travel in every request's _meta instead.
+func (p *peer) handshake(t *testing.T) { t.Helper() }
+
+// meta is the per-request _meta every request must carry. Tests build frames
+// by hand, so they carry it by hand.
+func meta() string {
+	return fmt.Sprintf(`"_meta":{%q:%q,%q:{}}`,
+		mcp.MetaProtocolVersion, mcp.ProtocolVersion, mcp.MetaClientCapabilities)
+}
+
+// req builds a raw request frame with _meta merged into params.
+func req(id, method string, paramFields ...string) string {
+	fields := append([]string{meta()}, paramFields...)
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"method":%q,"params":{%s}}`,
+		id, method, strings.Join(fields, ","))
 }
 
 func (p *peer) shutdown() { p.stop() }
@@ -790,4 +883,151 @@ func nonLoopbackHost(t *testing.T) string {
 	}
 	t.Skip("no non-loopback IPv4 interface; nothing to bind wrongly")
 	return ""
+}
+
+// ---- MRTR (REQ-MCP-CLIENT-08, amended in PRD 0.4.0)
+
+// TestAnUnboundedInputLoopIsRefused.
+//
+// The old server-initiated model made this impossible by construction: the
+// server asked, the client answered, the call continued. MRTR turns it into
+// "the client retries the whole request", so a server that returns
+// input_required every time holds the client in a loop forever. The bound is
+// what turns a hang into a reported error.
+func TestAnUnboundedInputLoopIsRefused(t *testing.T) {
+	var rounds atomic.Int32
+	s := mcp.NewServer(mcp.ServerOptions{})
+	must(t, s.RegisterTool(mcp.ToolDefinition{Name: "greedy"},
+		func(ctx context.Context, _ map[string]any) (mcp.ToolsCallResult, error) {
+			rounds.Add(1)
+			// Never satisfied: asks again on every retry, answers included.
+			return mcp.ToolsCallResult{}, mcp.NeedSampling("s", "k", mcp.SamplingParams{
+				Messages:  []mcp.SamplingMessage{{Role: "user", Content: mcp.Content{Type: "text", Text: "again"}}},
+				MaxTokens: 8,
+			})
+		}))
+
+	conn := pair(t, s, mcp.ServerConfig{Name: "s", AllowSampling: true}, mcp.ConnectionOptions{
+		Sampling: func(context.Context, mcp.SamplingParams) (mcp.SamplingResult, error) {
+			return mcp.SamplingResult{Role: "assistant", Model: "t",
+				Content: mcp.Content{Type: "text", Text: "ok"}}, nil
+		},
+	})
+
+	_, err := conn.Call(context.Background(), "greedy", nil)
+	if !errors.Is(err, mcp.ErrTooManyInputRounds) {
+		t.Fatalf("want ErrTooManyInputRounds, got %v", err)
+	}
+	if n := rounds.Load(); int(n) > mcp.MaxInputRounds {
+		t.Fatalf("the handler ran %d times; the bound is %d", n, mcp.MaxInputRounds)
+	}
+}
+
+// TestAnMRTRRetryCarriesTheAnswersAndTheOpaqueState. The server keeps NOTHING
+// between the two calls — there is no session — so requestState is the only
+// way it can remember where it was, and it must come back unchanged.
+func TestAnMRTRRetryCarriesTheAnswersAndTheOpaqueState(t *testing.T) {
+	var gotState string
+	s := mcp.NewServer(mcp.ServerOptions{})
+	must(t, s.RegisterTool(mcp.ToolDefinition{Name: "ask"},
+		func(ctx context.Context, _ map[string]any) (mcp.ToolsCallResult, error) {
+			in, retry := mcp.InputFrom(ctx)
+			if !retry {
+				return mcp.ToolsCallResult{}, mcp.NeedSampling("state-42", "k",
+					mcp.SamplingParams{MaxTokens: 8})
+			}
+			gotState = in.RequestState
+			var res mcp.SamplingResult
+			if err := json.Unmarshal(in.Responses["k"], &res); err != nil {
+				return mcp.ToolsCallResult{}, err
+			}
+			return mcp.ToolsCallResult{
+				Content: []mcp.Content{{Type: "text", Text: "got:" + res.Content.Text}}}, nil
+		}))
+
+	conn := pair(t, s, mcp.ServerConfig{Name: "s", AllowSampling: true}, mcp.ConnectionOptions{
+		Sampling: func(context.Context, mcp.SamplingParams) (mcp.SamplingResult, error) {
+			return mcp.SamplingResult{Role: "assistant", Model: "t",
+				Content: mcp.Content{Type: "text", Text: "answer"}}, nil
+		},
+	})
+
+	res, err := conn.Call(context.Background(), "ask", nil)
+	must(t, err)
+	if len(res.Content) != 1 || res.Content[0].Text != "got:answer" {
+		t.Fatalf("the retry did not carry the answer: %+v", res.Content)
+	}
+	if gotState != "state-42" {
+		t.Fatalf("requestState = %q, want it returned verbatim", gotState)
+	}
+}
+
+// TestAnExpiredToolCacheIsRefetched is the ttlMs half of REQ-MCP-SERVER-06.4.
+//
+// A client that never opened a subscription has no other way to learn its
+// cached list went stale, so the freshness hint is the only thing standing
+// between it and a permanently wrong tool list.
+func TestAnExpiredToolCacheIsRefetched(t *testing.T) {
+	s := mcp.NewServer(mcp.ServerOptions{ListTTLMs: 50})
+	must(t, s.RegisterTool(mcp.ToolDefinition{Name: "one"},
+		func(context.Context, map[string]any) (mcp.ToolsCallResult, error) {
+			return mcp.ToolsCallResult{}, nil
+		}))
+
+	now := time.Now()
+	conn := pair(t, s, mcp.ServerConfig{Name: "s"}, mcp.ConnectionOptions{
+		Now: func() time.Time { return now },
+	})
+	ctx := context.Background()
+
+	first, err := conn.ListTools(ctx)
+	must(t, err)
+	if len(first) != 1 {
+		t.Fatalf("want 1 tool, got %d", len(first))
+	}
+
+	// A tool appears, and this client is NOT subscribed — so nothing tells it.
+	must(t, s.RegisterTool(mcp.ToolDefinition{Name: "two"},
+		func(context.Context, map[string]any) (mcp.ToolsCallResult, error) {
+			return mcp.ToolsCallResult{}, nil
+		}))
+
+	cached, err := conn.ListTools(ctx)
+	must(t, err)
+	if len(cached) != 1 {
+		t.Fatalf("inside the ttl the cached list must be served; got %d", len(cached))
+	}
+
+	// Past the hint, the client re-fetches.
+	now = now.Add(100 * time.Millisecond)
+	fresh, err := conn.ListTools(ctx)
+	must(t, err)
+	if len(fresh) != 2 {
+		t.Fatalf("past ttlMs the list must be re-fetched; got %d tools", len(fresh))
+	}
+}
+
+// TestCacheScopeDefaultsToPrivate.
+//
+// A tool list can encode which tools THIS caller is allowed to see — a
+// per-tenant inventory, a per-key filter. `cacheScope: public` tells shared
+// intermediaries they may serve that response to anybody, so the default has
+// to be the one that cannot leak.
+func TestCacheScopeDefaultsToPrivate(t *testing.T) {
+	raw := rawPeer(t, echoServer(t))
+	raw.write(t, req("1", mcp.MethodToolsList))
+
+	m := raw.read(t)
+	if m.Error != nil {
+		t.Fatal(m.Error)
+	}
+	var res mcp.ToolsListResult
+	must(t, json.Unmarshal(m.Result, &res))
+	if res.CacheScope != mcp.CachePrivate {
+		t.Fatalf("cacheScope = %q, want %q: a list that may be caller-specific must not "+
+			"be advertised as publicly cacheable", res.CacheScope, mcp.CachePrivate)
+	}
+	if res.ResultType != mcp.ResultComplete {
+		t.Fatalf("resultType = %q", res.ResultType)
+	}
 }

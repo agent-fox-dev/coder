@@ -200,6 +200,13 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 						out.Terminate = *dec.Terminate
 					}
 				}
+				// REQ-TOOL-14.1/.2: every image entering history is
+				// re-processed HERE — at the boundary, after the user's
+				// post-tool hook. Doing it inside individual tools would miss
+				// MCP-bridged results, custom tools, and images a hook
+				// injected; there is exactly one place every image passes
+				// through, and this is it.
+				a.normalizeImages(&msg)
 				results[i] = msg
 				votes[i] = out.Terminate
 				s.Push(core.ToolExecutionEndEvent{
@@ -345,10 +352,12 @@ func toolResultMessage(c core.ToolUseBlock, r core.ToolResult) core.ToolResultMe
 	if err != nil {
 		payload = []byte(`{"ok":false,"error":"marshal_failed"}`)
 	}
+	content := core.Content{core.TextBlock{Text: string(payload)}}
+	content = append(content, r.Blocks...)
 	return core.ToolResultMessage{
 		ToolUseID: c.ID,
 		ToolName:  c.Name,
-		Content:   core.Content{core.TextBlock{Text: string(payload)}},
+		Content:   content,
 		IsError:   !r.OK,
 		Timestamp: time.Now(),
 	}

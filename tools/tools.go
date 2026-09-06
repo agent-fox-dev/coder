@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/imagex"
 	"github.com/agentfox/agentkit-go/schema"
 )
 
@@ -56,9 +57,32 @@ func All(opts Options) ([]core.Tool, error) {
 		fs.editFile(),
 		fs.listFiles(),
 		fs.findFiles(),
+		fs.searchFiles(),
 		executeTool(opts),
+		runCommandTool(opts),
+		PowerShell(opts),
 	}, nil
 }
+
+// FileNavigationTools names REQ-TOOL-04e's opt-in trio.
+//
+// They are in All() because All() is the DEFAULT set, and the requirement's
+// "opt-in" is about the tool policy of REQ-TOOL-10 rather than about this
+// constructor: an embedder scopes a run down with ToolPolicy, and a set that
+// omitted them by default would make the common case the one you have to
+// remember. What the requirement actually turns on is their ABSENCE from the
+// resolved set, which is the prompt builder's business, not this list's.
+func FileNavigationTools() []string {
+	return []string{"list_files", "find_files", "search_files"}
+}
+
+// ExecuteFallbackGuideline is REQ-TOOL-04e's sentence, verbatim.
+//
+// It is not a PromptGuidelines entry on any tool, because its condition is
+// that those tools are MISSING — a per-tool field can only fire when its tool
+// is present, which is the opposite of what the requirement asks for. The
+// prompt builder emits it.
+const ExecuteFallbackGuideline = "Use execute for file operations like ls, rg, find."
 
 // ---------------------------------------------------------------- path locks
 
@@ -129,9 +153,10 @@ type fileTools struct {
 
 func (f *fileTools) readFile() core.Tool {
 	return core.Tool{
-		Name:        "read_file",
-		Description: "Read a text file. Returns at most 2000 lines or 50KB, whichever comes first.",
-		Builtin:     true,
+		Name: "read_file",
+		Description: "Read a file. Text is returned as at most 2000 lines or 50KB, " +
+			"whichever comes first; an image is returned as a note plus the image itself.",
+		Builtin: true,
 		InputSchema: schema.Object(
 			schema.Prop("path", schema.String("Path to the file (relative to the workspace, or absolute)")),
 			schema.Opt("offset", schema.Int("1-based line to start from (default 1)")),
@@ -154,6 +179,13 @@ func (f *fileTools) readFile() core.Tool {
 			data, err := os.ReadFile(abs)
 			if err != nil {
 				return core.ErrResult("read_failed", err.Error())
+			}
+			// REQ-TOOL-14.6: images are detected by MAGIC BYTES, never by
+			// extension. `screenshot.txt` is still a PNG if its first eight
+			// bytes say so, and splitting one into "lines" hands the model
+			// several kilobytes of mojibake.
+			if mime, isImage := imagex.Sniff(data); isImage {
+				return readImage(abs, a.Path, data, mime)
 			}
 
 			lines := strings.Split(string(data), "\n")
@@ -194,6 +226,40 @@ func (f *fileTools) readFile() core.Tool {
 			return r
 		},
 	}
+}
+
+// readImage returns REQ-TOOL-14.6's "text note plus an ImageBlock".
+//
+// The note matters as much as the block: without it the model sees an image
+// appear with no statement of what was read, and cannot tell a screenshot it
+// asked for from one a previous turn left in history.
+func readImage(abs, shown string, data []byte, mime string) core.ToolResult {
+	// Formats providers reject are refused HERE, with a message naming the
+	// problem, rather than forwarded. Forwarded, the failure lands on the next
+	// provider request — by which time the image is in history and every
+	// subsequent request fails the same way.
+	//
+	// Normalize validates before it does anything else, so there is no
+	// separate Validate call: a second one would be unreachable code that
+	// looks like a safety check.
+	res, err := imagex.Normalize(data, mime)
+	if err != nil {
+		return core.ErrResult("unsupported_image", err.Error())
+	}
+
+	note := fmt.Sprintf("[%s: %s image, %d×%d]", shown, res.MIMEType, res.Width, res.Height)
+	if res.Changed {
+		note = fmt.Sprintf("[%s: %s image, downscaled to %d×%d for the provider's inline limit]",
+			shown, res.MIMEType, res.Width, res.Height)
+	}
+	out := core.OKResult(map[string]any{
+		"note":      note,
+		"mime_type": res.MIMEType,
+		"width":     res.Width,
+		"height":    res.Height,
+	})
+	out.Blocks = []core.ContentBlock{core.ImageBlock{Data: res.Base64(), MimeType: res.MIMEType}}
+	return out
 }
 
 func (f *fileTools) writeFile() core.Tool {
@@ -351,7 +417,6 @@ func (f *fileTools) listFiles() core.Tool {
 			schema.Opt("path", schema.String("Directory to list (default the workspace root)")),
 			schema.Opt("limit", schema.Int("Maximum entries")),
 		),
-		PromptGuidelines: []string{"Use execute for file operations like ls, rg, find."},
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
 				Path  string `json:"path"`
@@ -496,7 +561,6 @@ func executeTool(opts Options) core.Tool {
 			schema.Prop("command", schema.String("The shell command to run")),
 			schema.Opt("timeout_s", schema.Int("Seconds before the process tree is killed")),
 		),
-		PromptGuidelines: []string{"Use execute for file operations like ls, rg, find."},
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
 				Command  string `json:"command"`
@@ -522,27 +586,93 @@ func executeTool(opts Options) core.Tool {
 			if err != nil {
 				return core.ErrResult("exec_failed", err.Error())
 			}
-			code := res.ExitCode
-			md := &core.ToolMetadata{
-				Truncated:  res.Truncated,
-				TotalBytes: res.TotalBytes,
-				SpillPath:  res.SpillPath,
-				DurationMS: res.Duration.Milliseconds(),
-				ExitCode:   &code,
-				Outcome:    string(res.Outcome),
+			return execResultToTool(res)
+		},
+	}
+}
+
+// execResultToTool is the REQ-TOOL-08 envelope for a subprocess result.
+//
+// Shared by execute, run_command and powershell: the envelope is a property of
+// having run a subprocess, not of how the command was spelled, and three
+// copies would drift on the next field added to ToolMetadata.
+func execResultToTool(res ExecResult) core.ToolResult {
+	code := res.ExitCode
+	md := &core.ToolMetadata{
+		Truncated:  res.Truncated,
+		TotalBytes: res.TotalBytes,
+		SpillPath:  res.SpillPath,
+		DurationMS: res.Duration.Milliseconds(),
+		ExitCode:   &code,
+		Outcome:    string(res.Outcome),
+	}
+	if res.Truncated {
+		md.TruncatedBy = string(TruncatedByBytes)
+	}
+	out := core.ToolResult{
+		OK:       res.Outcome == OutcomeOK,
+		Data:     map[string]any{"output": res.Output, "exit_code": code, "outcome": string(res.Outcome)},
+		Metadata: md,
+	}
+	if !out.OK {
+		out.Error = "command_" + string(res.Outcome)
+	}
+	return out
+}
+
+// runCommandTool is REQ-TOOL-06's structured variant.
+//
+// The model picks between this and `execute` by NAME, which is the point: a
+// shell-features argument on one tool would be a choice the model gets wrong
+// silently. Here there is no shell at all, so a path with a space or a
+// semicolon in it is just an argument.
+func runCommandTool(opts Options) core.Tool {
+	return core.Tool{
+		Name:    "run_command",
+		Builtin: true,
+		Description: "Run a program with an explicit argument list and NO shell. " +
+			"Pipes, redirection, globs and $() do not work here — use execute for those. " +
+			"Prefer this when arguments come from data, since nothing is re-parsed.",
+		ExecutionMode: core.Sequential,
+		InputSchema: schema.Object(
+			schema.Prop("argv", schema.Array(schema.String(),
+				"Program and arguments, e.g. [\"git\", \"commit\", \"-m\", \"a message\"]")),
+			schema.Opt("timeout_s", schema.Int("Seconds before the process tree is killed")),
+		),
+		PromptGuidelines: []string{
+			"Use run_command when an argument contains spaces or shell metacharacters; " +
+				"nothing is re-parsed by a shell.",
+		},
+		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
+			var a struct {
+				Argv     []string `json:"argv"`
+				TimeoutS int      `json:"timeout_s"`
 			}
-			if res.Truncated {
-				md.TruncatedBy = string(TruncatedByBytes)
+			if err := json.Unmarshal(in, &a); err != nil {
+				return core.ErrResult("invalid_arguments", err.Error())
 			}
-			out := core.ToolResult{
-				OK:       res.Outcome == OutcomeOK,
-				Data:     map[string]any{"output": res.Output, "exit_code": code, "outcome": string(res.Outcome)},
-				Metadata: md,
+			if len(a.Argv) == 0 || strings.TrimSpace(a.Argv[0]) == "" {
+				return core.ErrResult("invalid_arguments",
+					"argv must name a program as its first element")
 			}
-			if !out.OK {
-				out.Error = "command_" + string(res.Outcome)
+			if a.TimeoutS < 0 {
+				return core.ErrResult("invalid_arguments", "timeout_s must be positive")
 			}
-			return out
+			dir := ""
+			if opts.Workspace != nil {
+				dir = opts.Workspace.Root
+			}
+			res, err := RunArgv(ctx, a.Argv, ExecOptions{
+				Dir:      dir,
+				Timeout:  time.Duration(a.TimeoutS) * time.Second,
+				MaxBytes: DefaultByteLimit,
+				SpillDir: opts.SpillDir,
+				Env:      opts.Env,
+			})
+			if err != nil {
+				return core.ErrResult("exec_failed", err.Error())
+			}
+			return execResultToTool(res)
 		},
 	}
 }

@@ -125,6 +125,15 @@ type ToolResult struct {
 	// Terminate never reaches the model; it is the REQ-TOOL-13 batch vote.
 	Terminate bool          `json:"-"`
 	Metadata  *ToolMetadata `json:"metadata,omitzero"`
+	// Blocks are extra content blocks appended after the JSON payload —
+	// the channel by which a tool returns an image (REQ-TOOL-14.6's
+	// "a text note plus an ImageBlock").
+	//
+	// It is separate from Data because Data is marshalled into one text block
+	// for the model, and an image is not text: a provider needs it as its own
+	// typed block, and base64 inside a JSON string would be both unreadable
+	// and counted as text tokens.
+	Blocks []ContentBlock `json:"-"`
 }
 
 func OKResult(data map[string]any) ToolResult { return ToolResult{OK: true, Data: data} }

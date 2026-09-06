@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -93,7 +94,40 @@ func Run(ctx context.Context, command string, opts ExecOptions) (ExecResult, err
 	if err != nil {
 		return ExecResult{}, err
 	}
+	return runArgv(ctx, append(append([]string{shell}, args...), command), opts)
+}
 
+// RunArgv is REQ-TOOL-06's structured variant: an argv vector, executed with
+// NO SHELL between the caller and the program.
+//
+// The difference is the entire point. `Run` hands a string to bash, so `;`,
+// `$(…)`, backticks, globs and redirection all mean something. Here they do
+// not: every element is one argument, verbatim, and a filename containing a
+// space or a semicolon reaches the program as itself. A caller that has
+// already got its arguments as separate values should never have to quote
+// them back into a shell string and hope the quoting is right.
+//
+// Everything else — process group, timeout, group kill, interleaved output,
+// tail truncation, spill — is identical, because those are properties of
+// running a subprocess and not of how the command was spelled.
+func RunArgv(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, error) {
+	if len(argv) == 0 {
+		return ExecResult{}, errors.New("tools: run_command needs at least one argument")
+	}
+	// Resolved against PATH here rather than left to exec.Command, so a
+	// missing program is a clear error instead of a start failure whose
+	// message names only the file.
+	bin, err := exec.LookPath(argv[0])
+	if err != nil {
+		return ExecResult{}, fmt.Errorf("tools: %q not found on PATH: %w", argv[0], err)
+	}
+	return runArgv(ctx, append([]string{bin}, argv[1:]...), opts)
+}
+
+// runArgv is the shared body. Both entry points reach it with a fully
+// resolved argv, so there is exactly one implementation of the process
+// lifecycle rather than two that drift.
+func runArgv(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, error) {
 	runCtx := ctx
 	var cancel context.CancelFunc
 	if opts.Timeout > 0 {
@@ -101,7 +135,7 @@ func Run(ctx context.Context, command string, opts ExecOptions) (ExecResult, err
 		defer cancel()
 	}
 
-	cmd := exec.Command(shell, append(args, command)...)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = opts.Dir
 	cmd.Stdin = nil // REQ-TOOL-06: stdin is DEVNULL, never the agent's own.
 	if opts.Env != nil {

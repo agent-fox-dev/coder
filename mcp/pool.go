@@ -76,7 +76,7 @@ func (p *Pool) Connect(ctx context.Context, cfg ServerConfig, env []string, secr
 	}
 
 	c := NewConnection(cfg, tr, p.opts)
-	if err := c.Initialize(ctx); err != nil {
+	if err := c.Discover(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -102,8 +102,8 @@ func (p *Pool) connectHTTP(ctx context.Context, cfg ServerConfig, env []string, 
 		}
 	}
 
-	tr, err := StartHTTP(ctx, HTTPTransportOptions{
-		URL: cfg.URL, Mode: cfg.Transport, Headers: headers,
+	tr, err := StartStreamableHTTP(ctx, HTTPTransportOptions{
+		URL: cfg.URL, Headers: headers,
 		Limits: p.opts.Limits, Warnf: func(format string, args ...any) {
 			if p.opts.Warnf != nil {
 				p.opts.Warnf("server %q: "+format, append([]any{cfg.Name}, args...)...)
@@ -115,7 +115,7 @@ func (p *Pool) connectHTTP(ctx context.Context, cfg ServerConfig, env []string, 
 	}
 
 	c := NewConnection(cfg, tr, p.opts)
-	if err := c.Initialize(ctx); err != nil {
+	if err := c.Discover(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
 	}

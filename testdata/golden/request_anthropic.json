@@ -1,0 +1,101 @@
+{
+  "model": "claude-test",
+  "max_tokens": 1024,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a release engineer.",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Which Go files changed?"
+        },
+        {
+          "type": "image",
+          "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+          }
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Let me look."
+        },
+        {
+          "type": "tool_use",
+          "id": "call_1",
+          "name": "find_files",
+          "input": {
+            "pattern": "**/*.go"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_1",
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"ok\":true,\"data\":{\"entries\":[\"main.go\"]}}"
+            }
+          ],
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "find_files",
+      "description": "Find files by glob pattern.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Glob pattern"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum results"
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      },
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "auto"
+  },
+  "temperature": 0.2,
+  "top_p": 0.9,
+  "stop_sequences": [
+    "\n\nHuman:"
+  ],
+  "stream": true
+}

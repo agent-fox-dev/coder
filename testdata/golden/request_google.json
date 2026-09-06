@@ -1,0 +1,102 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Which Go files changed?"
+        },
+        {
+          "inlineData": {
+            "mimeType": "image/png",
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+          }
+        }
+      ]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "text": "Let me look."
+        },
+        {
+          "functionCall": {
+            "name": "find_files",
+            "args": {
+              "pattern": "**/*.go"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        {
+          "functionResponse": {
+            "name": "find_files",
+            "response": {
+              "ok": true,
+              "data": {
+                "entries": [
+                  "main.go"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "systemInstruction": {
+    "parts": [
+      {
+        "text": "You are a release engineer."
+      }
+    ]
+  },
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "find_files",
+          "description": "Find files by glob pattern.",
+          "parameters": {
+            "type": "OBJECT",
+            "properties": {
+              "pattern": {
+                "type": "STRING",
+                "description": "Glob pattern"
+              },
+              "limit": {
+                "type": "INTEGER",
+                "description": "Maximum results"
+              }
+            },
+            "propertyOrdering": [
+              "pattern",
+              "limit"
+            ],
+            "required": [
+              "pattern"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "toolConfig": {
+    "functionCallingConfig": {
+      "mode": "AUTO"
+    }
+  },
+  "generationConfig": {
+    "temperature": 0.2,
+    "topP": 0.9,
+    "maxOutputTokens": 1024,
+    "stopSequences": [
+      "\n\nHuman:"
+    ]
+  }
+}

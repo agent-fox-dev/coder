@@ -31,8 +31,13 @@ type request struct {
 	ToolChoice  *toolChoice `json:"tool_choice,omitzero"`
 	Temperature *float64    `json:"temperature,omitzero"`
 	TopP        *float64    `json:"top_p,omitzero"`
-	Stream      bool        `json:"stream"`
-	Thinking    *thinking   `json:"thinking,omitzero"`
+	// StopSequences is core.Request.StopSequences. Dropping it silently, as
+	// this did until the NFR-TEST-08 request golden showed the field missing
+	// from the body, means a caller's stop condition never takes effect and
+	// nothing says so.
+	StopSequences []string  `json:"stop_sequences,omitzero"`
+	Stream        bool      `json:"stream"`
+	Thinking      *thinking `json:"thinking,omitzero"`
 
 	// immediateTools is the count of leading non-deferred tools. It is
 	// unexported and therefore never marshalled; StampCacheControl reads it to
@@ -184,11 +189,12 @@ func BuildRequestCached(m *core.Model, req core.Request, retention core.CacheRet
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeToolCallID))
 
 	out := &request{
-		Model:       m.ID,
-		Messages:    encodeMessages(repaired),
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stream:      true,
+		Model:         m.ID,
+		Messages:      encodeMessages(repaired),
+		Temperature:   req.Temperature,
+		TopP:          req.TopP,
+		StopSequences: req.StopSequences,
+		Stream:        true,
 	}
 
 	out.MaxTokens = m.MaxTokens

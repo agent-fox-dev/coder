@@ -9,7 +9,7 @@
 // OpenAI Responses is a SEPARATE wire API and therefore a separate package: it
 // differs in the message model, the tool-call identity model, the reasoning
 // replay model and the billing model. It is not this implementation with a
-// flag. (Not implemented in v1.)
+// flag; see provider/openairesponses.
 package openai
 
 import (
@@ -32,7 +32,11 @@ type request struct {
 	ToolChoice  string    `json:"tool_choice,omitzero"`
 	Temperature *float64  `json:"temperature,omitzero"`
 	TopP        *float64  `json:"top_p,omitzero"`
-	Stream      bool      `json:"stream"`
+	// Stop is core.Request.StopSequences. See the note on the Anthropic
+	// request struct: this was dropped silently until a request golden made
+	// the omission visible.
+	Stop   []string `json:"stop,omitzero"`
+	Stream bool     `json:"stream"`
 	// StreamOptions.include_usage is REQUIRED for a streamed request to report
 	// usage at all. Without it OpenAI returns `usage: null` on every chunk,
 	// which REQ-GO-15 forbids as a context anchor and REQ-PROV-05 forbids as a
@@ -185,6 +189,7 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 		Messages:    encodeMessages(repaired, req.System, compat),
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
+		Stop:        req.StopSequences,
 		Stream:      true,
 
 		StreamOptions: &streamOptions{IncludeUsage: true},

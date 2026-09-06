@@ -109,7 +109,6 @@ func parseServer(path string, i int, t *toml.Table) (ServerConfig, []Diagnostic)
 	sc.URL = str("url")
 	sc.Dir = str("dir")
 	sc.ToolPrefix = str("tool_prefix")
-	sc.Transport = HTTPMode(str("transport"))
 
 	if v, ok := t.Get("args"); ok && v.Kind == toml.KindStringArray {
 		sc.Args = append([]string(nil), v.Array...)
@@ -154,22 +153,23 @@ func parseServer(path string, i int, t *toml.Table) (ServerConfig, []Diagnostic)
 				"and the url is ignored", where, sc.Name)})
 	}
 
-	switch sc.Transport {
-	case HTTPModeAuto, HTTPModeStreamable, HTTPModeSSE:
-	default:
-		// Named but unrecognised is refused rather than silently auto-
-		// negotiated: an operator who wrote `transport = "http"` meant
-		// something specific, and quietly doing something else is how a
-		// deployment ends up on a revision nobody chose.
-		diags = append(diags, Diagnostic{Path: path, Severity: diag.SeverityError,
-			Message: fmt.Sprintf("%s (%q): transport %q is not one of %q, %q, or empty for "+
-				"auto-negotiation", where, sc.Name, sc.Transport, HTTPModeStreamable, HTTPModeSSE)})
-		sc.Name = "" // not usable
-	}
-	if sc.Transport != HTTPModeAuto && sc.URL == "" {
-		diags = append(diags, Diagnostic{Path: path, Severity: diag.SeverityWarning,
-			Message: fmt.Sprintf("%s (%q): transport only applies to a url server and is "+
-				"ignored for a command", where, sc.Name)})
+	if t := str("transport"); t != "" {
+		// 2026-07-28 leaves exactly one remote transport, so the field has
+		// nothing left to select. It is still PARSED rather than ignored: an
+		// operator who wrote `transport = "sse"` configured a transport this
+		// build removed, and silently serving them Streamable HTTP would hide
+		// that their server is probably unreachable.
+		sev := diag.SeverityWarning
+		msg := fmt.Sprintf("%s (%q): transport %q is obsolete; MCP %s defines only "+
+			"Streamable HTTP and this build implements only that",
+			where, sc.Name, t, ProtocolVersion)
+		if t != "streamable-http" {
+			sev = diag.SeverityError
+			msg = fmt.Sprintf("%s (%q): transport %q is not implemented; MCP %s removed "+
+				"it and this build is modern-only", where, sc.Name, t, ProtocolVersion)
+			sc.Name = "" // not usable
+		}
+		diags = append(diags, Diagnostic{Path: path, Severity: sev, Message: msg})
 	}
 	return sc, diags
 }

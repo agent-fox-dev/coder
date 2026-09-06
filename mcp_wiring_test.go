@@ -42,7 +42,7 @@ func mcpTools(t *testing.T, serverName string) []core.Tool {
 	go func() { defer close(done); _ = srv.Serve(context.Background(), serverSide) }()
 
 	conn := mcp.NewConnection(mcp.ServerConfig{Name: serverName}, clientSide, mcp.ConnectionOptions{})
-	if err := conn.Initialize(context.Background()); err != nil {
+	if err := conn.Discover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	pool := mcp.NewPool(mcp.ConnectionOptions{})

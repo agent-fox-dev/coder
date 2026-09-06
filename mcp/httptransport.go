@@ -11,59 +11,48 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/agentfox/agentkit-go/wire"
 )
 
-// REQ-MCP-CLIENT-02's two remote transports.
+// REQ-MCP-CLIENT-02's remote transport, amended in PRD 0.4.0.
 //
-// HTTPModeStreamable is the 2025-03-26 spec: one endpoint, POST a frame and
-// the reply comes back either as a single JSON body or as an SSE stream on
-// that same response. HTTPModeSSE is the 2024-11-05 spec: a long-lived GET
-// carries every server->client message, and the server names a SEPARATE URL to
-// POST to in an `endpoint` event.
-type HTTPMode string
+// ONE transport, not three. 2026-07-28 reclassified HTTP+SSE (2024-11-05) as
+// Deprecated and changed Streamable HTTP itself: the GET stream, protocol-level
+// sessions, the `Mcp-Session-Id` header and `Last-Event-ID` resumability are
+// all gone. What remains is a single POST endpoint whose response is either a
+// JSON object or an SSE stream scoped to that one request.
+//
+// Everything the removed machinery used to carry now travels per request: the
+// version in a header and in `_meta`, and long-lived notifications on a
+// `subscriptions/listen` response stream.
 
+// Required request headers (2026-07-28 §Request Metadata). These mirror body
+// fields into headers so a gateway can route without parsing JSON — which is
+// also why a server MUST reject a request whose headers disagree with its
+// body, and why this client derives them from the body rather than accepting
+// them from a caller.
 const (
-	// HTTPModeAuto POSTs as 2025-03-26 and falls back to 2024-11-05 when the
-	// server rejects the POST. This is the spec's own backwards-compatibility
-	// procedure, and it is the default because the alternative is making an
-	// operator know which revision a third-party server implements before they
-	// can configure it.
-	HTTPModeAuto       HTTPMode = ""
-	HTTPModeStreamable HTTPMode = "streamable-http"
-	HTTPModeSSE        HTTPMode = "sse"
+	HeaderProtocolVersion = "MCP-Protocol-Version"
+	HeaderMethod          = "Mcp-Method"
+	HeaderName            = "Mcp-Name"
 )
 
-// MCPSessionHeader is the 2025-03-26 session identifier.
-const MCPSessionHeader = "Mcp-Session-Id"
-
-// MaxSessionIDBytes bounds the session id we will echo back. The value comes
-// from the server and goes straight into a request header on every subsequent
-// call; unbounded, a server could make us send megabytes per request.
-const MaxSessionIDBytes = 512
-
-var (
-	// ErrSessionExpired is the 2025-03-26 spec's 404-on-a-known-session. A
-	// caller that sees it must start a new session rather than retry, which is
-	// why it is distinguishable from any other HTTP failure.
-	ErrSessionExpired = errors.New("mcp: the server no longer knows this session")
-
-	// ErrEndpointOrigin is the HTTP/SSE transport's refusal to POST somewhere
-	// the stream told it to.
-	ErrEndpointOrigin = errors.New("mcp: the server's endpoint event names a different origin")
-
-	// ErrNoEndpoint means the 2024-11-05 stream opened but never named a POST
-	// endpoint.
-	ErrNoEndpoint = errors.New("mcp: the sse stream ended without an endpoint event")
+// Base64SentinelPrefix and Base64SentinelSuffix wrap a header value that is
+// not safe as plain ASCII. The markers are case-sensitive and defined by the
+// spec exactly as written.
+const (
+	Base64SentinelPrefix = "=?base64?"
+	Base64SentinelSuffix = "?="
 )
+
+// ErrHeaderMismatch is the client-side view of a -32020.
+var ErrHeaderMismatch = errors.New("mcp: the request headers disagree with the request body")
 
 // HTTPTransportOptions configures a remote transport.
 type HTTPTransportOptions struct {
 	// URL is the server endpoint. http and https only.
-	URL  string
-	Mode HTTPMode
+	URL string
 	// Client is the HTTP client. Nil builds one with no overall timeout,
 	// because a request whose response is a long-lived SSE stream must not be
 	// cut off by a client deadline — the per-call deadline lives on the
@@ -74,13 +63,7 @@ type HTTPTransportOptions struct {
 	Headers map[string]string
 	Limits  wire.Limits
 	Warnf   func(format string, args ...any)
-	// EndpointTimeout bounds the wait for the 2024-11-05 `endpoint` event
-	// before the first Send can proceed. Zero uses DefaultEndpointTimeout.
-	EndpointTimeout time.Duration
 }
-
-// DefaultEndpointTimeout bounds the 2024-11-05 handshake.
-const DefaultEndpointTimeout = 30 * time.Second
 
 // inboundBuffer is how many frames may sit undelivered before a pump blocks.
 // Blocking is the correct back-pressure: dropping a frame loses a response the
@@ -226,6 +209,7 @@ func (h *httpCommon) applyHeaders(r *http.Request) {
 
 // readStream pumps an SSE body until it ends, delivering `message` events.
 func (h *httpCommon) readStream(body io.ReadCloser, onEndpoint func(string)) {
+	_ = onEndpoint
 	defer body.Close()
 	dec := newSSEDecoder(body, int(h.limits.MaxMessageBytes))
 	for {
