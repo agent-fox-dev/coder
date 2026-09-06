@@ -401,6 +401,9 @@ func (d *decoder) consume(r *provider.SSEReader) error {
 }
 
 func (d *decoder) chunk(data []byte) error {
+	if err := provider.GuardUntrusted(data); err != nil {
+		return fmt.Errorf("openai: %w", err)
+	}
 	var ch wireChunk
 	if err := json.Unmarshal(data, &ch); err != nil {
 		return fmt.Errorf("openai: decoding chunk: %w", err)

@@ -36,6 +36,7 @@ left to be discovered.
 
 | Package | What it owns |
 |---|---|
+| `wire` | Bounded, strict decoder for bytes AgentKit did not produce: hand-rolled scanner, reflective binder, framed reader. |
 | `jsonx` | Order-preserving JSON. Decodes once, marshals in slice order at every depth. |
 | `schema` | Structured JSON Schema value + typed combinators. No reflection, no codegen. |
 | `core` | Canonical vocabulary and every interface seam: messages, content blocks, events, `EventStream`, `Tool`, `ProviderClient`. |
@@ -117,6 +118,26 @@ shallower one; a vendored dependency that is itself a git checkout does not
 inherit the outer project's rules. Without the boundary, a rule the outer
 project wrote about *its* build output silently deletes files from the listing
 of a repository that has never heard of it.
+
+**Duplicate object keys are a rejection, not a resolution**
+([`wire/`](wire/)). `encoding/json` silently takes the last one, which hands an
+untrusted peer the choice of which of two values AgentKit sees — and the one it
+does not see is the one a human reviewing the message read. That is why this
+package has its own scanner rather than driving `json.Decoder`: duplicates are
+invisible through `Token()`, which reports both.
+
+Two more from the same file. **A `Content-Length` is parsed as `uint64` and
+range-checked before it is narrowed** — parse it as `int` on a 32-bit build and
+a declared 2³¹ wraps negative, sails past a `> max` check, and panics on a
+negative slice bound, which is a remote crash from a header field. And **no
+buffer is sized to a declared length**: a peer announcing 16 MiB and sending
+one byte must cost one byte, or the number in the header is a free allocation
+primitive.
+
+**Field matching is case-sensitive**, unlike `encoding/json`. `id` and `Id` are
+two distinct keys, so duplicate-key rejection does not catch them; case-folded
+matching then binds both to one field with the last one winning, reintroducing
+exactly the last-wins the layer below rejects.
 
 **The audit trail records an arguments HASH, never the arguments**
 ([`audit.go`](audit.go)). REQ-OBS-05 says hash, and the word is the design: an
@@ -334,6 +355,15 @@ confirmed to turn the corresponding test red:
 | Take one global lock instead of a keyed one | `TestPerVendorLocksDoNotSerializeDifferentVendors` |
 | Never release a refcounted lock entry | `TestVendorLocksAreReleased` |
 | Rewrite a stored bearer into an API-key header | `TestACredentialStoreReachesEveryWire` |
+| Resolve duplicate keys last-wins | `TestDuplicateKeysAreRejected` |
+| Parse a `Content-Length` as `int` | `TestAContentLengthIsRangeCheckedInUint64` |
+| Pre-allocate to a declared frame length | `TestNoBufferIsPreAllocatedToADeclaredSize` |
+| Resynchronize after a malformed frame | `TestAReaderIsPoisonedByItsFirstMalformedFrame` |
+| Ignore an unknown property | `TestAnUnknownPropertyIsARejection` |
+| Match struct fields case-insensitively | `TestFieldMatchingIsCaseSensitive` |
+| Accept an integer past the safe-integer range | `TestIntegersOutsideTheSafeRangeAreRejected` |
+| Let an explicit `null` reach the reflective setter | `TestExplicitNullNeverPanics` |
+| Validate only the root struct | `TestTheValidatorHookRunsPerStructAtItsOwnPath` |
 | Record tool arguments instead of their hash | `TestTheAuditTrailHashesArgumentsRatherThanRecordingThem` |
 | Fire session-end only on a clean run | `TestSessionStartAndEndFireOnEveryExit` |
 | Infer an MCP server from an unprefixed tool name | `TestMCPServerOf` |
@@ -341,7 +371,7 @@ confirmed to turn the corresponding test red:
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
-Eight attempts **failed to discriminate**, which is worth stating because a
+Nine attempts **failed to discriminate**, which is worth stating because a
 mutation that does not distinguish the two implementations proves nothing
 about the test. Four came from one sitting on the SSRF guard, and each was a
 test that passed for a reason other than the one it claimed:
@@ -356,7 +386,9 @@ test that passed for a reason other than the one it claimed:
 All four were rewritten to fail against their mutation. Two more came from the
 audit work: a `MCPServerOf` table with no local tool name containing the
 separator, and a panic mutation that still called `recover()` and so still
-swallowed the panic it was meant to release.
+swallowed the panic it was meant to release. The ninth measured `HeapAlloc`
+after a `runtime.GC()` to catch a 16 MiB pre-allocation that was already
+garbage by the time it looked — `TotalAlloc` is the instrument that survives.
 
 The original abort test cancelled *before* the batch, where correct and broken
 implementations behave identically. It now cancels mid-batch, where the broken
@@ -372,8 +404,9 @@ with `CGO_ENABLED=0` the toolchain excludes cgo files by build constraint, so
 A cgo-off gate cannot see the thing it claims to check.
 
 Also included: `FuzzRepairAlwaysSendable` (432k executions clean),
-`FuzzSalvageAlwaysProducesValidJSON` (1.6M clean), `FuzzSessionLogLoad`, and a
-cross-target build gate for `linux/amd64`,
+`FuzzSalvageAlwaysProducesValidJSON` (1.6M clean),
+`FuzzGuardNeverPanics` (2.3M) and `FuzzBindNeverPanics` (2.9M),
+`FuzzSessionLogLoad`, and a cross-target build gate for `linux/amd64`,
 `linux/arm64`, `darwin/arm64` and `windows/amd64`.
 
 ## What is not built
@@ -397,6 +430,8 @@ Stated plainly so nobody reports it as done.
   exits 1, which is NFR-TEST-07.3's required answer rather than a bug. The
   unit suite pins the wire format against *regression*; only a reference pins
   it against *truth*, and the weaker claim is the honest one until then.
+- **MCP transports.** The bounded strict decoder they need ([`wire`](wire/))
+  ships and is fuzzed; the JSON-RPC layer above it does not.
 - **`docs/PROVIDERS.md`** (NFR-COMPAT-07): the ledger of pinned API versions
   and capture dates. It has nothing to record until the harness has a corpus.
 

@@ -3,7 +3,7 @@
 **Author:** [Platform Engineering]
 **Date:** 2026-09-05
 **Status:** Draft
-**Version:** 0.3.3
+**Version:** 0.3.4
 
 > **Revision note (0.3.0).** This revision incorporates a review of a shipped, zero-dependency
 > Go agent SDK and coding agent of comparable scope and identical constraints
@@ -18,6 +18,10 @@
 >
 > **0.3.2** corrects REQ-LOOP-02's wire table: Ollama's native API and Gemini's `generateContent`
 > pair tool results **positionally**, with no id on the wire at all. See §6.1.
+>
+> **0.3.4** scopes REQ-SEC-12.1. Unknown-property REJECTION applies to protocol payloads
+> (JSON-RPC, MCP), not to provider responses, which get REQ-SEC-11's bounds and
+> duplicate-key rejection and stay tolerant of additive vendor changes. See §6.11.
 >
 > **0.3.3** applies NFR-PERF-09 to itself: four budgets now have benchmarks and threshold
 > tests, and **NFR-PERF-02 and NFR-PERF-08 are demoted to design guidance** because the
@@ -908,6 +912,9 @@ A context file is repository-authored standing instruction text (house style, bu
   3. A `Validator` hook runs as soon as each struct is filled, for constraints the Go type shape cannot express (`minLength`, `minimum`, literal unions).
   4. Explicit `null` for an untyped field must be handled without reflection panics. A reflective setter that panics on null means any peer can crash the process by sending `null` for a tool input.
   5. This applies to **protocol payloads only**. Locally authored manifests (skills, plugins) are decoded leniently — REQ-SKILL-10.
+  6. **Provider responses take the bounds, not the unknown-property rejection** (amended in 0.3.4). REQ-SEC-11's size, depth, container and duplicate-key rules apply to every untrusted surface including a provider response: they cost one linear scan, nothing legitimate trips them, and duplicate-key rejection closes a real hole — a gateway sending two `stop_reason` members and letting last-wins decide which one the loop acts on.
+
+      Rule 1 does not apply there, and the reasoning is worth recording rather than leaving as a silent exception. The threat rule 1 names is a peer *smuggling* fields to reach code paths the schema was meant to gate, which requires the decoded value to be forwarded somewhere that reads it dynamically. An MCP tool result is such a value: it flows into a handler, and a tool definition flows into the prompt. A provider response is not: it is read into a fixed `AssistantMessage` with typed fields and no dynamic dispatch, so an extra member reaches nothing. Meanwhile the cost of rejecting one is certain and total — the day a vendor adds a field to a streaming event, every request fails — and that is the exact opposite of the position this document takes in REQ-SESS-05.2 ("a loader that drops what it does not model silently destroys data written by a newer version") and in `RawBlock`. Applying rule 1 uniformly would trade a threat that cannot reach anything for an outage that certainly will.
 - **REQ-SEC-13 (attribution disclosure and opt-out):** Any header AgentKit sends to a third-party provider that identifies AgentKit, the consuming application, or the session is *attribution* and is governed by this requirement.
   1. The complete per-provider set is enumerated in a dedicated documentation section. Changing that set is a documented, released change even when no other code changes.
   2. A single kill switch — `AGENTKIT_TELEMETRY=0`, or `AgentConfig.Attribution = false` — disables every attribution header. The default being on is precisely why it must be disclosed.

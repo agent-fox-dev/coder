@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/agentfox/agentkit-go/wire"
 )
 
 // ErrSSETruncated is the mid-stream truncation of REQ-PROV-04.
@@ -135,3 +137,25 @@ func splitField(line []byte) (name, value []byte) {
 	}
 	return name, value
 }
+
+// GuardUntrusted applies REQ-SEC-11's bounds to bytes a provider sent.
+//
+// SCOPE, and it is deliberate. REQ-SEC-12 names provider responses as a
+// surface for the strict tree decoder, but strictness has two halves with very
+// different cost/benefit here:
+//
+//   - The BOUNDS and duplicate-key rejection apply. They cost one linear scan,
+//     they close real holes (a gateway sending two stop_reasons and letting
+//     last-wins pick), and nothing legitimate trips them.
+//   - Unknown-field REJECTION does not. REQ-SEC-12.1's threat is a peer
+//     smuggling fields to reach code paths the schema was meant to gate, which
+//     requires the decoded value to be forwarded somewhere that reads it
+//     dynamically. A provider response is read into a fixed
+//     core.AssistantMessage with typed fields; an extra field reaches nothing.
+//     Meanwhile the cost is certain: the day a vendor adds a field to
+//     message_delta, every request fails. That is the opposite of the stance
+//     this document takes in REQ-SESS-05.2 and core.RawBlock.
+//
+// The PRD is amended accordingly (0.3.4). MCP payloads, when they land, get
+// the full wire.Parse + wire.Bind path.
+func GuardUntrusted(data []byte) error { return wire.Guard(data, wire.Limits{}) }

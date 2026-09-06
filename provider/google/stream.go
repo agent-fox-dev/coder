@@ -303,6 +303,9 @@ func (d *decoder) consume(r *provider.SSEReader) error {
 }
 
 func (d *decoder) chunk(data []byte) error {
+	if err := provider.GuardUntrusted(data); err != nil {
+		return fmt.Errorf("google: %w", err)
+	}
 	var wr wireResponse
 	if err := json.Unmarshal(data, &wr); err != nil {
 		return fmt.Errorf("google: decoding chunk: %w", err)

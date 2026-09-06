@@ -218,6 +218,9 @@ func (d *decoder) consume(r *provider.NDJSONReader) error {
 }
 
 func (d *decoder) chunk(line []byte) error {
+	if err := provider.GuardUntrusted(line); err != nil {
+		return fmt.Errorf("ollama: %w", err)
+	}
 	var ch wireChunk
 	if err := json.Unmarshal(line, &ch); err != nil {
 		return fmt.Errorf("ollama: decoding chunk: %w", err)

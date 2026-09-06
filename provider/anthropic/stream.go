@@ -307,6 +307,15 @@ func (d *decodeState) event(ev provider.SSEEvent) error {
 	switch ev.Type {
 	case "ping", "":
 		return nil
+	}
+	// REQ-SEC-11: bytes a provider sent are bytes we did not produce. One
+	// linear scan enforces the size, depth and container bounds and rejects
+	// duplicate keys, which is what stops a gateway sending two stop_reasons
+	// and letting last-wins choose which one we act on.
+	if err := provider.GuardUntrusted(ev.Data); err != nil {
+		return fmt.Errorf("anthropic: %s event: %w", ev.Type, err)
+	}
+	switch ev.Type {
 
 	case "error":
 		var we wireError
@@ -499,6 +508,9 @@ func (d *decodeState) fail(text string, err error) {
 // call. Sharing the assembler is what makes that true by construction rather
 // than by coincidence, and DecodeResponse is how the test can say so.
 func DecodeResponse(m *core.Model, data []byte, lookup func(string) *core.Model) (*core.AssistantMessage, error) {
+	if err := provider.GuardUntrusted(data); err != nil {
+		return nil, fmt.Errorf("anthropic: decoding response: %w", err)
+	}
 	var wr wireResponse
 	if err := json.Unmarshal(data, &wr); err != nil {
 		return nil, fmt.Errorf("anthropic: decoding response: %w", err)
