@@ -416,6 +416,8 @@ confirmed to turn the corresponding test red:
 | Check the HTTP method before authenticating | `TestAuthenticationRunsBeforeTheMethodCheck` |
 | Resynchronize after a malformed MCP frame | `TestAMalformedFrameTearsTheConnectionDown` |
 | Walk past an array of tables resolving `[a.b]` | `TestASubTableUnderAnArrayElementBelongsToThatElement` |
+| Expose MCP tools unqualified | `TestMCPToolsAreGatedByQualifiedNameEverywhere` |
+| Adapt an MCP tool without its server name | `TestAnMCPToolCallIsAuditedWithItsServerName` |
 | Record tool arguments instead of their hash | `TestTheAuditTrailHashesArgumentsRatherThanRecordingThem` |
 | Fire session-end only on a clean run | `TestSessionStartAndEndFireOnEveryExit` |
 | Infer an MCP server from an unprefixed tool name | `TestMCPServerOf` |
