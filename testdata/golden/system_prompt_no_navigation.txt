@@ -6,6 +6,8 @@ what to do differently. Prefer one correct call to several speculative ones.
 
 Guidelines:
 - Read a file before editing it.
+- Use run_command when an argument contains spaces or shell metacharacters; nothing is re-parsed by a shell.
+- powershell runs only on Windows; prefer execute for portable commands.
 - Use execute for file operations like ls, rg, find.
 - Do not guess at file contents or APIs; read them.
 - Report what you actually did, including what failed.

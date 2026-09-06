@@ -197,6 +197,27 @@ against the stream's own URL and then checked: same scheme, same host, same
 port, or we do not send. Relative endpoints (`/messages?sessionId=…`) are the
 common case and are precisely what the rule makes safe.
 
+**The default tool set is platform-stable, `powershell` included**
+([`tools/powershell.go`](tools/powershell.go)). REQ-TOOL-06 asks for the second
+shell dialect as a *separately named* tool registered on every platform, with
+the platform check deferred to execution — and the reason is the tool list, not
+PowerShell. That list is the head of the cached prompt prefix, so a set that
+differed between a Linux runner and a Windows box would give each a different
+prefix hash and neither would ever hit the other's provider-side cache. The
+symptom would be a bill, not an error.
+
+**The edit fallback is a match key, never an output**
+([`tools/fold.go`](tools/fold.go)). REQ-TOOL-04d's whitespace-tolerant pass
+runs *only* after exact matching has failed for the whole batch, matches at
+line granularity, and splices whole **original** lines back — so every line the
+edit did not touch keeps its exact bytes, curly quotes and trailing spaces
+included. A pass that emitted its own fold would turn a one-line edit into a
+whole-file ASCII-ification nobody asked for. Trailing whitespace is folded and
+*leading* whitespace is not: indentation is semantic in Go, Python, YAML and
+Makefiles alike, and trimming it would let an edit match at the wrong nesting
+level. NFKC is not in the standard library, so this is a hand-rolled fold over
+the confusable set — the cost REQ-TOOL-04d says to pay deliberately.
+
 **MCP is pinned to `2026-07-28`, modern-only.** That revision removed the
 `initialize` handshake, protocol-level sessions and `Mcp-Session-Id`, `ping`,
 the HTTP GET stream and SSE resumability, and server-initiated requests.
@@ -570,6 +591,13 @@ confirmed to turn the corresponding test red:
 | Share compat keys between two wire APIs | `TestTheCompatProfileKeysAreDisjointFromChatCompletions` |
 | Seed tool arguments from the item placeholder | `TestAPlaceholderArgumentStringIsNotSeededIntoTheDeltas` |
 | Bump a pinned API version without the ledger | `TestTheProviderLedgerMatchesTheCode` |
+| Route `run_command` through a shell | `TestRunCommandDoesNotGoThroughAShell` |
+| Register `powershell` only where it runs | `TestPowerShellIsRegisteredOnEveryPlatform` |
+| Probe the platform at registration rather than on call | `TestPowerShellDefersItsPlatformCheckToExecution` |
+| Let a folded match beat an exact one | `TestAnExactMatchIsNeverOverriddenByAFoldedOne` |
+| Write the fold back instead of the original lines | `TestUntouchedLinesKeepTheirExactBytes` |
+| Fold leading whitespace away | `TestTrailingWhitespaceIsToleratedButLeadingIsNot` |
+| Apply the rescuable half of a batch | `TestAPartiallyRescuedBatchIsRejected` |
 
 Twelve attempts **failed to discriminate**, which is worth stating because a
 mutation that does not distinguish the two implementations proves nothing
@@ -617,19 +645,6 @@ Also included: `FuzzRepairAlwaysSendable` (432k executions clean),
 
 Stated plainly so nobody reports it as done.
 
-- **`run_command` and `powershell`** (REQ-TOOL-06). The requirement names both
-  alongside `execute`: `run_command(argv []string)` for structured invocation
-  with no shell interpolation, and `powershell` as a *separately named* tool
-  registered on every platform with the platform check deferred to execution,
-  so the tool list — and therefore the cached prompt prefix — stays
-  platform-stable. `execute` ships; neither of these does.
-- **REQ-TOOL-04d's whitespace-tolerant fallback.** The BOM and CRLF half is
-  built (`NormalizeForEdit`/`Restore`). The fallback pass that runs *only after
-  exact matching fails for every edit* — NFKC, per-line trailing-whitespace
-  trim, and folding of smart quotes, dash variants and exotic spaces to ASCII —
-  is not. The requirement flags the cost itself: NFKC is not in the standard
-  library, so closing this means a hand-rolled fold over the confusable set,
-  paid deliberately against REQ-GO-11.
 - **Reference bodies for the differential harness.** The harness itself ships
   ([`difftest/`](difftest/), a separate module) and its own suite is
   mutation-verified. It has no scenarios, because NFR-TEST-06.3 forbids

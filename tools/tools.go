@@ -59,6 +59,8 @@ func All(opts Options) ([]core.Tool, error) {
 		fs.findFiles(),
 		fs.searchFiles(),
 		executeTool(opts),
+		runCommandTool(opts),
+		PowerShell(opts),
 	}, nil
 }
 
@@ -584,27 +586,93 @@ func executeTool(opts Options) core.Tool {
 			if err != nil {
 				return core.ErrResult("exec_failed", err.Error())
 			}
-			code := res.ExitCode
-			md := &core.ToolMetadata{
-				Truncated:  res.Truncated,
-				TotalBytes: res.TotalBytes,
-				SpillPath:  res.SpillPath,
-				DurationMS: res.Duration.Milliseconds(),
-				ExitCode:   &code,
-				Outcome:    string(res.Outcome),
+			return execResultToTool(res)
+		},
+	}
+}
+
+// execResultToTool is the REQ-TOOL-08 envelope for a subprocess result.
+//
+// Shared by execute, run_command and powershell: the envelope is a property of
+// having run a subprocess, not of how the command was spelled, and three
+// copies would drift on the next field added to ToolMetadata.
+func execResultToTool(res ExecResult) core.ToolResult {
+	code := res.ExitCode
+	md := &core.ToolMetadata{
+		Truncated:  res.Truncated,
+		TotalBytes: res.TotalBytes,
+		SpillPath:  res.SpillPath,
+		DurationMS: res.Duration.Milliseconds(),
+		ExitCode:   &code,
+		Outcome:    string(res.Outcome),
+	}
+	if res.Truncated {
+		md.TruncatedBy = string(TruncatedByBytes)
+	}
+	out := core.ToolResult{
+		OK:       res.Outcome == OutcomeOK,
+		Data:     map[string]any{"output": res.Output, "exit_code": code, "outcome": string(res.Outcome)},
+		Metadata: md,
+	}
+	if !out.OK {
+		out.Error = "command_" + string(res.Outcome)
+	}
+	return out
+}
+
+// runCommandTool is REQ-TOOL-06's structured variant.
+//
+// The model picks between this and `execute` by NAME, which is the point: a
+// shell-features argument on one tool would be a choice the model gets wrong
+// silently. Here there is no shell at all, so a path with a space or a
+// semicolon in it is just an argument.
+func runCommandTool(opts Options) core.Tool {
+	return core.Tool{
+		Name:    "run_command",
+		Builtin: true,
+		Description: "Run a program with an explicit argument list and NO shell. " +
+			"Pipes, redirection, globs and $() do not work here — use execute for those. " +
+			"Prefer this when arguments come from data, since nothing is re-parsed.",
+		ExecutionMode: core.Sequential,
+		InputSchema: schema.Object(
+			schema.Prop("argv", schema.Array(schema.String(),
+				"Program and arguments, e.g. [\"git\", \"commit\", \"-m\", \"a message\"]")),
+			schema.Opt("timeout_s", schema.Int("Seconds before the process tree is killed")),
+		),
+		PromptGuidelines: []string{
+			"Use run_command when an argument contains spaces or shell metacharacters; " +
+				"nothing is re-parsed by a shell.",
+		},
+		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
+			var a struct {
+				Argv     []string `json:"argv"`
+				TimeoutS int      `json:"timeout_s"`
 			}
-			if res.Truncated {
-				md.TruncatedBy = string(TruncatedByBytes)
+			if err := json.Unmarshal(in, &a); err != nil {
+				return core.ErrResult("invalid_arguments", err.Error())
 			}
-			out := core.ToolResult{
-				OK:       res.Outcome == OutcomeOK,
-				Data:     map[string]any{"output": res.Output, "exit_code": code, "outcome": string(res.Outcome)},
-				Metadata: md,
+			if len(a.Argv) == 0 || strings.TrimSpace(a.Argv[0]) == "" {
+				return core.ErrResult("invalid_arguments",
+					"argv must name a program as its first element")
 			}
-			if !out.OK {
-				out.Error = "command_" + string(res.Outcome)
+			if a.TimeoutS < 0 {
+				return core.ErrResult("invalid_arguments", "timeout_s must be positive")
 			}
-			return out
+			dir := ""
+			if opts.Workspace != nil {
+				dir = opts.Workspace.Root
+			}
+			res, err := RunArgv(ctx, a.Argv, ExecOptions{
+				Dir:      dir,
+				Timeout:  time.Duration(a.TimeoutS) * time.Second,
+				MaxBytes: DefaultByteLimit,
+				SpillDir: opts.SpillDir,
+				Env:      opts.Env,
+			})
+			if err != nil {
+				return core.ErrResult("exec_failed", err.Error())
+			}
+			return execResultToTool(res)
 		},
 	}
 }
