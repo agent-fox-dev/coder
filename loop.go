@@ -171,6 +171,7 @@ func (a *Agent) runLoop(ctx context.Context, s *core.EventStream, initial *core.
 	}
 
 	s.Push(core.AgentStartEvent{SessionID: a.cfg.SessionID, Provider: a.cfg.Model.Provider, API: a.cfg.Model.API, Model: a.cfg.Model.ID})
+	a.audit(core.AuditEvent{Kind: core.AuditSessionStart, Timestamp: startedAt})
 
 	// Outer loop: a pending follow-up restarts it within the SAME run — no
 	// second AgentStartEvent, one RunResult (REQ-LOOP-14).
@@ -360,6 +361,19 @@ outer:
 	done := core.AgentDoneEvent{Result: res, Usage: res.Usage}
 	s.Push(done)
 	a.fireAgentDone(done)
+
+	// REQ-OBS-03's session end fires on EVERY exit — clean, errored or
+	// aborted. A hook that fires only on the happy path is worse than none: an
+	// auditor cannot then tell a session that ended badly from one still
+	// running, which is the case they most need to see.
+	end := core.AuditEvent{
+		Kind: core.AuditSessionEnd, Usage: res.Usage, StopReason: res.StopReason,
+	}
+	if runErr != nil {
+		end.Error = runErr.Error()
+	}
+	a.audit(end)
+
 	if runErr != nil {
 		a.fireError(runErr)
 	}

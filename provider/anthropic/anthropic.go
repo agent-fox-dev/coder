@@ -165,6 +165,22 @@ func NormalizeToolCallID(s string) string {
 // provider contract, not the loop's, because the loop is not running when a
 // transcript is loaded from disk.
 func BuildRequest(m *core.Model, req core.Request, retention core.CacheRetention) (*request, provider.RepairReport, error) {
+	out, rep, _, err := BuildRequestCached(m, req, retention, nil)
+	return out, rep, err
+}
+
+// BuildRequestCached is BuildRequest with REQ-CACHE-06's per-session schema
+// cache attached. A nil prefix marshals every schema, which is what
+// BuildRequest does and what a one-shot caller wants.
+//
+// NFR-PERF-03 is why this exists rather than being an internal detail: tool
+// schema serialization "must be computed once per session and cached, not
+// recomputed on every model call", and at 128 tools that recomputation is
+// ~0.9 ms of the ~1.5 ms it takes to build a request — the dominant term, paid
+// on every turn, for bytes that did not change.
+func BuildRequestCached(m *core.Model, req core.Request, retention core.CacheRetention,
+	prefix *provider.ToolPrefix) (*request, provider.RepairReport, provider.SyncReport, error) {
+	var sync provider.SyncReport
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeToolCallID))
 
 	out := &request{
@@ -192,27 +208,31 @@ func BuildRequest(m *core.Model, req core.Request, retention core.CacheRetention
 	// whole provider-side cache over one added tool.
 	split := provider.SplitDeferredTools(req.Tools, req.Messages)
 	out.immediateTools = len(split.Immediate)
-	appendTools := func(ts []core.ToolWire, deferred bool) error {
+	// ONE Sync over the whole tool list, before the split. Syncing the two
+	// halves separately would make each call see the other half as removed —
+	// reporting a prefix invalidation on every turn and evicting the very
+	// entries the cache exists to keep.
+	schemas, srep, err := prefix.Sync(req.Tools)
+	if err != nil {
+		return nil, rep, sync, err
+	}
+	sync = srep
+	byName := make(map[string]json.RawMessage, len(req.Tools))
+	for i, tw := range req.Tools {
+		byName[tw.Name] = schemas[i]
+	}
+	appendTools := func(ts []core.ToolWire, deferred bool) {
 		for _, tw := range ts {
-			raw, err := json.Marshal(tw.InputSchema)
-			if err != nil {
-				return err
-			}
-			t := tool{Name: tw.Name, Description: tw.Description, InputSchema: raw}
+			t := tool{Name: tw.Name, Description: tw.Description, InputSchema: byName[tw.Name]}
 			if deferred {
 				yes := true
 				t.DeferLoading = &yes
 			}
 			out.Tools = append(out.Tools, t)
 		}
-		return nil
 	}
-	if err := appendTools(split.Immediate, false); err != nil {
-		return nil, rep, err
-	}
-	if err := appendTools(split.Deferred, true); err != nil {
-		return nil, rep, err
-	}
+	appendTools(split.Immediate, false)
+	appendTools(split.Deferred, true)
 
 	// ToolChoice absent is NOT auto: a provider must not invent a selection
 	// when the field is empty (REQ-TOOL-16). An explicit choice is forwarded
@@ -226,7 +246,7 @@ func BuildRequest(m *core.Model, req core.Request, retention core.CacheRetention
 	}
 
 	StampCacheControl(out, retention, m)
-	return out, rep, nil
+	return out, rep, sync, nil
 }
 
 // StampCacheControl places the §6.2a Level 1 breakpoints.

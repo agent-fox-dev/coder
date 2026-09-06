@@ -3,6 +3,7 @@ package agentkit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -39,6 +40,16 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 	cfg := a.cfg
 	tools := ResolveToolPolicy(a.tools, cfg.ToolPolicy)
 	a.mu.Unlock()
+
+	// Read ONCE, here, alongside cfg. Reaching back through a.mu from inside a
+	// thunk would put lock traffic on the per-tool path of a parallel batch —
+	// the one path NFR-PERF-04 asks to be genuinely concurrent — and would
+	// acquire the agent lock from a goroutine the executor does not own.
+	tracer := cfg.Tracer
+	if tracer == nil {
+		tracer = core.NoopTracer
+	}
+	auditSession := cfg.SessionID
 
 	byName := make(map[string]core.Tool, len(tools))
 	for _, t := range tools {
@@ -123,8 +134,34 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 			start := time.Now()
 			s.Push(core.ToolExecutionStartEvent{ToolUseID: c.ID, Name: c.Name})
 
-			// Only the handler body runs outside the lock.
-			out := invokeHandler(ctx, tool, prepared)
+			// REQ-OBS-02: a span around the HANDLER, wrapping only the part
+			// that does work. Wrapping the finalize block as well would put
+			// every peer's span duration inside every other peer's, because
+			// finalization is serialized under the batch mutex — so a parallel
+			// batch would trace as though it were sequential.
+			var out core.ToolResult
+			_ = tracer.StartSpan("agentkit.tool_call", func(sp core.Span) error {
+				defer sp.End()
+				out = invokeHandler(ctx, tool, prepared)
+				sp.SetAttributes(map[string]any{
+					"tool_name":   c.Name,
+					"tool_use_id": c.ID,
+					"is_error":    !out.OK,
+					"elapsed_ms":  time.Since(start).Milliseconds(),
+				})
+				if !out.OK {
+					sp.SetStatus(errors.New(out.Error))
+				}
+				return nil
+			})
+			a.audit(core.AuditEvent{
+				Kind: core.AuditToolCall, SessionID: auditSession,
+				ToolName: c.Name, ToolUseID: c.ID,
+				ServerName:    MCPServerOf(c.Name),
+				ArgumentsHash: ArgumentsHash(prepared.Raw),
+				IsError:       !out.OK,
+				ElapsedMS:     time.Since(start).Milliseconds(),
+			})
 
 			// ---- Phase 3, per call: finalize under the batch mutex.
 			// A func-scoped critical section with a DEFERRED unlock: a

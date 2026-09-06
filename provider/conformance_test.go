@@ -554,3 +554,64 @@ func TestOllamaReportsErrorsInsideA200Body(t *testing.T) {
 		t.Fatalf("error = %q, want the server's own text", msg.ErrorMessage)
 	}
 }
+
+// TestACredentialStoreReachesEveryWire is REQ-AUTH-05 through the real
+// dispatch path.
+//
+// The store is the layer that can hold a refreshed OAuth token, and it is
+// useless if only one provider consults it. This asserts the token reaches the
+// wire on all four — and, on Google, that a stored Authorization header
+// survives instead of being rewritten into x-goog-api-key, which is the
+// Vertex/ADC path of NFR-COMPAT-05.
+func TestACredentialStoreReachesEveryWire(t *testing.T) {
+	store := &provider.MemoryStore{}
+	for _, vendor := range []string{"anthropic", "openai", "google", "ollama"} {
+		if err := store.Save(context.Background(), vendor, provider.Credential{
+			AccessToken: "stored-oauth-token", Scheme: provider.SchemeBearer,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	creds := provider.NewCredentials(store)
+
+	for _, c := range cases() {
+		t.Run(c.name, func(t *testing.T) {
+			p := withCredentials(t, c.name, creds)
+			var hdr http.Header
+			req := core.Request{Options: core.RequestOptions{
+				Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					hdr = r.Header.Clone()
+					return &http.Response{StatusCode: 200, Header: http.Header{},
+						Body: io.NopCloser(strings.NewReader(c.stream))}, nil
+				}),
+			}}
+			p.Stream(context.Background(), c.model, req, core.ProviderStreamOptions{}).Result()
+
+			if got := hdr.Get("Authorization"); got != "Bearer stored-oauth-token" {
+				t.Fatalf("Authorization = %q, want the stored credential. The environment "+
+					"table cannot hold a refreshed token; only the store can.", got)
+			}
+			if hdr.Get("X-Goog-Api-Key") != "" {
+				t.Fatal("a stored OAuth token must not be rewritten into an API-key " +
+					"header: that is the Vertex/ADC path and it expects a bearer")
+			}
+		})
+	}
+}
+
+func withCredentials(t *testing.T, api string, creds *provider.Credentials) core.APIProvider {
+	t.Helper()
+	none := func(string) string { return "" }
+	switch api {
+	case string(anthropic.API):
+		return anthropic.Provider(anthropic.Options{Getenv: none, Credentials: creds})
+	case string(openai.API):
+		return openai.Provider(openai.Options{Getenv: none, Credentials: creds})
+	case string(google.API):
+		return google.Provider(google.Options{Getenv: none, Credentials: creds})
+	case string(ollama.API):
+		return ollama.Provider(ollama.Options{Getenv: none, Credentials: creds})
+	}
+	t.Fatalf("no constructor for %q", api)
+	return core.APIProvider{}
+}

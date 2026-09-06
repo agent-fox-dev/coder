@@ -36,13 +36,14 @@ left to be discovered.
 
 | Package | What it owns |
 |---|---|
+| `wire` | Bounded, strict decoder for bytes AgentKit did not produce: hand-rolled scanner, reflective binder, framed reader. |
 | `jsonx` | Order-preserving JSON. Decodes once, marshals in slice order at every depth. |
 | `schema` | Structured JSON Schema value + typed combinators. No reflection, no codegen. |
 | `core` | Canonical vocabulary and every interface seam: messages, content blocks, events, `EventStream`, `Tool`, `ProviderClient`. |
 | `catalog` | Embedded model catalog, resolution, sibling-cloning, `max_tokens` and thinking-level clamping. |
 | `session` | Append-only JSONL log, damage-tolerant loader, branch tree, resume fold. |
 | `skills` | Skill manifests (hand-rolled TOML subset), progressive disclosure, project context files, and the default-off trust gate. |
-| `tools` | Built-in tools, path containment, bounded accumulator, process control, glob, and a layered gitignore engine. |
+| `tools` | Built-in tools, path containment, bounded accumulator, process control, glob, a layered gitignore engine, and `fetch_url` behind an SSRF guard. |
 | `provider` | Send-time transcript repair, HTTP transport + retry, credential resolution, header precedence, cost arithmetic, SSE decoding — everything shared by every wire API. |
 | `provider/{anthropic,openai,google,ollama,faux}` | One wire API each, encode and decode. |
 | `difftest` | Separate module: the NFR-TEST-06/07 differential harness — canonicalizing comparator, key-order side channel, divergence ledger, exit machine. |
@@ -118,6 +119,72 @@ inherit the outer project's rules. Without the boundary, a rule the outer
 project wrote about *its* build output silently deletes files from the listing
 of a repository that has never heard of it.
 
+**Duplicate object keys are a rejection, not a resolution**
+([`wire/`](wire/)). `encoding/json` silently takes the last one, which hands an
+untrusted peer the choice of which of two values AgentKit sees — and the one it
+does not see is the one a human reviewing the message read. That is why this
+package has its own scanner rather than driving `json.Decoder`: duplicates are
+invisible through `Token()`, which reports both.
+
+Two more from the same file. **A `Content-Length` is parsed as `uint64` and
+range-checked before it is narrowed** — parse it as `int` on a 32-bit build and
+a declared 2³¹ wraps negative, sails past a `> max` check, and panics on a
+negative slice bound, which is a remote crash from a header field. And **no
+buffer is sized to a declared length**: a peer announcing 16 MiB and sending
+one byte must cost one byte, or the number in the header is a free allocation
+primitive.
+
+**Field matching is case-sensitive**, unlike `encoding/json`. `id` and `Id` are
+two distinct keys, so duplicate-key rejection does not catch them; case-folded
+matching then binds both to one field with the last one winning, reintroducing
+exactly the last-wins the layer below rejects.
+
+**The audit trail records an arguments HASH, never the arguments**
+([`audit.go`](audit.go)). REQ-OBS-05 says hash, and the word is the design: an
+audit trail is precisely the artifact that gets shipped to a log aggregator and
+retained for years, while tool arguments routinely carry file contents,
+credentials and personal data. A hash correlates the same call across sessions
+without making the audit log the largest copy of the data it describes.
+`server_name` is derived from the REQ-SEC-08 tool-name prefix, so it is right
+for any tool following the convention and *empty* — rather than wrong — for one
+that is not.
+
+**Session end fires on every exit**, clean, errored or aborted. A hook that
+fires only on the happy path is worse than none: an auditor cannot then
+distinguish a session that ended badly from one still running, which is the
+case they most need to see.
+
+**OAuth refresh is double-checked inside the lock**
+([`provider/credentials.go`](provider/credentials.go)). Without the second
+check, N concurrent turns arriving on an expired token each POST the same
+refresh token, the provider rotates it N times, and N−1 turns are left holding
+a credential the provider has already invalidated. The session does not fail
+cleanly — it fails N−1 times out of N, intermittently, and reads as a flaky
+provider. The first check, outside the lock, exists so the common case (a valid
+token) does not serialize turns that have nothing to coordinate.
+
+Two nearby details: the refresh carries **its own timeout** because it holds
+the per-vendor lock, and a zero `ExpiresAt` means *never expires*, not *expired
+at the epoch* — read the other way it refreshes a plain API key, which has no
+refresh flow, on every turn.
+
+**The SSRF guard validates at connect time, not only at resolution**
+([`tools/ssrf.go`](tools/ssrf.go)). Checking only the DNS answer leaves a
+TOCTOU window a rebind walks straight through: the name resolves to a public
+address for the check and to `169.254.169.254` for the connect, and the SDK
+fetches the cloud instance credentials on the attacker's behalf. The
+`Dialer.Control` check runs on the concrete address the kernel is about to
+connect to, and it is the one that actually holds.
+
+Two more that look like details and are not. **Every resolved address must
+pass, not merely the one we would have picked** — a name answering with one
+public and one private address *is* the attack, and "connect to the first
+permitted one" hands over a retry loop. And **an address is unmapped before
+classification**: `netip`'s own predicates unwrap `::ffff:10.0.0.1`, but
+`netip.Prefix.Contains` never matches across address families, so every range
+in the reserved table is reachable through its IPv4-mapped spelling unless you
+unmap first.
+
 **Compaction applies its checkpoint before estimating.** The naive reading
 oscillates: the compacted request reports small usage → the threshold passes →
 full history returns → it fails again. Each swing invalidates the provider's
@@ -192,6 +259,45 @@ results.
 **Ollama reports failure inside a 200.** A top-level `error` string on an
 otherwise ordinary chunk. The transport layer cannot see it.
 
+## Performance budgets
+
+Four numeric budgets now have a benchmark **and a threshold test that fails the
+build** — a `Benchmark` function alone prints a number nobody reads, and
+NFR-PERF-09 is explicit that a budget which cannot fail does not constrain
+anything.
+
+| Budget | Measured | Threshold |
+|---|---|---|
+| NFR-PERF-01 loop overhead per turn | ~48 µs | < 1 ms |
+| NFR-PERF-06 cache hit over a direct return | ~0.8 µs | < 0.5 ms |
+| NFR-PERF-07 `cache_control` stamping, 128 tools / 1000 messages | ~47 ns | < 1 ms |
+| NFR-PERF-03 schemas serialized on a steady-state request | 0 | 0 |
+
+NFR-PERF-03 is asserted as a **count**, not a duration. "Computed once per
+session" has an exact answer, and a count does not flake on a busy runner.
+NFR-PERF-04 (true concurrency) and NFR-PERF-05 (first token before the body
+ends) are structural, and are pinned by tests that **deadlock** rather than by
+stopwatches — the broken implementation cannot reach the assertion at all.
+
+The budget file is `//go:build !race`: the detector inflates every measurement
+by roughly an order of magnitude, so a threshold loose enough to survive it is
+too loose to catch anything.
+
+**Writing these found two things.**
+
+REQ-CACHE-06's tool-schema cache was implemented, unit-tested, and attached to
+no provider — so every request re-serialized every schema, ~0.9 ms of a ~1.4 ms
+build at 128 tools. Same shape as the session log that was built, tested and
+never written to. It is wired now, and `TestASteadyStateRequestSerializesNoSchemas`
+is the assertion that was missing.
+
+NFR-PERF-01's "per turn" is under-specified. The REQ-GO-15 estimate and the
+REQ-PROV-11 repair pass are both O(history), so a turn 500 messages deep costs
+~1.7x a first turn. Both are well inside the budget; the depth term is reported
+by `BenchmarkLoopTurnAtDepth` and deliberately given **no** threshold, because
+inventing one the requirement does not state is the unenforceable rigour
+NFR-PERF-09 objects to.
+
 ## Testing
 
 `go test -race ./...` is the default gate for the root module;
@@ -236,12 +342,53 @@ confirmed to turn the corresponding test red:
 | Let a ledger entry cover any kind at its path | `TestClassificationAndStaleEntries` |
 | Treat a stale ledger entry as clean | `TestAStaleLedgerEntryExitsThree` |
 | Report a dark run as a pass | `TestADarkRunPrintsNoTally` |
+| Classify an address without unmapping 4-in-6 | `TestIPv4MappedIPv6IsUnmappedBeforeClassification` |
+| Validate only the first resolved address | `TestTheGuardRefusesEveryResolvedAddressNotJustTheFirst` |
+| Skip per-hop scheme re-validation | `TestARedirectToHTTPIsBlockedWhenHTTPIsNotAllowed` |
+| Read the whole body, then truncate | `TestTheResponseIsCappedAt512KB` |
+| Keep caller headers across a cross-host redirect | `TestCallerHeadersAreDroppedOnACrossHostRedirect` |
+| Unwire the schema cache from the request path | `TestTheProviderOwnsAPrefixByDefault` |
+| Buffer the response body before decoding | `TestFirstTokenIsEmittedBeforeTheStreamEnds` |
+| Run tool handlers sequentially | `TestParallelToolsUseTrueConcurrency` |
+| Drop the double check inside the refresh lock | `TestConcurrentTurnsRefreshExactlyOnce` |
+| Use a bare expiry check with no validity floor | `TestTheValidityFloorRefreshesBeforeExpiry` |
+| Take one global lock instead of a keyed one | `TestPerVendorLocksDoNotSerializeDifferentVendors` |
+| Never release a refcounted lock entry | `TestVendorLocksAreReleased` |
+| Rewrite a stored bearer into an API-key header | `TestACredentialStoreReachesEveryWire` |
+| Resolve duplicate keys last-wins | `TestDuplicateKeysAreRejected` |
+| Parse a `Content-Length` as `int` | `TestAContentLengthIsRangeCheckedInUint64` |
+| Pre-allocate to a declared frame length | `TestNoBufferIsPreAllocatedToADeclaredSize` |
+| Resynchronize after a malformed frame | `TestAReaderIsPoisonedByItsFirstMalformedFrame` |
+| Ignore an unknown property | `TestAnUnknownPropertyIsARejection` |
+| Match struct fields case-insensitively | `TestFieldMatchingIsCaseSensitive` |
+| Accept an integer past the safe-integer range | `TestIntegersOutsideTheSafeRangeAreRejected` |
+| Let an explicit `null` reach the reflective setter | `TestExplicitNullNeverPanics` |
+| Validate only the root struct | `TestTheValidatorHookRunsPerStructAtItsOwnPath` |
+| Record tool arguments instead of their hash | `TestTheAuditTrailHashesArgumentsRatherThanRecordingThem` |
+| Fire session-end only on a clean run | `TestSessionStartAndEndFireOnEveryExit` |
+| Infer an MCP server from an unprefixed tool name | `TestMCPServerOf` |
+| Let a panicking observer unwind the run | `TestAPanickingAuditHookDoesNotTakeTheRunWithIt` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
-Two attempts **failed to discriminate**, which is worth stating because a
+Nine attempts **failed to discriminate**, which is worth stating because a
 mutation that does not distinguish the two implementations proves nothing
-about the test.
+about the test. Four came from one sitting on the SSRF guard, and each was a
+test that passed for a reason other than the one it claimed:
+
+| It looked like it tested | It actually passed because |
+|---|---|
+| 4-in-6 unmapping | the addresses chosen were ones `netip` already unwraps |
+| an https→http redirect refusal | the https URL pointed at a plain-HTTP server, so hop 1 died in the handshake |
+| the 512 KB read cap | slicing after an unbounded read produces an identical body |
+| header stripping across hosts | both hops dialled the same server, so the second never happened |
+
+All four were rewritten to fail against their mutation. Two more came from the
+audit work: a `MCPServerOf` table with no local tool name containing the
+separator, and a panic mutation that still called `recover()` and so still
+swallowed the panic it was meant to release. The ninth measured `HeapAlloc`
+after a `runtime.GC()` to catch a 16 MiB pre-allocation that was already
+garbage by the time it looked — `TotalAlloc` is the instrument that survives.
 
 The original abort test cancelled *before* the batch, where correct and broken
 implementations behave identically. It now cancels mid-batch, where the broken
@@ -257,8 +404,9 @@ with `CGO_ENABLED=0` the toolchain excludes cgo files by build constraint, so
 A cgo-off gate cannot see the thing it claims to check.
 
 Also included: `FuzzRepairAlwaysSendable` (432k executions clean),
-`FuzzSalvageAlwaysProducesValidJSON` (1.6M clean), `FuzzSessionLogLoad`, and a
-cross-target build gate for `linux/amd64`,
+`FuzzSalvageAlwaysProducesValidJSON` (1.6M clean),
+`FuzzGuardNeverPanics` (2.3M) and `FuzzBindNeverPanics` (2.9M),
+`FuzzSessionLogLoad`, and a cross-target build gate for `linux/amd64`,
 `linux/arm64`, `darwin/arm64` and `windows/amd64`.
 
 ## What is not built
@@ -272,11 +420,7 @@ Stated plainly so nobody reports it as done.
   trust gate; the four plugin categories do not.
 - **OpenAI Responses.** It is a separate wire API, not this one with a flag —
   different message model, tool-call identity, reasoning replay and billing.
-- **`CredentialStore` and OAuth refresh** (REQ-AUTH-05/06). The ordered
-  per-vendor environment table, the three-valued credential state and the
-  redaction boundary ship; the application-owned store and the
-  refresh-under-lock do not.
-- **`fetch_url` and the SSRF guard.** Image normalization.
+- **Image normalization** (REQ-TOOL-14).
 - **Reference bodies for the differential harness.** The harness itself ships
   ([`difftest/`](difftest/), a separate module) and its own suite is
   mutation-verified. It has no scenarios, because NFR-TEST-06.3 forbids
@@ -286,11 +430,10 @@ Stated plainly so nobody reports it as done.
   exits 1, which is NFR-TEST-07.3's required answer rather than a bug. The
   unit suite pins the wire format against *regression*; only a reference pins
   it against *truth*, and the weaker claim is the honest one until then.
+- **MCP transports.** The bounded strict decoder they need ([`wire`](wire/))
+  ships and is fuzzed; the JSON-RPC layer above it does not.
 - **`docs/PROVIDERS.md`** (NFR-COMPAT-07): the ledger of pinned API versions
   and capture dates. It has nothing to record until the harness has a corpus.
-- **Benchmarks.** Four numeric performance budgets have no acceptance
-  mechanism. Per the specification's own instruction, a budget with no
-  benchmark behind it constrains nothing.
 
 `search_files` (REQ-TOOL-05's grep tool, with `rg --json` acceleration) is not
 built. The ignore engine underneath it is, and `find_files` uses it.

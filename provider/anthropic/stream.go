@@ -60,6 +60,19 @@ type Options struct {
 	// (REQ-PROV-05.5). Nil bills a fallback-served response at the requested
 	// model's rates and still records the served name.
 	BillingLookup func(string) *core.Model
+	// Credentials is REQ-AUTH-05's application-owned store. When set it is
+	// consulted BEFORE the environment table, because it is the layer that can
+	// hold a refreshed OAuth token and the environment is static. An empty
+	// store falls through, so adding one never breaks a working env setup.
+	Credentials *provider.Credentials
+	// ToolPrefix is REQ-CACHE-06's per-session schema cache. Nil means this
+	// provider value owns one, which is the right scope in practice: a
+	// registry is built per agent config. Pass one explicitly to share it, or
+	// to read its reconciliation reports.
+	ToolPrefix *provider.ToolPrefix
+	// OnToolPrefixSync reports each reconciliation, so an embedder can feed
+	// REQ-CACHE-11's prefix-invalidation counter.
+	OnToolPrefixSync func(provider.SyncReport)
 	// Now is injectable for deterministic timestamps in tests.
 	Now func() time.Time
 	// MaxSSEEventBytes bounds one accumulated SSE event; zero is the default.
@@ -68,11 +81,17 @@ type Options struct {
 
 // Provider returns the registry entry (REQ-PROV-09).
 func Provider(opts Options) core.APIProvider {
-	c := &client{opts: opts}
+	c := &client{opts: opts, prefix: opts.ToolPrefix}
+	if c.prefix == nil {
+		c.prefix = &provider.ToolPrefix{}
+	}
 	return core.APIProvider{API: API, Stream: c.Stream}
 }
 
-type client struct{ opts Options }
+type client struct {
+	opts   Options
+	prefix *provider.ToolPrefix
+}
 
 func (c *client) now() time.Time {
 	if c.opts.Now != nil {
@@ -95,9 +114,12 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 		retention = *r
 	}
 
-	body, rep, err := BuildRequest(m, req, retention)
+	body, rep, sync, err := BuildRequestCached(m, req, retention, c.prefix)
 	if err != nil {
 		return core.ErrorStream(nil, fmt.Errorf("anthropic: building request: %w", err))
+	}
+	if fn := c.opts.OnToolPrefixSync; fn != nil {
+		fn(sync)
 	}
 	if rep.Changed() && o.Warnf != nil {
 		o.Warnf("anthropic: %s", rep.String())
@@ -148,7 +170,11 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	}
 
 	env := provider.Env{Override: req.Options.Env, Getenv: c.opts.Getenv}
-	auth := provider.ResolveAuth(VendorAuth, env)
+	auth, err := provider.ResolveAuthWith(ctx, m.Provider, c.opts.Credentials, VendorAuth, env)
+	if err != nil {
+		d.fail(provider.TransportErrorText("anthropic", ctx, err), err)
+		return
+	}
 
 	url := provider.ResolveBaseURL(m, auth, defaultBase(c.opts.BaseURL)) + "/v1/messages"
 
@@ -281,6 +307,15 @@ func (d *decodeState) event(ev provider.SSEEvent) error {
 	switch ev.Type {
 	case "ping", "":
 		return nil
+	}
+	// REQ-SEC-11: bytes a provider sent are bytes we did not produce. One
+	// linear scan enforces the size, depth and container bounds and rejects
+	// duplicate keys, which is what stops a gateway sending two stop_reasons
+	// and letting last-wins choose which one we act on.
+	if err := provider.GuardUntrusted(ev.Data); err != nil {
+		return fmt.Errorf("anthropic: %s event: %w", ev.Type, err)
+	}
+	switch ev.Type {
 
 	case "error":
 		var we wireError
@@ -473,6 +508,9 @@ func (d *decodeState) fail(text string, err error) {
 // call. Sharing the assembler is what makes that true by construction rather
 // than by coincidence, and DecodeResponse is how the test can say so.
 func DecodeResponse(m *core.Model, data []byte, lookup func(string) *core.Model) (*core.AssistantMessage, error) {
+	if err := provider.GuardUntrusted(data); err != nil {
+		return nil, fmt.Errorf("anthropic: decoding response: %w", err)
+	}
 	var wr wireResponse
 	if err := json.Unmarshal(data, &wr); err != nil {
 		return nil, fmt.Errorf("anthropic: decoding response: %w", err)

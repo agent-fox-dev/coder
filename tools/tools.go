@@ -27,8 +27,17 @@ type Options struct {
 
 // All returns the default built-in tool set.
 //
-// `fetch_url` is deliberately NOT here: REQ-TOOL-07 puts it outside the
-// default set, reachable only by naming it in ToolPolicy.ToolNames.
+// `fetch_url` is deliberately NOT here (REQ-TOOL-07). Reaching it takes two
+// affirmative acts, not one:
+//
+//	cfg.ToolPolicy.CustomTools = append(cfg.ToolPolicy.CustomTools,
+//	    tools.FetchTool(tools.FetchOptions{}))
+//	// and, if an allowlist is in use, name it there too:
+//	cfg.ToolPolicy.ToolNames = append(cfg.ToolPolicy.ToolNames, "fetch_url")
+//
+// A tool that makes outbound requests on the model's behalf is a different
+// risk class from one that reads a file inside a workspace root, and an
+// embedder should have to say so.
 func All(opts Options) ([]core.Tool, error) {
 	if opts.Workspace == nil {
 		ws, err := NewWorkspace("")

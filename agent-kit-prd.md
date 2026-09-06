@@ -3,7 +3,7 @@
 **Author:** [Platform Engineering]
 **Date:** 2026-09-05
 **Status:** Draft
-**Version:** 0.3.2
+**Version:** 0.3.4
 
 > **Revision note (0.3.0).** This revision incorporates a review of a shipped, zero-dependency
 > Go agent SDK and coding agent of comparable scope and identical constraints
@@ -18,6 +18,15 @@
 >
 > **0.3.2** corrects REQ-LOOP-02's wire table: Ollama's native API and Gemini's `generateContent`
 > pair tool results **positionally**, with no id on the wire at all. See §6.1.
+>
+> **0.3.4** scopes REQ-SEC-12.1. Unknown-property REJECTION applies to protocol payloads
+> (JSON-RPC, MCP), not to provider responses, which get REQ-SEC-11's bounds and
+> duplicate-key rejection and stay tolerant of additive vendor changes. See §6.11.
+>
+> **0.3.3** applies NFR-PERF-09 to itself: four budgets now have benchmarks and threshold
+> tests, and **NFR-PERF-02 and NFR-PERF-08 are demoted to design guidance** because the
+> subsystems they budget do not exist. Writing the benchmarks found REQ-CACHE-06's schema
+> cache attached to no provider. See §11.
 
 ---
 
@@ -903,6 +912,9 @@ A context file is repository-authored standing instruction text (house style, bu
   3. A `Validator` hook runs as soon as each struct is filled, for constraints the Go type shape cannot express (`minLength`, `minimum`, literal unions).
   4. Explicit `null` for an untyped field must be handled without reflection panics. A reflective setter that panics on null means any peer can crash the process by sending `null` for a tool input.
   5. This applies to **protocol payloads only**. Locally authored manifests (skills, plugins) are decoded leniently — REQ-SKILL-10.
+  6. **Provider responses take the bounds, not the unknown-property rejection** (amended in 0.3.4). REQ-SEC-11's size, depth, container and duplicate-key rules apply to every untrusted surface including a provider response: they cost one linear scan, nothing legitimate trips them, and duplicate-key rejection closes a real hole — a gateway sending two `stop_reason` members and letting last-wins decide which one the loop acts on.
+
+      Rule 1 does not apply there, and the reasoning is worth recording rather than leaving as a silent exception. The threat rule 1 names is a peer *smuggling* fields to reach code paths the schema was meant to gate, which requires the decoded value to be forwarded somewhere that reads it dynamically. An MCP tool result is such a value: it flows into a handler, and a tool definition flows into the prompt. A provider response is not: it is read into a fixed `AssistantMessage` with typed fields and no dynamic dispatch, so an extra member reaches nothing. Meanwhile the cost of rejecting one is certain and total — the day a vendor adds a field to a streaming event, every request fails — and that is the exact opposite of the position this document takes in REQ-SESS-05.2 ("a loader that drops what it does not model silently destroys data written by a newer version") and in `RawBlock`. Applying rule 1 uniformly would trade a threat that cannot reach anything for an outage that certainly will.
 - **REQ-SEC-13 (attribution disclosure and opt-out):** Any header AgentKit sends to a third-party provider that identifies AgentKit, the consuming application, or the session is *attribution* and is governed by this requirement.
   1. The complete per-provider set is enumerated in a dedicated documentation section. Changing that set is a documented, released change even when no other code changes.
   2. A single kill switch — `AGENTKIT_TELEMETRY=0`, or `AgentConfig.Attribution = false` — disables every attribution header. The default being on is precisely why it must be disclosed.
@@ -1127,14 +1139,18 @@ The protocol flow for each MCP tool call:
 ### Performance
 
 - **NFR-PERF-01:** The agentic loop overhead (excluding model API latency and tool execution time) must be less than 1 ms per turn.
-- **NFR-PERF-02:** MCP server connection setup (stdio subprocess spawn + initialize handshake) must complete within 2 seconds for typical local MCP servers. Connection setup happens once per session, not per tool call.
+- **NFR-PERF-02 (DESIGN GUIDANCE — no acceptance mechanism):** MCP server connection setup (stdio subprocess spawn + initialize handshake) should complete within 2 seconds for typical local MCP servers. Connection setup happens once per session, not per tool call. Demoted per NFR-PERF-09: the MCP client is not implemented, so there is nothing to benchmark. It is restored to a budget when a benchmark and CI threshold accompany the implementation.
 - **NFR-PERF-03:** Tool schema serialization must be computed once per session and cached (REQ-CACHE-06), not recomputed on every model call.
 - **NFR-PERF-04:** Parallel tool execution must use true concurrency: one goroutine per tool handler invocation, joined by `sync.WaitGroup` (**not** `errgroup` — REQ-GO-04). Only the handler body runs concurrently; interceptor invocation, event emission and result finalization are serialized under a single mutex (REQ-LOOP-05) and are excluded from the concurrency target. Sequential execution is used when `parallel_tools=false`, when any tool in the batch declares `ExecutionMode: Sequential`, or when the batch holds a single call.
 - **NFR-PERF-05:** The streaming path must not buffer complete model responses before yielding the first token. `TextDeltaEvent` must be emitted as soon as the first streaming delta arrives.
 - **NFR-PERF-06:** A Level 2 cache hit must add less than 0.5 ms overhead versus a direct response return. The LRU eviction path must not block the agent loop.
 - **NFR-PERF-07:** Anthropic `cache_control` breakpoint injection must be a pure in-memory operation performed on **every** request; it must not make any additional API calls. There is no breakpoint cache and no structural-hash recomputation path to budget (§6.2a Level 1). Stamping the three markers must add less than 1 ms for tool sets up to 128 tools and transcripts up to 1000 messages.
-- **NFR-PERF-08:** Google `CachedContent` creation is a network call and must run on a background goroutine before the first model call of the session when `context_cache_ttl` is set. The agent loop must not block waiting for it — it falls back to uncached operation if creation has not completed.
+- **NFR-PERF-08 (DESIGN GUIDANCE — no acceptance mechanism):** Google `CachedContent` creation is a network call and should run on a background goroutine before the first model call of the session when `context_cache_ttl` is set. The agent loop must not block waiting for it — it falls back to uncached operation if creation has not completed. Demoted per NFR-PERF-09: this is a network-timing property with no offline benchmark, and `CachedContent` is not implemented. The non-blocking half is a testable structural claim and is restored to a requirement when it ships.
 - **NFR-PERF-09 (performance budgets need an acceptance mechanism):** Every numeric budget in this section is either attached to a named `go test -bench` target with a CI threshold, or it is demoted to design guidance and labelled as such. A number with no benchmark behind it cannot fail, and therefore does not constrain anything. Prioritization note: in the closest shipped comparable — a zero-dependency Go agent SDK of comparable scope — the entire test budget went to differential, golden, parity and race testing and **no Go benchmarks were written at all**, which is evidence that correctness-under-concurrency and wire fidelity are where the defects actually live. If the benchmarks are not going to be written, the honest move is to delete the numbers rather than ship unenforceable ones.
+
+  **Status.** Four budgets now carry a benchmark and a threshold test that fails the build: NFR-PERF-01 (`BenchmarkLoopTurnOverhead`), NFR-PERF-06 (`BenchmarkCacheHit` against `BenchmarkDirectResponse`), NFR-PERF-07 (`BenchmarkCacheControlStamping`) and NFR-PERF-03 (asserted as a COUNT — a steady-state request must serialize zero schemas — rather than as a duration, so it cannot flake). NFR-PERF-04 and NFR-PERF-05 are structural rather than numeric and are pinned by tests that deadlock rather than by thresholds. NFR-PERF-02 and NFR-PERF-08 are demoted above, because the subsystems they budget do not exist.
+
+  Two findings came out of writing them. First, REQ-CACHE-06's schema cache was implemented, unit-tested and attached to no provider, so every request re-serialized every tool schema — ~0.9 ms of a ~1.4 ms request build at 128 tools. Second, NFR-PERF-01's "per turn" is under-specified: the REQ-GO-15 estimate and the REQ-PROV-11 repair pass are both O(history), so a turn 500 messages deep costs ~1.7x a first turn. Both remain well inside 1 ms; the depth term is reported by a benchmark and deliberately not given a threshold the requirement does not state.
 
 ### Reliability
 

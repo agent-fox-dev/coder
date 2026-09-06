@@ -56,6 +56,22 @@ type Hooks struct {
 	OnTurnEnd   func(TurnEndEvent)
 	OnAgentDone func(AgentDoneEvent)
 	OnError     func(error)
+
+	// OnSessionStart and OnSessionEnd are REQ-OBS-03.
+	//
+	// The requirement names EventHookPlugin, and plugins are not built. The
+	// hook POINTS are not a plugin feature though — a plugin would be one more
+	// registrant — so they ship here, and a plugin host later becomes a
+	// registrant rather than a redesign.
+	//
+	// OnSessionEnd fires exactly once per run, including on an error or an
+	// abort. A hook that fires only on the happy path is worse than none: an
+	// auditor cannot tell a session that ended badly from one still running.
+	OnSessionStart func(AuditEvent)
+	OnSessionEnd   func(AuditEvent)
+	// OnAudit receives every AuditEvent, session start and end included, so a
+	// single sink needs one registration rather than four.
+	OnAudit func(AuditEvent)
 }
 
 // QueueMode is REQ-LOOP-15's per-queue delivery mode.
@@ -99,6 +115,13 @@ type AgentConfig struct {
 
 	SessionID    string
 	TrustProject bool
+	// Tracer receives the REQ-OBS-02 tool spans. Nil means NoopTracer.
+	//
+	// It is separate from TracingMiddleware's tracer, which wraps the MODEL
+	// call: middleware cannot see a tool execution at all, so a tracer that
+	// reached the SDK only through Axis 1 would leave REQ-OBS-02
+	// unimplementable. Pass the same value to both to get one trace.
+	Tracer Tracer
 	// Attribution defaults on and is disclosed (REQ-SEC-13). A single kill
 	// switch disables every attribution header.
 	Attribution    *bool

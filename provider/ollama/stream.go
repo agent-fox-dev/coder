@@ -39,7 +39,12 @@ type Options struct {
 	Attribution   *bool
 	BillingLookup func(string) *core.Model
 	Now           func() time.Time
-	MaxLineBytes  int
+	// Credentials is REQ-AUTH-05's application-owned store. When set it is
+	// consulted BEFORE the environment table, because it is the layer that can
+	// hold a refreshed OAuth token and the environment is static. An empty
+	// store falls through, so adding one never breaks a working env setup.
+	Credentials  *provider.Credentials
+	MaxLineBytes int
 }
 
 func Provider(opts Options) core.APIProvider {
@@ -95,7 +100,11 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	}
 
 	env := provider.Env{Override: req.Options.Env, Getenv: c.opts.Getenv}
-	auth := provider.ResolveAuth(VendorAuth, env)
+	auth, err := provider.ResolveAuthWith(ctx, m.Provider, c.opts.Credentials, VendorAuth, env)
+	if err != nil {
+		d.fail(provider.TransportErrorText("ollama", ctx, err), err)
+		return
+	}
 
 	base := c.opts.BaseURL
 	if base == "" {
@@ -209,6 +218,9 @@ func (d *decoder) consume(r *provider.NDJSONReader) error {
 }
 
 func (d *decoder) chunk(line []byte) error {
+	if err := provider.GuardUntrusted(line); err != nil {
+		return fmt.Errorf("ollama: %w", err)
+	}
 	var ch wireChunk
 	if err := json.Unmarshal(line, &ch); err != nil {
 		return fmt.Errorf("ollama: decoding chunk: %w", err)
