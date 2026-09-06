@@ -14,6 +14,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/google"
 	"github.com/agentfox/agentkit-go/provider/ollama"
 	"github.com/agentfox/agentkit-go/provider/openai"
+	"github.com/agentfox/agentkit-go/provider/openairesponses"
 	"github.com/agentfox/agentkit-go/schema"
 )
 
@@ -146,6 +147,9 @@ func goldenRequestCases(t *testing.T) []goldenCase {
 		{"google", capture(t,
 			google.Provider(google.Options{BaseURL: "https://example.invalid"}),
 			goldenModel("gemini-test", core.API("google-generative-ai"), "google"), req)},
+		{"openai_responses", capture(t,
+			openairesponses.Provider(openairesponses.Options{BaseURL: "https://example.invalid"}),
+			goldenModel("gpt-resp-test", core.API("openai-responses"), "openai"), req)},
 		{"ollama", capture(t,
 			ollama.Provider(ollama.Options{BaseURL: "https://example.invalid"}),
 			goldenModel("llama-test", core.API("ollama"), "ollama"), req)},

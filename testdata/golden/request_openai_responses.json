@@ -1,0 +1,70 @@
+{
+  "model": "gpt-resp-test",
+  "instructions": "You are a release engineer.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Which Go files changed?"
+        },
+        {
+          "type": "input_image",
+          "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Let me look."
+        }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "find_files",
+      "arguments": "{\"pattern\":\"**/*.go\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_1",
+      "output": "{\"ok\":true,\"data\":{\"entries\":[\"main.go\"]}}"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "find_files",
+      "description": "Find files by glob pattern.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Glob pattern"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum results"
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "max_output_tokens": 1024,
+  "temperature": 0.2,
+  "top_p": 0.9,
+  "store": false,
+  "stream": true
+}
