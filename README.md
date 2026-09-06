@@ -163,6 +163,27 @@ not cancel the numeric `5`. Tearing a transport down cancels everything still
 in flight before waiting for it — otherwise one slow handler holds the
 shutdown open and then writes to a pipe that is already gone.
 
+**A remote server's `endpoint` event may not leave its origin**
+([`mcp/httpsse.go`](mcp/httpsse.go)). In the 2024-11-05 transport the server
+names the URL its client should POST to. Every POST carries the configured
+headers, which is where a bearer token for that server lives — so a server that
+could name any origin would be choosing where our credential gets sent, as
+traffic that looks exactly like the protocol working. The named URL is resolved
+against the stream's own URL and then checked: same scheme, same host, same
+port, or we do not send. Relative endpoints (`/messages?sessionId=…`) are the
+common case and are precisely what the rule makes safe.
+
+**The remote transports auto-negotiate, but only on the server's own answer.**
+`transport` unset POSTs as 2025-03-26 and falls back to 2024-11-05 when the
+server rejects the POST with 405/404/400 — the spec's own backwards-
+compatibility procedure, so an operator does not have to know which revision a
+third-party server implements. A 5xx or a transport failure never triggers the
+fallback: that is a working server having a bad day, and silently changing
+which revision we speak because of one turns a transient failure into a
+permanent misconfiguration. The fallback swaps the transport under a read loop
+that is parked inside the old one, so `Receive` carries a generation counter to
+tell "the transport under me was exchanged" from "the session ended".
+
 **Pagination cursors name an entry, not an index.** Unregister a tool between
 two pages and an index-based cursor silently skips whatever moved into its
 place. A cursor for an entry that no longer exists is refused rather than
@@ -460,6 +481,19 @@ confirmed to turn the corresponding test red:
 | Resume a listing AT the cursor's entry | `TestListingPagesAndResumesAfterTheCursor` |
 | Accept a cursor this server never issued | `TestAFabricatedCursorIsRefused` |
 | Bind MCP HTTP mode to every interface | `TestHTTPModeBindsLoopback` |
+| POST where a server's `endpoint` event points, off-origin | `TestAnEndpointOnAnotherOriginIsRefused` |
+| Compare endpoint origins without the port | `TestAnEndpointOnAnotherOriginIsRefused` |
+| Fall back to the older revision on a 5xx | `TestAutoDoesNotSwitchRevisionOnAServerError` |
+| Kill the session when the auto transport swaps | `TestAutoFallsBackToTheOlderRevision` |
+| Echo an unbounded server-chosen session id | `TestAnOversizedSessionIDIsRefused` |
+| Treat a 404 for a live session as any other error | `TestA404ForAKnownSessionIsDistinguishable` |
+| Treat 405 on the standalone GET as fatal | `TestAServerWithoutAStandaloneStreamStillWorks` |
+| Read an SSE-answered POST as JSON | `TestStreamableHTTPAcceptsAnSSEAnsweredPOST` |
+| Buffer an unbounded `data:` field | `TestAnOversizedSSELineIsRefused` |
+| Dispatch an event the stream ended in the middle of | `TestAStreamThatEndsMidEventIsAnError` |
+| Send `Bearer ` when the token variable is unset | `TestAHeaderThatResolvesToNothingIsDroppedNotSentBlank` |
+| Let an interpolated secret smuggle a header | `TestAHeaderCarryingAControlByteIsRefused` |
+| Accept a non-http scheme as a transport | `TestOnlyHTTPSchemesAreTransports` |
 | Start HTTP mode when `api_key_env` is unset | `TestHTTPModeRefusesToStartWithoutAKey` |
 | Fall back to stdio on an unknown transport | `TestRunRejectsAnUnknownTransport` |
 | Walk past an array of tables resolving `[a.b]` | `TestASubTableUnderAnArrayElementBelongsToThatElement` |
@@ -530,12 +564,13 @@ Stated plainly so nobody reports it as done.
   exits 1, which is NFR-TEST-07.3's required answer rather than a bug. The
   unit suite pins the wire format against *regression*; only a reference pins
   it against *truth*, and the weaker claim is the honest one until then.
-- **MCP HTTP/SSE and streamable-HTTP client transports.** stdio ships and is
-  tested against a real subprocess; the two HTTP *client* transports of
-  REQ-MCP-CLIENT-02 do not. The server's HTTP mode does ship, and so does the
-  reference driver ([`cmd/mcp-server`](cmd/mcp-server/)) — the SDK equivalent
-  of REQ-MCP-SERVER-02's `nightshift --mcp-server`, exercised end to end as a
-  real subprocess by the shipped client.
+- **SSE stream resumption.** All three of REQ-MCP-CLIENT-02's transports ship
+  — stdio against a real subprocess, and both HTTP revisions against real
+  `httptest` servers. What is *not* built is reconnecting a dropped event
+  stream with `Last-Event-ID`: an optional part of the 2025-03-26 spec that
+  needs a retry policy and duplicate suppression to be worth anything. The
+  decoder therefore parses `id:` and discards it, rather than storing an id it
+  would never send and implying support that is not there.
 - **Plugin implementations.** The four categories, the registry, discovery, the
   lint and `validate-plugins` ship; no first-party plugin does. That is the
   intended shape — a plugin is the embedder's code — but it means the

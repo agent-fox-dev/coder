@@ -38,16 +38,21 @@ func (p *Pool) Add(c *ServerConnection) error {
 	return nil
 }
 
-// Connect spawns a stdio server and initializes it.
+// Connect opens a server and initializes it (REQ-MCP-CLIENT-02).
 //
-// env is the reduced environment for the child (REQ-MCP-CLIENT-10), and
-// secrets resolves ${VAR} references in the config's Env map at SPAWN time —
-// so a credential lives in the child's environment and never in the config
-// file, the process table, or a log of the command line.
+// A `command` server is spawned as a subprocess over stdio; a `url` server is
+// opened over one of the two HTTP transports. env is the reduced environment
+// for a child (REQ-MCP-CLIENT-10), and secrets resolves ${VAR} references at
+// CONNECT time — so a credential lives in the child's environment or in a
+// request header, and never in the config file, the process table, or a log of
+// the command line.
 func (p *Pool) Connect(ctx context.Context, cfg ServerConfig, env []string, secrets func(string) string) (*ServerConnection, error) {
-	if cfg.Command == "" {
-		return nil, fmt.Errorf("mcp: server %q has no command; only stdio servers can be "+
-			"spawned by Connect", cfg.Name)
+	switch {
+	case cfg.Command != "":
+	case cfg.URL != "":
+		return p.connectHTTP(ctx, cfg, env, secrets)
+	default:
+		return nil, fmt.Errorf("mcp: server %q has neither a command nor a url", cfg.Name)
 	}
 	childEnv, missing := resolveEnv(cfg.Env, env, secrets)
 	for _, name := range missing {
@@ -63,6 +68,45 @@ func (p *Pool) Connect(ctx context.Context, cfg ServerConfig, env []string, secr
 		Stderr: func(line string) {
 			if p.opts.Warnf != nil {
 				p.opts.Warnf("server %q: %s", cfg.Name, line)
+			}
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	c := NewConnection(cfg, tr, p.opts)
+	if err := c.Initialize(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := p.Add(c); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// connectHTTP opens a remote server.
+//
+// The headers are resolved through the SAME ${VAR} path as a subprocess's
+// environment, so `Authorization = "Bearer ${GH_TOKEN}"` in a config file
+// carries a reference and not a token.
+func (p *Pool) connectHTTP(ctx context.Context, cfg ServerConfig, env []string, secrets func(string) string) (*ServerConnection, error) {
+	headers, missing := resolveHeaders(cfg.Headers, env, secrets)
+	for _, name := range missing {
+		if p.opts.Warnf != nil {
+			p.opts.Warnf("server %q: ${%s} is unset and expanded to empty; the request "+
+				"header will carry a blank value rather than the literal reference",
+				cfg.Name, name)
+		}
+	}
+
+	tr, err := StartHTTP(ctx, HTTPTransportOptions{
+		URL: cfg.URL, Mode: cfg.Transport, Headers: headers,
+		Limits: p.opts.Limits, Warnf: func(format string, args ...any) {
+			if p.opts.Warnf != nil {
+				p.opts.Warnf("server %q: "+format, append([]any{cfg.Name}, args...)...)
 			}
 		},
 	})
@@ -310,19 +354,7 @@ func convertSchema(v wire.Value, depth int) *schema.Schema {
 
 // resolveEnv builds the child's environment (REQ-MCP-CLIENT-10).
 func resolveEnv(declared map[string]string, base []string, secrets func(string) string) ([]string, []string) {
-	lookup := func(name string) string {
-		if secrets != nil {
-			if v := secrets(name); v != "" {
-				return v
-			}
-		}
-		for _, kv := range base {
-			if k, v, ok := strings.Cut(kv, "="); ok && k == name {
-				return v
-			}
-		}
-		return ""
-	}
+	lookup := envLookup(base, secrets)
 
 	out := append([]string(nil), base...)
 	var missing []string
@@ -335,6 +367,75 @@ func resolveEnv(declared map[string]string, base []string, secrets func(string) 
 		v, miss := interpolate(declared[k], lookup)
 		missing = append(missing, miss...)
 		out = append(out, k+"="+v)
+	}
+	return out, missing
+}
+
+// envLookup is the one resolution order for ${VAR}: the secrets store first,
+// then the reduced environment. Sharing it is what keeps a header and a child
+// environment from resolving the same reference differently.
+func envLookup(base []string, secrets func(string) string) func(string) string {
+	return func(name string) string {
+		if secrets != nil {
+			if v := secrets(name); v != "" {
+				return v
+			}
+		}
+		for _, kv := range base {
+			if k, v, ok := strings.Cut(kv, "="); ok && k == name {
+				return v
+			}
+		}
+		return ""
+	}
+}
+
+// resolveHeaders expands ${VAR} in header values, reporting the names that
+// resolved to nothing.
+//
+// A header referencing a variable that did not resolve is DROPPED ENTIRELY,
+// not sent with the gap filled in. `Bearer ${TOKEN}` with no TOKEN is
+// `Bearer ` — literal scaffolding around a missing secret, which is not a
+// weaker credential but a malformed request, and the 401 it earns tells an
+// operator far less than the warning this returns. Checking the resolved
+// string for emptiness would miss exactly this case, so the test is whether
+// any REFERENCE went unresolved.
+func resolveHeaders(declared map[string]string, base []string, secrets func(string) string) (map[string]string, []string) {
+	if len(declared) == 0 {
+		return nil, nil
+	}
+	lookup := envLookup(base, secrets)
+	out := make(map[string]string, len(declared))
+	var missing []string
+	seen := map[string]bool{}
+	keys := make([]string, 0, len(declared))
+	for k := range declared {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		expanded, names := interpolate(declared[k], lookup)
+		for _, n := range names {
+			if !seen[n] {
+				seen[n], missing = true, append(missing, n)
+			}
+		}
+		if len(names) > 0 || strings.TrimSpace(expanded) == "" {
+			continue
+		}
+		if !isHeaderSafe(k) || !isHeaderSafe(expanded) {
+			// A control byte in a header is a request-splitting attempt, and
+			// it can arrive through an interpolated secret rather than through
+			// the config file.
+			if !seen[k] {
+				seen[k], missing = true, append(missing, k)
+			}
+			continue
+		}
+		out[k] = expanded
+	}
+	if len(out) == 0 {
+		return nil, missing
 	}
 	return out, missing
 }

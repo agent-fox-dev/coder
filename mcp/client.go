@@ -48,6 +48,17 @@ type ServerConfig struct {
 	Args    []string
 	URL     string
 	Dir     string
+	// Transport selects the remote revision for a URL server
+	// (REQ-MCP-CLIENT-02). Empty auto-negotiates: 2025-03-26 first, falling
+	// back to 2024-11-05 when the server rejects the POST. A field is needed
+	// because REQ-MCP-CLIENT-07's `url` alone does not say which of the two
+	// specs is behind it.
+	Transport HTTPMode
+	// Headers are sent on every request to a URL server. Values may carry
+	// ${VAR} references, resolved from the secrets store exactly like Env — a
+	// remote server's bearer token has the same reason not to sit in a config
+	// file as a subprocess's does.
+	Headers map[string]string
 	// Env values may carry ${VAR} references, resolved at spawn time against
 	// the secrets store (REQ-MCP-CLIENT-10).
 	Env map[string]string
