@@ -36,6 +36,7 @@ left to be discovered.
 
 | Package | What it owns |
 |---|---|
+| `mcp` | Model Context Protocol, client and server, on the standard library: JSON-RPC, stdio transport, tool pool, HTTP serving with API-key auth. |
 | `plugins` | Four plugin categories, registry, manifest discovery, import lint, conformance report. |
 | `wire` | Bounded, strict decoder for bytes AgentKit did not produce: hand-rolled scanner, reflective binder, framed reader. |
 | `jsonx` | Order-preserving JSON. Decodes once, marshals in slice order at every depth. |
@@ -119,6 +120,22 @@ shallower one; a vendored dependency that is itself a git checkout does not
 inherit the outer project's rules. Without the boundary, a rule the outer
 project wrote about *its* build output silently deletes files from the listing
 of a repository that has never heard of it.
+
+**MCP is implemented on the standard library, not on `mcp-go`**
+([`mcp/`](mcp/)). REQ-MCP-CLIENT-01 names that library and REQ-SEC-11 names
+three MCP surfaces where a decoder must reject duplicate keys and bound itself
+before allocating. A third-party library owns the wire on all three, and no
+general-purpose JSON-RPC implementation rejects duplicate keys — because
+JSON-RPC does not ask it to. The two requirements cannot both hold; the PRD is
+amended in 0.3.5 with the argument.
+
+Two consequences worth knowing. **Server handlers run concurrently**, because a
+handler calling `RequestSampling` waits for a response arriving on the same
+transport — serving one request at a time and supporting sampling are mutually
+exclusive. And **the 50K result cap is spent across the whole result, not per
+item**: a server returning two hundred blocks of 49K each passes a per-item cap
+and delivers ten megabytes into the model's context. It counts runes, not
+bytes, or a CJK result gets a third of the room an ASCII one does.
 
 **A plugin hook can only narrow, never widen**
 ([`plugins/`](plugins/)). REQ-PLUGIN-04's original ordering put a static
@@ -390,6 +407,15 @@ confirmed to turn the corresponding test red:
 | Flag any import path containing "internal" | `TestAPluginsOwnInternalPackageIsAllowed` |
 | Require plugin source to compile before linting it | `TestTheLintReadsFilesThatDoNotCompile` |
 | Skip the "could not lint" report | `TestAManifestWithNoSourceIsReportedRatherThanPassed` |
+| Let an MCP subprocess inherit the parent environment | `TestAStdioServerRunsAsASubprocessWithAReducedEnvironment` |
+| Cap MCP results per item rather than per result | `TestResultsAreCappedAcrossTheWholeResult` |
+| Count the result cap in bytes | `TestTheCapCountsRunesNotBytes` |
+| Skip the MCP tool-name collision check | `TestAShadowedNativeToolIsRefusedAtConnectionTime` |
+| Answer sampling without the per-server gate | `TestSamplingIsRefusedUnlessEnabledAndAlwaysAudited` |
+| Serve MCP over HTTP with no API key | `TestHTTPModeRequiresAnAPIKey` |
+| Check the HTTP method before authenticating | `TestAuthenticationRunsBeforeTheMethodCheck` |
+| Resynchronize after a malformed MCP frame | `TestAMalformedFrameTearsTheConnectionDown` |
+| Walk past an array of tables resolving `[a.b]` | `TestASubTableUnderAnArrayElementBelongsToThatElement` |
 | Record tool arguments instead of their hash | `TestTheAuditTrailHashesArgumentsRatherThanRecordingThem` |
 | Fire session-end only on a clean run | `TestSessionStartAndEndFireOnEveryExit` |
 | Infer an MCP server from an unprefixed tool name | `TestMCPServerOf` |
@@ -397,7 +423,7 @@ confirmed to turn the corresponding test red:
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
-Eleven attempts **failed to discriminate**, which is worth stating because a
+Twelve attempts **failed to discriminate**, which is worth stating because a
 mutation that does not distinguish the two implementations proves nothing
 about the test. Four came from one sitting on the SSRF guard, and each was a
 test that passed for a reason other than the one it claimed:
@@ -443,9 +469,6 @@ Also included: `FuzzRepairAlwaysSendable` (432k executions clean),
 
 Stated plainly so nobody reports it as done.
 
-- **MCP client and server.** Requires `mcp-go`, which under the dependency
-  policy must live in a nested module, which requires a tagged root release
-  first. An ordering constraint, not a defect.
 - **OpenAI Responses.** It is a separate wire API, not this one with a flag —
   different message model, tool-call identity, reasoning replay and billing.
 - **Image normalization** (REQ-TOOL-14).
@@ -458,8 +481,9 @@ Stated plainly so nobody reports it as done.
   exits 1, which is NFR-TEST-07.3's required answer rather than a bug. The
   unit suite pins the wire format against *regression*; only a reference pins
   it against *truth*, and the weaker claim is the honest one until then.
-- **MCP transports.** The bounded strict decoder they need ([`wire`](wire/))
-  ships and is fuzzed; the JSON-RPC layer above it does not.
+- **MCP HTTP/SSE and streamable-HTTP client transports.** stdio ships and is
+  tested against a real subprocess; the two HTTP client transports of
+  REQ-MCP-CLIENT-02 do not. The server's HTTP mode does ship.
 - **Plugin implementations.** The four categories, the registry, discovery, the
   lint and `validate-plugins` ship; no first-party plugin does. That is the
   intended shape — a plugin is the embedder's code — but it means the

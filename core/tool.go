@@ -47,6 +47,17 @@ type Tool struct {
 	PrepareArguments    func(map[string]any) map[string]any
 	PromptGuidelines    []string
 	ConstrainedSampling *ConstrainedSampling
+
+	// MCPServer names the MCP server a tool came from, empty for a local one.
+	//
+	// It is a FIELD rather than something derived from the qualified name, and
+	// that is a correction. REQ-MCP-CLIENT-05's convention is
+	// `server_name__tool_name` with a configurable prefix, so a local tool
+	// called `a__b` and an MCP tool from server `a` are indistinguishable by
+	// name — and a configurable prefix means the name may carry no server at
+	// all. REQ-OBS-05 wants server_name on every MCP tool call; the layer that
+	// connected to the server is the only one that actually knows it.
+	MCPServer string
 }
 
 // ToolWire is the projection a provider is allowed to see — the four fields of

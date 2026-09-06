@@ -3,7 +3,7 @@
 **Author:** [Platform Engineering]
 **Date:** 2026-09-05
 **Status:** Draft
-**Version:** 0.3.4
+**Version:** 0.3.5
 
 > **Revision note (0.3.0).** This revision incorporates a review of a shipped, zero-dependency
 > Go agent SDK and coding agent of comparable scope and identical constraints
@@ -18,6 +18,11 @@
 >
 > **0.3.2** corrects REQ-LOOP-02's wire table: Ollama's native API and Gemini's `generateContent`
 > pair tool results **positionally**, with no id on the wire at all. See §6.1.
+>
+> **0.3.5** replaces `mcp-go` with a standard-library MCP implementation. REQ-MCP-CLIENT-01
+> and REQ-SEC-11 cannot both hold: a third-party library owns the wire on the three
+> surfaces REQ-SEC-11 names, and no general-purpose JSON-RPC implementation rejects
+> duplicate keys. See §6.7.
 >
 > **0.3.4** scopes REQ-SEC-12.1. Unknown-property REJECTION applies to protocol payloads
 > (JSON-RPC, MCP), not to provider responses, which get REQ-SEC-11's bounds and
@@ -782,7 +787,13 @@ A context file is repository-authored standing instruction text (house style, bu
 
 ### 6.7 MCP Client Support
 
-- **REQ-MCP-CLIENT-01:** Consume MCP servers as tool providers using `github.com/mark3labs/mcp-go`.
+- **REQ-MCP-CLIENT-01 (amended in 0.3.5):** Consume MCP servers as tool providers. The original text named `github.com/mark3labs/mcp-go`; the protocol is implemented on the Go standard library instead, and the reason is a conflict inside this document rather than a preference.
+
+  REQ-SEC-11 requires every decoder reading bytes AgentKit did not produce to be bounded before it allocates, and names three surfaces explicitly: MCP stdio NDJSON from spawned subprocesses, MCP HTTP/SSE and streamable-HTTP response bodies, and inbound requests to the AgentKit MCP server. Rule 5 of that requirement then says `encoding/json` satisfies none of rules 1–4 and that a bare `json.Decoder` on an untrusted stream is a conformance failure. A third-party MCP library owns the wire on all three surfaces. Either it independently satisfies REQ-SEC-11 — no general-purpose JSON-RPC implementation rejects duplicate object keys, because JSON-RPC does not ask it to — or REQ-SEC-11 is unsatisfiable exactly where it was written to apply.
+
+  Three smaller facts point the same way. REQ-GO-06 already assigns JSON-RPC id generation and response correlation to AgentKit, which would be an odd thing to specify about a dependency. REQ-GO-11 confines third-party modules to a nested module to keep the root standard-library-only, and with no third-party module the goal is met more directly than the mechanism protecting it. And REQ-GO-11.2 requires a nested module to depend on a *tagged* root release, which does not exist — so the specified path is not merely less good, it is not currently buildable.
+
+  The cost is real and is recorded rather than argued away: this is a partial implementation of a moving specification, and every capability it does not model is a capability AgentKit does not have. What ships covers the client and server subset the §6.7 and §6.8 requirements name.
 - **REQ-MCP-CLIENT-02:** Three transports: stdio (subprocess + NDJSON), HTTP/SSE (2024-11-05 spec), streamable HTTP (2025-03-26 spec).
 - **REQ-MCP-CLIENT-03:** `MCPServerConnection` wraps an mcp-go client session and provides: initialization (protocol handshake + capability negotiation), tool list caching with refresh on `notifications/tools/list_changed`, `Call(toolName string, arguments map[string]any) (map[string]any, error)`, and audit logging of every call via `afaudit`.
 - **REQ-MCP-CLIENT-04:** `MCPServerPool` holds `server_name -> MCPServerConnection`, instantiated during session initialization, torn down after the session ends.
@@ -798,9 +809,9 @@ A context file is repository-authored standing instruction text (house style, bu
 
 - **REQ-MCP-SERVER-01:** Optional, off by default. Enabled via `[mcp_server] enabled = true` in `config.toml`.
 - **REQ-MCP-SERVER-02:** Two serving modes: stdio (`nightshift --mcp-server`) and HTTP (`mcp_server.transport = 'http'`, `mcp_server.port`).
-- **REQ-MCP-SERVER-03:** Server implementation uses mcp-go server primitives with explicit tool registration.
-- **REQ-MCP-SERVER-04:** Exposed tools: `process_issue(issue_number, mode)`, `get_session_status(session_id)`, `list_active_sessions()`, `cancel_session(session_id)`.
-- **REQ-MCP-SERVER-05:** Exposed resources: `nightshift://issues/{number}/triage-report`, `nightshift://sessions/{id}/audit-log`, `nightshift://config`.
+- **REQ-MCP-SERVER-03 (amended in 0.3.5):** Server implementation provides explicit tool and resource registration. Per REQ-MCP-CLIENT-01 above, the primitives are AgentKit's own.
+- **REQ-MCP-SERVER-04 (scoped in 0.3.5):** Exposed tools: `process_issue(issue_number, mode)`, `get_session_status(session_id)`, `list_active_sessions()`, `cancel_session(session_id)`. These are **nightshift's** tools, not AgentKit's: a library has no issues to process and no sessions to list. AgentKit ships REQ-MCP-SERVER-03's registration mechanism and the host registers this inventory — the same split as REQ-PLUGIN-10's `nightshift --validate-plugins`.
+- **REQ-MCP-SERVER-05 (scoped in 0.3.5):** Exposed resources: `nightshift://issues/{number}/triage-report`, `nightshift://sessions/{id}/audit-log`, `nightshift://config`. Scoped as REQ-MCP-SERVER-04: the `nightshift://` scheme is the daemon's, and AgentKit ships the resource registration and read dispatch it needs.
 - **REQ-MCP-SERVER-06:** Implements MCP 2025-03-26 protocol version.
 - **REQ-MCP-SERVER-07:** HTTP mode requires API key authentication on every request. Unauthenticated requests return HTTP 401. Stdio mode relies on OS-level process isolation.
 

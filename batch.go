@@ -170,7 +170,7 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 			a.audit(core.AuditEvent{
 				Kind: core.AuditToolCall, SessionID: auditSession,
 				ToolName: c.Name, ToolUseID: c.ID,
-				ServerName:    MCPServerOf(c.Name),
+				ServerName:    serverNameOf(tool, c.Name),
 				ArgumentsHash: ArgumentsHash(prepared.Raw),
 				IsError:       !out.OK,
 				ElapsedMS:     time.Since(start).Milliseconds(),
