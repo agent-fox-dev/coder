@@ -1,9 +1,13 @@
 package tools_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
+	"image"
+	"image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -437,4 +441,124 @@ func searchTool(t *testing.T, root string) coreTool {
 	}
 	t.Fatal("search_files is not in the default tool set")
 	return coreTool{}
+}
+
+// ---- REQ-TOOL-14.6: read_file detects images by magic bytes
+
+func readTool(t *testing.T, root string) coreTool {
+	t.Helper()
+	ws, err := tools.NewWorkspace(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := tools.All(tools.Options{Workspace: ws})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range all {
+		if tl.Name == "read_file" {
+			return tl
+		}
+	}
+	t.Fatal("read_file is missing")
+	return coreTool{}
+}
+
+// TestReadFileDetectsAnImageByItsBytesNotItsName is REQ-TOOL-14.6. A PNG
+// called .txt is still a PNG, and splitting it into "lines" hands the model
+// several kilobytes of mojibake.
+func TestReadFileDetectsAnImageByItsBytesNotItsName(t *testing.T) {
+	root := t.TempDir()
+	img := image.NewRGBA(image.Rect(0, 0, 16, 8))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "screenshot.txt"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := readTool(t, root).Execute(context.Background(),
+		json.RawMessage(`{"path":"screenshot.txt"}`))
+	if !res.OK {
+		t.Fatalf("read failed: %+v", res)
+	}
+	if len(res.Blocks) != 1 {
+		t.Fatalf("want a text note plus one ImageBlock; got %d blocks", len(res.Blocks))
+	}
+	img2, ok := res.Blocks[0].(core.ImageBlock)
+	if !ok {
+		t.Fatalf("block is %T, want core.ImageBlock", res.Blocks[0])
+	}
+	if img2.MimeType != "image/png" {
+		t.Fatalf("mime %q", img2.MimeType)
+	}
+	note, _ := res.Data["note"].(string)
+	if !strings.Contains(note, "16") || !strings.Contains(note, "8") {
+		t.Fatalf("the note must say what was read; got %q", note)
+	}
+	if _, isText := res.Data["content"]; isText {
+		t.Fatal("an image must not also be returned as text lines")
+	}
+}
+
+// TestReadFileRefusesAnAnimatedPNGAtTheTool. Forwarding it lands the failure on
+// the NEXT provider request — by which time the image is in history and every
+// later request fails the same way.
+func TestReadFileRefusesAnAnimatedPNGAtTheTool(t *testing.T) {
+	root := t.TempDir()
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	animated := insertPNGChunk(buf.Bytes(), "acTL", []byte{0, 0, 0, 2, 0, 0, 0, 0})
+	if err := os.WriteFile(filepath.Join(root, "anim.png"), animated, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := readTool(t, root).Execute(context.Background(), json.RawMessage(`{"path":"anim.png"}`))
+	if res.OK || res.Error != "unsupported_image" {
+		t.Fatalf("want unsupported_image, got %+v", res)
+	}
+	if !strings.Contains(res.Detail, "APNG") && !strings.Contains(res.Detail, "animated") {
+		t.Fatalf("the refusal must name the problem; got %q", res.Detail)
+	}
+}
+
+// TestReadFileStillReadsText. The image path must not capture ordinary files.
+func TestReadFileStillReadsText(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := readTool(t, root).Execute(context.Background(), json.RawMessage(`{"path":"a.go"}`))
+	if !res.OK || len(res.Blocks) != 0 {
+		t.Fatalf("a text file must return no image blocks; got %+v", res)
+	}
+}
+
+// insertPNGChunk adds a chunk right after IHDR.
+func insertPNGChunk(src []byte, typ string, payload []byte) []byte {
+	const sigLen = 8
+	ihdrLen := int(uint32(src[sigLen])<<24 | uint32(src[sigLen+1])<<16 |
+		uint32(src[sigLen+2])<<8 | uint32(src[sigLen+3]))
+	at := sigLen + 8 + ihdrLen + 4
+
+	chunk := make([]byte, 0, 12+len(payload))
+	n := uint32(len(payload))
+	chunk = append(chunk, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+	chunk = append(chunk, typ...)
+	chunk = append(chunk, payload...)
+	c := crc32.NewIEEE()
+	_, _ = c.Write([]byte(typ))
+	_, _ = c.Write(payload)
+	crc := c.Sum32()
+	chunk = append(chunk, byte(crc>>24), byte(crc>>16), byte(crc>>8), byte(crc))
+
+	out := make([]byte, 0, len(src)+len(chunk))
+	out = append(out, src[:at]...)
+	out = append(out, chunk...)
+	out = append(out, src[at:]...)
+	return out
 }

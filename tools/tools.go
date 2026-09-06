@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/imagex"
 	"github.com/agentfox/agentkit-go/schema"
 )
 
@@ -150,9 +151,10 @@ type fileTools struct {
 
 func (f *fileTools) readFile() core.Tool {
 	return core.Tool{
-		Name:        "read_file",
-		Description: "Read a text file. Returns at most 2000 lines or 50KB, whichever comes first.",
-		Builtin:     true,
+		Name: "read_file",
+		Description: "Read a file. Text is returned as at most 2000 lines or 50KB, " +
+			"whichever comes first; an image is returned as a note plus the image itself.",
+		Builtin: true,
 		InputSchema: schema.Object(
 			schema.Prop("path", schema.String("Path to the file (relative to the workspace, or absolute)")),
 			schema.Opt("offset", schema.Int("1-based line to start from (default 1)")),
@@ -175,6 +177,13 @@ func (f *fileTools) readFile() core.Tool {
 			data, err := os.ReadFile(abs)
 			if err != nil {
 				return core.ErrResult("read_failed", err.Error())
+			}
+			// REQ-TOOL-14.6: images are detected by MAGIC BYTES, never by
+			// extension. `screenshot.txt` is still a PNG if its first eight
+			// bytes say so, and splitting one into "lines" hands the model
+			// several kilobytes of mojibake.
+			if mime, isImage := imagex.Sniff(data); isImage {
+				return readImage(abs, a.Path, data, mime)
 			}
 
 			lines := strings.Split(string(data), "\n")
@@ -215,6 +224,40 @@ func (f *fileTools) readFile() core.Tool {
 			return r
 		},
 	}
+}
+
+// readImage returns REQ-TOOL-14.6's "text note plus an ImageBlock".
+//
+// The note matters as much as the block: without it the model sees an image
+// appear with no statement of what was read, and cannot tell a screenshot it
+// asked for from one a previous turn left in history.
+func readImage(abs, shown string, data []byte, mime string) core.ToolResult {
+	// Formats providers reject are refused HERE, with a message naming the
+	// problem, rather than forwarded. Forwarded, the failure lands on the next
+	// provider request — by which time the image is in history and every
+	// subsequent request fails the same way.
+	//
+	// Normalize validates before it does anything else, so there is no
+	// separate Validate call: a second one would be unreachable code that
+	// looks like a safety check.
+	res, err := imagex.Normalize(data, mime)
+	if err != nil {
+		return core.ErrResult("unsupported_image", err.Error())
+	}
+
+	note := fmt.Sprintf("[%s: %s image, %d×%d]", shown, res.MIMEType, res.Width, res.Height)
+	if res.Changed {
+		note = fmt.Sprintf("[%s: %s image, downscaled to %d×%d for the provider's inline limit]",
+			shown, res.MIMEType, res.Width, res.Height)
+	}
+	out := core.OKResult(map[string]any{
+		"note":      note,
+		"mime_type": res.MIMEType,
+		"width":     res.Width,
+		"height":    res.Height,
+	})
+	out.Blocks = []core.ContentBlock{core.ImageBlock{Data: res.Base64(), MimeType: res.MIMEType}}
+	return out
 }
 
 func (f *fileTools) writeFile() core.Tool {
