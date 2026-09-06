@@ -1,11 +1,27 @@
-package skills
+package toml
 
 import (
 	"fmt"
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/agentfox/agentkit-go/internal/diag"
 )
+
+// Diagnostic and Severity are the shared report type (internal/diag), aliased
+// so a caller of this package needs one import rather than two.
+type (
+	Diagnostic = diag.Diagnostic
+	Severity   = diag.Severity
+)
+
+const (
+	SeverityWarning = diag.SeverityWarning
+	SeverityError   = diag.SeverityError
+)
+
+const bomPrefix = diag.BOMPrefix
 
 // ---------------------------------------------------------------- TOML subset
 //
@@ -114,7 +130,9 @@ func (t *Table) Sub(key string) (*Table, bool) {
 	return s, ok
 }
 
-func (t *Table) qualify(key string) string {
+// Qualify renders a key with its table prefix, for a diagnostic that has to
+// name where in the document the problem is.
+func (t *Table) Qualify(key string) string {
 	if t.name == "" {
 		return key
 	}
@@ -137,7 +155,7 @@ func (t *Table) ensure(path []string, line int) *Table {
 	for _, part := range path {
 		nxt, ok := cur.subs[part]
 		if !ok {
-			nxt = newTable(cur.qualify(part), line)
+			nxt = newTable(cur.Qualify(part), line)
 			cur.subs[part] = nxt
 			cur.subKeys = append(cur.subKeys, part)
 		}
@@ -379,12 +397,12 @@ func (p *tomlParser) parseKeyValue() error {
 	}
 	key := path[len(path)-1]
 	if !ok {
-		p.warnf(line, "key %q skipped: %s", tbl.qualify(key), why)
+		p.warnf(line, "key %q skipped: %s", tbl.Qualify(key), why)
 		return nil
 	}
 	v.Line = line
 	if !tbl.set(key, v) {
-		p.warnf(line, "duplicate key %q; the last value wins", tbl.qualify(key))
+		p.warnf(line, "duplicate key %q; the last value wins", tbl.Qualify(key))
 	}
 	return nil
 }

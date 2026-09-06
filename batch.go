@@ -130,6 +130,19 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 			}
 		}
 
+		// REQ-PLUGIN-04, as amended by REQ-SEC-03.5. Event hooks run AFTER the
+		// embedder's interceptor and may only NARROW: an "allow" here means
+		// "this hook does not object", never "overrule the authorization
+		// boundary". The original ordering — a static allowlist ahead of hooks
+		// — is gone, and with it any notion of the SDK running something
+		// before the interceptor that the interceptor cannot override.
+		if d, by := pluginVeto(ctx, cfg.Plugins, c.Name, prepared.Raw); d == core.PluginBlock {
+			results[i] = toolResultMessage(c, core.ErrResult("blocked_by_plugin",
+				fmt.Sprintf("plugin %q blocked this call", by.PluginName())))
+			s.Push(core.ToolResultEvent{Message: results[i]})
+			continue
+		}
+
 		thunks = append(thunks, func() {
 			start := time.Now()
 			s.Push(core.ToolExecutionStartEvent{ToolUseID: c.ID, Name: c.Name})

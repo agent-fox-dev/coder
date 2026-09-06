@@ -115,6 +115,11 @@ type AgentConfig struct {
 
 	SessionID    string
 	TrustProject bool
+	// Plugins is REQ-PLUGIN-11's registry, held HERE and not in a
+	// package-level global — so two agents in one process can carry different
+	// plugin sets, and a test can inject a mock without patching global state
+	// or freezing a registry against late registration.
+	Plugins PluginRegistry
 	// Tracer receives the REQ-OBS-02 tool spans. Nil means NoopTracer.
 	//
 	// It is separate from TracingMiddleware's tracer, which wraps the MODEL

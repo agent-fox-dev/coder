@@ -36,6 +36,7 @@ left to be discovered.
 
 | Package | What it owns |
 |---|---|
+| `plugins` | Four plugin categories, registry, manifest discovery, import lint, conformance report. |
 | `wire` | Bounded, strict decoder for bytes AgentKit did not produce: hand-rolled scanner, reflective binder, framed reader. |
 | `jsonx` | Order-preserving JSON. Decodes once, marshals in slice order at every depth. |
 | `schema` | Structured JSON Schema value + typed combinators. No reflection, no codegen. |
@@ -118,6 +119,25 @@ shallower one; a vendored dependency that is itself a git checkout does not
 inherit the outer project's rules. Without the boundary, a rule the outer
 project wrote about *its* build output silently deletes files from the listing
 of a repository that has never heard of it.
+
+**A plugin hook can only narrow, never widen**
+([`plugins/`](plugins/)). REQ-PLUGIN-04's original ordering put a static
+command allowlist ahead of hooks; REQ-SEC-03 removed the allowlist and made the
+embedder's `BeforeToolCall` the authorization boundary. So hooks run *after*
+it, a call it already refused never reaches a plugin at all, and a hook's
+`"allow"` means "no objection" rather than "overrule the host". The first
+`"block"` wins and **stops the scan** — a hook that ran after the decision was
+made is one whose author will eventually assume it can change it.
+
+**The import restriction is a lint, not a sandbox**, and REQ-SEC-07 says so.
+With build-time module linkage plugin code runs in this process with these
+privileges. `LintImports` catches a plugin reaching for `agentkit/internal`; it
+does not stop one reading your filesystem. It matches the *prefix*, so a
+plugin's own `example.com/mine/internal/x` is its own business — rejecting
+every path containing "internal" would refuse a plugin for having ordinary Go
+structure. And it parses imports only, so a plugin that does not build against
+this SDK version is still linted, which is the case where the lint matters
+most.
 
 **Duplicate object keys are a rejection, not a resolution**
 ([`wire/`](wire/)). `encoding/json` silently takes the last one, which hands an
@@ -364,6 +384,12 @@ confirmed to turn the corresponding test red:
 | Accept an integer past the safe-integer range | `TestIntegersOutsideTheSafeRangeAreRejected` |
 | Let an explicit `null` reach the reflective setter | `TestExplicitNullNeverPanics` |
 | Validate only the root struct | `TestTheValidatorHookRunsPerStructAtItsOwnPath` |
+| Keep the first registration on a name collision | `TestALaterRegistrationWins` |
+| Continue the hook scan past a block | `TestTheFirstBlockWinsAndStopsTheScan` |
+| Run the plugin gate ahead of the interceptor | `TestAPluginHookCannotOverturnTheInterceptor` |
+| Flag any import path containing "internal" | `TestAPluginsOwnInternalPackageIsAllowed` |
+| Require plugin source to compile before linting it | `TestTheLintReadsFilesThatDoNotCompile` |
+| Skip the "could not lint" report | `TestAManifestWithNoSourceIsReportedRatherThanPassed` |
 | Record tool arguments instead of their hash | `TestTheAuditTrailHashesArgumentsRatherThanRecordingThem` |
 | Fire session-end only on a clean run | `TestSessionStartAndEndFireOnEveryExit` |
 | Infer an MCP server from an unprefixed tool name | `TestMCPServerOf` |
@@ -371,7 +397,7 @@ confirmed to turn the corresponding test red:
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
 
-Nine attempts **failed to discriminate**, which is worth stating because a
+Eleven attempts **failed to discriminate**, which is worth stating because a
 mutation that does not distinguish the two implementations proves nothing
 about the test. Four came from one sitting on the SSRF guard, and each was a
 test that passed for a reason other than the one it claimed:
@@ -389,6 +415,10 @@ separator, and a panic mutation that still called `recover()` and so still
 swallowed the panic it was meant to release. The ninth measured `HeapAlloc`
 after a `runtime.GC()` to catch a 16 MiB pre-allocation that was already
 garbage by the time it looked — `TotalAlloc` is the instrument that survives.
+The last two were the harness's fault rather than the tests': one replaced the
+phrase `parser.ImportsOnly` where it first appeared, which was inside a doc
+comment, and one added a second call to the plugin gate without moving the
+first. Neither implemented the bug it was named after.
 
 The original abort test cancelled *before* the batch, where correct and broken
 implementations behave identically. It now cancels mid-batch, where the broken
@@ -416,8 +446,6 @@ Stated plainly so nobody reports it as done.
 - **MCP client and server.** Requires `mcp-go`, which under the dependency
   policy must live in a nested module, which requires a tagged root release
   first. An ordering constraint, not a defect.
-- **Plugins** (§6.6). Skills and project context files now ship, with the
-  trust gate; the four plugin categories do not.
 - **OpenAI Responses.** It is a separate wire API, not this one with a flag —
   different message model, tool-call identity, reasoning replay and billing.
 - **Image normalization** (REQ-TOOL-14).
@@ -432,6 +460,10 @@ Stated plainly so nobody reports it as done.
   it against *truth*, and the weaker claim is the honest one until then.
 - **MCP transports.** The bounded strict decoder they need ([`wire`](wire/))
   ships and is fuzzed; the JSON-RPC layer above it does not.
+- **Plugin implementations.** The four categories, the registry, discovery, the
+  lint and `validate-plugins` ship; no first-party plugin does. That is the
+  intended shape — a plugin is the embedder's code — but it means the
+  categories have no in-tree user yet.
 - **`docs/PROVIDERS.md`** (NFR-COMPAT-07): the ledger of pinned API versions
   and capture dates. It has nothing to record until the harness has a corpus.
 

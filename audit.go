@@ -1,8 +1,10 @@
 package agentkit
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -106,4 +108,30 @@ func (a *Agent) audit(e core.AuditEvent) {
 func (a *Agent) AuditSkills(names []string) {
 	a.audit(core.AuditEvent{Kind: core.AuditSkillsLoaded,
 		Skills: append([]string(nil), names...)})
+}
+
+// pluginVeto runs REQ-PLUGIN-04's event hooks over one tool call.
+//
+// Hooks run in REGISTRATION ORDER and the first "block" WINS — the scan stops
+// there, so a later hook cannot un-block what an earlier one refused. A
+// panicking hook is contained: a plugin is third-party code in this process,
+// and letting it take the run down would make every plugin a liveness risk for
+// the host.
+func pluginVeto(ctx context.Context, reg core.PluginRegistry, toolName string,
+	input json.RawMessage) (core.PluginDecision, core.EventHookPlugin) {
+
+	if reg == nil {
+		return core.PluginNoOpinion, nil
+	}
+	for _, h := range reg.EventHooks() {
+		d := core.PluginNoOpinion
+		func() {
+			defer func() { _ = recover() }()
+			d = h.OnToolUse(ctx, toolName, input)
+		}()
+		if d == core.PluginBlock {
+			return core.PluginBlock, h
+		}
+	}
+	return core.PluginNoOpinion, nil
 }
