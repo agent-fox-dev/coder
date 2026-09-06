@@ -93,6 +93,14 @@ type AgentConfig struct {
 	Temperature  *float64
 	TopP         *float64
 	SystemPrompt string
+	// PromptBlocks are extra system-prompt sections appended after the
+	// built-in ones, in order — the skills and project-context block, or
+	// anything an embedder assembles itself.
+	//
+	// Untyped text because core cannot import skills without inverting the
+	// package graph, and because discovery is the embedder's affirmative act
+	// (REQ-SKILL-04, REQ-SEC-10) rather than something the loop performs.
+	PromptBlocks []string
 
 	StopPolicy StopPolicy
 	// ErrorOnLimit gates whether a limit stop also returns ErrMaxTurns /

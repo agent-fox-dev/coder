@@ -1,0 +1,8 @@
+### branch_summary
+[The conversation was rewound. A summary of the abandoned branch follows.]
+
+Tried the wrong glob; switched to **/*.go.
+### compaction
+[Earlier conversation, summarized]
+
+The user asked for the Go files and got them.

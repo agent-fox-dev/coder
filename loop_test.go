@@ -34,6 +34,10 @@ type scripted struct {
 	// seen records the message list each turn was asked to complete, so a test
 	// can assert what the loop actually sent and when.
 	seen []core.Messages
+	// systems records the assembled system prompt per turn, so a test can
+	// assert what the model was actually told rather than what a builder
+	// returns in isolation.
+	systems [][]core.ContentBlock
 }
 
 func (s *scripted) provider() core.APIProvider {
@@ -46,6 +50,7 @@ func (s *scripted) stream(ctx context.Context, m *core.Model, req core.Request, 
 	i := s.calls
 	s.calls++
 	s.seen = append(s.seen, req.Messages)
+	s.systems = append(s.systems, req.System)
 	var msg core.AssistantMessage
 	if i < len(s.turns) {
 		msg = s.turns[i]

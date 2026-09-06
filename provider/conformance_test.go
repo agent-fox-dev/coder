@@ -615,3 +615,34 @@ func withCredentials(t *testing.T, api string, creds *provider.Credentials) core
 	t.Fatalf("no constructor for %q", api)
 	return core.APIProvider{}
 }
+
+// TestStopSequencesReachEveryWire pins REQ-PROV's stop sequences as a property
+// of the provider CONTRACT rather than of one implementation.
+//
+// This exists because two of the four providers silently dropped the field
+// until the NFR-TEST-08 request golden made the omission visible. A caller's
+// stop condition that never takes effect, with nothing reporting it, is the
+// exact failure mode a per-provider test set does not catch: each provider's
+// own tests pass, and the field is absent from half the bodies.
+func TestStopSequencesReachEveryWire(t *testing.T) {
+	const marker = "STOP-MARKER-42"
+	for _, c := range cases() {
+		t.Run(c.name, func(t *testing.T) {
+			var body []byte
+			req := core.Request{
+				StopSequences: []string{marker},
+				Options: core.RequestOptions{
+					Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						body, _ = io.ReadAll(r.Body)
+						return &http.Response{StatusCode: 200, Header: http.Header{},
+							Body: io.NopCloser(strings.NewReader(c.stream))}, nil
+					}),
+				},
+			}
+			c.provider.Stream(context.Background(), c.model, req, core.ProviderStreamOptions{}).Result()
+			if !strings.Contains(string(body), marker) {
+				t.Fatalf("the stop sequence never reached the wire.\nbody = %s", body)
+			}
+		})
+	}
+}

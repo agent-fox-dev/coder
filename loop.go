@@ -401,8 +401,14 @@ func (a *Agent) callModel(ctx context.Context, out *core.EventStream, view core.
 		EstContextTokens: EstimateContextTokens(view, checkpointOf(a.history)),
 		Options:          cfg.RequestOptions,
 	}
-	if cfg.SystemPrompt != "" {
-		req.System = []core.ContentBlock{core.TextBlock{Text: cfg.SystemPrompt}}
+	// The assembled prompt, not the raw field: per-tool guidelines
+	// (NFR-TEST-08a) and REQ-TOOL-04e's conditional guideline are only visible
+	// to the model if something assembles them, and the tool set they describe
+	// is the RESOLVED one just computed above.
+	if sys := BuildSystemPrompt(PromptInput{
+		Custom: cfg.SystemPrompt, Tools: tools, ExtraBlocks: cfg.PromptBlocks,
+	}); sys != "" {
+		req.System = []core.ContentBlock{core.TextBlock{Text: sys}}
 	}
 
 	registry := cfg.Providers
