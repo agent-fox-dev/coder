@@ -163,6 +163,30 @@ not cancel the numeric `5`. Tearing a transport down cancels everything still
 in flight before waiting for it — otherwise one slow handler holds the
 shutdown open and then writes to a pipe that is already gone.
 
+**`search_files` has two backends and one declared contract**
+([`tools/search.go`](tools/search.go)). `rg --json` when it is on PATH,
+otherwise a complete native implementation — not a "fall back to `regexp`",
+which would return `node_modules`. REQ-TOOL-05 asks for a parity test pinning
+the fallback against whichever backend is present, and writing it is what
+found four places where the two disagreed: ripgrep only honours `.gitignore`
+inside a git repository, it parallelizes so truncation kept whichever N
+finished first, it emits each line once so two matches a line apart each lost
+the other from their context, and its `--stats` "searches" counts files that
+MATCHED — reporting 0 for a query that scanned the whole tree. A fifth came out
+of mutation testing: passing `--glob` lets ripgrep's dialect *narrow* the file
+set, and a post-filter can only remove matches, never recover a file ripgrep
+was told not to open.
+
+**Images are normalized at the history boundary, not inside tools**
+([`imagex/`](imagex/), [`images.go`](images.go)). REQ-TOOL-14's rule is that
+every image entering history is re-processed whichever tool produced it, and
+there is exactly one place they all pass through. It runs *after* the
+post-tool hook, because that hook is the one path that can add an image without
+any tool knowing. The budget is measured on **base64**, not decoded bytes:
+base64 is 4/3 the size of what it encodes, so budgeting the bytes ships an
+image a third over the limit it was checked against and nothing in the
+provider's error mentions base64.
+
 **A remote server's `endpoint` event may not leave its origin**
 ([`mcp/httpsse.go`](mcp/httpsse.go)). In the 2024-11-05 transport the server
 names the URL its client should POST to. Every POST carries the configured
@@ -505,6 +529,29 @@ confirmed to turn the corresponding test red:
 | Let a panicking observer unwind the run | `TestAPanickingAuditHookDoesNotTakeTheRunWithIt` |
 | Remove the project trust gate | `TestProjectSkillsAreNotDiscoveredWithoutExplicitTrust` |
 | Fall back to a relative path when `HOME` is unresolvable | `TestAnUnresolvableHomeSkipsTheUserTierInsteadOfResolvingRelatively` |
+| Search without the ignore engine | `TestSearchSkipsIgnoredAndBinaryFiles` |
+| Let a nested repo's rules leak outward | `TestANestedRepositorysRulesDoNotLeakOutward` |
+| Read `case_sensitive` as a plain bool | `TestSmartCaseIsTheDefault` |
+| Let `rg` and the native backend disagree | `TestTheTwoBackendsAgree` |
+| Inherit ripgrep's glob dialect | `TestTheFileGlobUsesAgentKitsDialect` |
+| Forward an animated PNG to the provider | `TestAnimatedPNGIsRefused` |
+| Budget an image on decoded bytes, not base64 | `TestTheBudgetIsMeasuredOnBase64NotOnBytes` |
+| Re-encode an image that already fits | `TestAConformingImageIsReturnedByteForByte` |
+| Drop the alpha channel instead of compositing | `TestATransparentPNGIsFlattenedOntoWhite` |
+| Downscale by sampling rather than averaging | `TestDownscalingAveragesRatherThanSampling` |
+| Normalize images before the post-tool hook | `TestNormalizationRunsAfterThePostToolHook` |
+| Delete a tool's image when normalization fails | `TestANormalizationFailureKeepsTheOriginalBlock` |
+| Sort tool guidelines instead of first-seen order | `TestGuidelinesAreDeduplicatedPreservingFirstSeenOrder` |
+| Keep built-in blocks under a custom system prompt | `TestGoldenCustomSystemPrompt` |
+| Send the raw `SystemPrompt` instead of the assembled one | `TestTheAssembledPromptReachesTheProvider` |
+| Drop a caller's stop sequences silently | `TestAStopSequenceEitherTakesEffectOrIsReported` |
+| Nest a Responses tool under `function` | `TestAToolIsFlatNotNested` |
+| Collapse the composite `callId\|itemId` | `TestTheToolCallIdentityIsComposite` |
+| Reference the composite id from a tool output | `TestAFunctionCallOutputReferencesOnlyTheCallID` |
+| Lose the reasoning chain between turns | `TestReasoningIsReplayedWithItsItemIDAndEncryptedContent` |
+| Share compat keys between two wire APIs | `TestTheCompatProfileKeysAreDisjointFromChatCompletions` |
+| Seed tool arguments from the item placeholder | `TestAPlaceholderArgumentStringIsNotSeededIntoTheDeltas` |
+| Bump a pinned API version without the ledger | `TestTheProviderLedgerMatchesTheCode` |
 
 Twelve attempts **failed to discriminate**, which is worth stating because a
 mutation that does not distinguish the two implementations proves nothing
@@ -575,11 +622,23 @@ Stated plainly so nobody reports it as done.
   lint and `validate-plugins` ship; no first-party plugin does. That is the
   intended shape — a plugin is the embedder's code — but it means the
   categories have no in-tree user yet.
-- **`docs/PROVIDERS.md`** (NFR-COMPAT-07): the ledger of pinned API versions
-  and capture dates. It has nothing to record until the harness has a corpus.
+- **A vendor capture behind the request goldens.**
+  [`docs/PROVIDERS.md`](docs/PROVIDERS.md) ships and is checked against the
+  code by a test, so a pin bump that forgets the ledger fails. Its capture-date
+  column is empty, and that is the honest state: `testdata/golden/request_*.json`
+  were produced by AgentKit, so they pin the wire format against *regression*
+  and say nothing about whether it still matches the vendor. Only a capture, or
+  the `difftest` harness above, pins it against *truth*.
+- **WebP normalization.** REQ-TOOL-14 downscales JPEG, PNG and GIF; the
+  standard library has no WebP decoder and REQ-GO-11 forbids the module that
+  does, so a WebP image is reported unsupported and kept as-is — which is what
+  REQ-TOOL-14.5 asks for on any failure, and a format providers accept anyway.
 
-`search_files` (REQ-TOOL-05's grep tool, with `rg --json` acceleration) is not
-built. The ignore engine underneath it is, and `find_files` uses it.
+All five wire APIs ship, including `openai-responses` as a separate
+implementation rather than `openai-completions` with a flag — the two differ in
+the message model, the tool-call identity model, reasoning replay, the caching
+parameters and the billing model, and a flag would branch on itself in every
+one of those places.
 
 ## License
 
