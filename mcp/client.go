@@ -376,8 +376,29 @@ func (c *ServerConnection) call(ctx context.Context, method string, params, out 
 		// Forget the waiter so a timed-out call does not leak an entry for the
 		// life of the connection.
 		c.corr.forget(id)
+		// Tell the server to stop. Without this a cancelled call leaves the
+		// handler running to completion on the other side — for a tool that
+		// spends money or holds a lock, "the client gave up" and "the work
+		// stopped" have to be the same event.
+		c.cancelRemote(id, ctx.Err())
 		return ctx.Err()
 	}
+}
+
+// cancelRemote sends notifications/cancelled for an abandoned request. A send
+// failure is deliberately ignored: the call has already failed, and the
+// cancellation is a courtesy to a peer that may itself be the reason the send
+// cannot complete.
+func (c *ServerConnection) cancelRemote(id ID, cause error) {
+	rawID, err := id.MarshalJSON()
+	if err != nil {
+		return
+	}
+	reason := ""
+	if cause != nil {
+		reason = cause.Error()
+	}
+	_ = c.notify(MethodCancelled, CancelledParams{RequestID: rawID, Reason: reason})
 }
 
 func (c *ServerConnection) notify(method string, params any) error {

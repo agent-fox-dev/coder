@@ -25,7 +25,46 @@ const (
 	MethodResourcesRead = "resources/read"
 	MethodSampling      = "sampling/createMessage"
 	MethodPing          = "ping"
+
+	MethodResourceTemplatesList = "resources/templates/list"
+	MethodResourcesChanged      = "notifications/resources/list_changed"
+	MethodCancelled             = "notifications/cancelled"
 )
+
+// SupportedProtocolVersions is the negotiation table (REQ-MCP-SERVER-06),
+// newest first.
+//
+// A function rather than a package-level slice: an exported slice is writable
+// by anything that imports the package, and a caller that appended a version
+// we do not actually speak would make the server agree to it.
+func SupportedProtocolVersions() []string {
+	return []string{ProtocolVersion, LegacyProtocolVersion}
+}
+
+// NegotiateProtocol picks the version to answer `initialize` with.
+//
+// A client asking for one we speak is answered with the SAME version, per the
+// spec's requirement; anything else is answered with the newest we speak, and
+// the client decides whether it can live with that.
+func NegotiateProtocol(requested string) string {
+	for _, v := range SupportedProtocolVersions() {
+		if v == requested {
+			return v
+		}
+	}
+	return ProtocolVersion
+}
+
+// CancelledParams is notifications/cancelled.
+//
+// RequestID is json.RawMessage rather than an ID because it must round-trip
+// through the same Key() encoding the correlator uses; decoding it into a
+// typed ID and re-encoding would collapse the number/string distinction that
+// Key() exists to preserve.
+type CancelledParams struct {
+	RequestID json.RawMessage `json:"requestId"`
+	Reason    string          `json:"reason,omitzero"`
+}
 
 // ---------------------------------------------------------------- initialize
 
@@ -64,6 +103,16 @@ type InitializeParams struct {
 	ProtocolVersion string             `json:"protocolVersion"`
 	Capabilities    ClientCapabilities `json:"capabilities"`
 	ClientInfo      Implementation     `json:"clientInfo"`
+}
+
+// Validate is the server-side check on an inbound handshake. A client that
+// names no protocol version has not asked for one, and answering it with ours
+// as though it had agreed is how a version mismatch becomes invisible.
+func (p InitializeParams) Validate() error {
+	if p.ProtocolVersion == "" {
+		return errMissing("protocolVersion")
+	}
+	return nil
 }
 
 type InitializeResult struct {
@@ -154,6 +203,11 @@ func (r Resource) Validate() error {
 		return errMissing("uri")
 	}
 	return nil
+}
+
+// ResourcesListParams carries the pagination cursor.
+type ResourcesListParams struct {
+	Cursor string `json:"cursor,omitzero"`
 }
 
 type ResourcesListResult struct {

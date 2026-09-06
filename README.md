@@ -137,6 +137,39 @@ item**: a server returning two hundred blocks of 49K each passes a per-item cap
 and delivers ten megabytes into the model's context. It counts runes, not
 bytes, or a CJK result gets a third of the room an ASCII one does.
 
+**The server advertises `listChanged`, so it sends it**
+([`mcp/server.go`](mcp/server.go)). Registering or withdrawing a tool after a
+client has connected emits `notifications/tools/list_changed` to every
+initialized session. A capability advertised in the handshake and then never
+honoured is worse than one never claimed: a client that trusts it caches its
+tool list forever. The notification is sent *after* the registry lock is
+released, so one wedged client's transport cannot block every registration on
+the server.
+
+**Resource URIs are templated** ([`mcp/resources.go`](mcp/resources.go)).
+REQ-MCP-SERVER-05's own examples are parameterised —
+`nightshift://issues/{number}/triage-report` — which exact-URI registration
+cannot express at all; a host would have to register every issue it has ever
+seen. A plain `{var}` matches one path segment and `{+var}` is RFC 6570's
+reserved expansion and may span `/`. An exact registration always beats a
+matching template, or registration order would decide which answers and a
+specific registration would become silently unreachable.
+
+**A cancelled request goes unanswered.** `notifications/cancelled` cancels the
+handler's context and suppresses its reply, because a response the client has
+stopped waiting for looks like an answer to whatever it asked next. The
+correlation key encodes the id's *type*, so cancelling the string `"5"` does
+not cancel the numeric `5`. Tearing a transport down cancels everything still
+in flight before waiting for it — otherwise one slow handler holds the
+shutdown open and then writes to a pipe that is already gone.
+
+**Pagination cursors name an entry, not an index.** Unregister a tool between
+two pages and an index-based cursor silently skips whatever moved into its
+place. A cursor for an entry that no longer exists is refused rather than
+restarted from the top, and one this server did not issue is refused by its
+prefix — cursors are opaque by spec, and a client that guessed the format
+should learn that rather than get a page computed from a name it invented.
+
 **A plugin hook can only narrow, never widen**
 ([`plugins/`](plugins/)). REQ-PLUGIN-04's original ordering put a static
 command allowlist ahead of hooks; REQ-SEC-03 removed the allowlist and made the
@@ -415,6 +448,20 @@ confirmed to turn the corresponding test red:
 | Serve MCP over HTTP with no API key | `TestHTTPModeRequiresAnAPIKey` |
 | Check the HTTP method before authenticating | `TestAuthenticationRunsBeforeTheMethodCheck` |
 | Resynchronize after a malformed MCP frame | `TestAMalformedFrameTearsTheConnectionDown` |
+| Answer a method before the MCP handshake completes | `TestAMethodBeforeInitializeIsRefused` |
+| Always answer `initialize` with our newest version | `TestTheServerEchoesAProtocolVersionItSpeaks` |
+| Advertise `listChanged` without ever sending it | `TestRegisteringAToolNotifiesConnectedClients` |
+| Notify a session that has not finished initializing | `TestNoNotificationBeforeTheHandshakeCompletes` |
+| Answer a request the client cancelled | `TestACancelledRequestStopsTheHandlerAndGoesUnanswered` |
+| Key a cancellation on the id's value, not its type | `TestAStringAndANumericRequestIDDoNotCollideWhenCancelling` |
+| Leave in-flight handlers running through a shutdown | `TestShutdownCancelsInFlightHandlers` |
+| Let a `{var}` swallow a path separator | `TestATemplateVariableDoesNotSpanASlash` |
+| Let a template shadow an exact resource registration | `TestAnExactResourceWinsOverAMatchingTemplate` |
+| Resume a listing AT the cursor's entry | `TestListingPagesAndResumesAfterTheCursor` |
+| Accept a cursor this server never issued | `TestAFabricatedCursorIsRefused` |
+| Bind MCP HTTP mode to every interface | `TestHTTPModeBindsLoopback` |
+| Start HTTP mode when `api_key_env` is unset | `TestHTTPModeRefusesToStartWithoutAKey` |
+| Fall back to stdio on an unknown transport | `TestRunRejectsAnUnknownTransport` |
 | Walk past an array of tables resolving `[a.b]` | `TestASubTableUnderAnArrayElementBelongsToThatElement` |
 | Expose MCP tools unqualified | `TestMCPToolsAreGatedByQualifiedNameEverywhere` |
 | Adapt an MCP tool without its server name | `TestAnMCPToolCallIsAuditedWithItsServerName` |
@@ -484,8 +531,11 @@ Stated plainly so nobody reports it as done.
   unit suite pins the wire format against *regression*; only a reference pins
   it against *truth*, and the weaker claim is the honest one until then.
 - **MCP HTTP/SSE and streamable-HTTP client transports.** stdio ships and is
-  tested against a real subprocess; the two HTTP client transports of
-  REQ-MCP-CLIENT-02 do not. The server's HTTP mode does ship.
+  tested against a real subprocess; the two HTTP *client* transports of
+  REQ-MCP-CLIENT-02 do not. The server's HTTP mode does ship, and so does the
+  reference driver ([`cmd/mcp-server`](cmd/mcp-server/)) — the SDK equivalent
+  of REQ-MCP-SERVER-02's `nightshift --mcp-server`, exercised end to end as a
+  real subprocess by the shipped client.
 - **Plugin implementations.** The four categories, the registry, discovery, the
   lint and `validate-plugins` ship; no first-party plugin does. That is the
   intended shape — a plugin is the embedder's code — but it means the
