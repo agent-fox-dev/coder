@@ -56,9 +56,30 @@ func All(opts Options) ([]core.Tool, error) {
 		fs.editFile(),
 		fs.listFiles(),
 		fs.findFiles(),
+		fs.searchFiles(),
 		executeTool(opts),
 	}, nil
 }
+
+// FileNavigationTools names REQ-TOOL-04e's opt-in trio.
+//
+// They are in All() because All() is the DEFAULT set, and the requirement's
+// "opt-in" is about the tool policy of REQ-TOOL-10 rather than about this
+// constructor: an embedder scopes a run down with ToolPolicy, and a set that
+// omitted them by default would make the common case the one you have to
+// remember. What the requirement actually turns on is their ABSENCE from the
+// resolved set, which is the prompt builder's business, not this list's.
+func FileNavigationTools() []string {
+	return []string{"list_files", "find_files", "search_files"}
+}
+
+// ExecuteFallbackGuideline is REQ-TOOL-04e's sentence, verbatim.
+//
+// It is not a PromptGuidelines entry on any tool, because its condition is
+// that those tools are MISSING — a per-tool field can only fire when its tool
+// is present, which is the opposite of what the requirement asks for. The
+// prompt builder emits it.
+const ExecuteFallbackGuideline = "Use execute for file operations like ls, rg, find."
 
 // ---------------------------------------------------------------- path locks
 
@@ -351,7 +372,6 @@ func (f *fileTools) listFiles() core.Tool {
 			schema.Opt("path", schema.String("Directory to list (default the workspace root)")),
 			schema.Opt("limit", schema.Int("Maximum entries")),
 		),
-		PromptGuidelines: []string{"Use execute for file operations like ls, rg, find."},
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
 				Path  string `json:"path"`
@@ -496,7 +516,6 @@ func executeTool(opts Options) core.Tool {
 			schema.Prop("command", schema.String("The shell command to run")),
 			schema.Opt("timeout_s", schema.Int("Seconds before the process tree is killed")),
 		),
-		PromptGuidelines: []string{"Use execute for file operations like ls, rg, find."},
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
 				Command  string `json:"command"`
