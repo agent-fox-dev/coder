@@ -1,4 +1,4 @@
-package skills
+package toml
 
 import (
 	"errors"
@@ -171,7 +171,10 @@ func TestTOMLStructuralFailuresAreErrorsWithALineNumber(t *testing.T) {
 		name, src string
 		line      int
 	}{
-		{"array of tables", "name = \"a\"\n[[servers]]\n", 2},
+		// [[servers]] used to be here: an array of tables was a hard error
+		// until REQ-MCP-CLIENT-07's [[mcp.servers]] needed one. It is now
+		// parsed, and arraytable_test.go covers it.
+		{"array header not closed", "name = \"a\"\n[[servers]\n", 2},
 		{"unterminated string", "name = \"a\ndescription = \"b\"\n", 1},
 		{"unterminated array", "a = [\"x\",\n", 1},
 		{"missing equals", "name \"a\"\n", 1},

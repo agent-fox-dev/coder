@@ -1,6 +1,10 @@
 package core
 
-import "time"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"time"
+)
 
 // AuditKind names one audited operation.
 type AuditKind string
@@ -53,4 +57,27 @@ type AuditEvent struct {
 	// Error is the run's terminal error, if any. Its text is the SDK's own;
 	// no credential reaches it (NFR-SEC-01, REQ-AUTH-07).
 	Error string
+}
+
+// HashArguments is REQ-OBS-05's "arguments hash".
+//
+// A HASH, never the arguments. Tool arguments routinely carry file contents,
+// credentials and personal data, and an audit trail is precisely the artifact
+// that gets shipped to a log aggregator and retained for years. The hash gives
+// correlation — the same call twice, the same call across sessions — without
+// making the audit log the largest copy of the data it describes.
+//
+// It is taken over the RAW argument bytes, so two calls that differ only in
+// the key order the model authored hash differently. That is deliberate and
+// matches REQ-CACHE-01: on wires that carry arguments as a JSON string they
+// are genuinely different calls.
+//
+// It lives in core because both the batch executor and the MCP client need it,
+// and neither should import the other.
+func HashArguments(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }

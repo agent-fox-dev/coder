@@ -152,7 +152,9 @@ func (s *collectingSpan) End()                            {}
 
 // ------------------------------------------------------------ REQ-CACHE-10
 
-func wire(name string) core.ToolWire {
+// namedWire was `wire` until the `wire` package became an import here. A local
+// identifier shadowing a package name is a latent conflict, not a style point.
+func namedWire(name string) core.ToolWire {
 	return core.ToolWire{Name: name, Description: name,
 		InputSchema: schema.Object(schema.Opt("x", schema.String("x")))}
 }
@@ -173,7 +175,7 @@ func TestAToolAddedMidSessionIsDeferred(t *testing.T) {
 		core.AssistantMessage{Content: core.Content{toolUse(t, "c1", "read_file", `{}`)}},
 		addedResult("mcp__db__query"),
 	}
-	s := provider.SplitDeferredTools([]core.ToolWire{wire("read_file"), wire("mcp__db__query")}, history)
+	s := provider.SplitDeferredTools([]core.ToolWire{namedWire("read_file"), namedWire("mcp__db__query")}, history)
 
 	if len(s.Immediate) != 1 || s.Immediate[0].Name != "read_file" {
 		t.Fatalf("immediate = %+v, want just read_file", s.Immediate)
@@ -198,7 +200,7 @@ func TestLaterUsageCannotUnDeferATool(t *testing.T) {
 		core.AssistantMessage{Content: core.Content{toolUse(t, "c2", "mcp__db__query", `{}`)}},
 		core.ToolResultMessage{ToolUseID: "c2", Content: core.Content{core.TextBlock{Text: "rows"}}},
 	}
-	s := provider.SplitDeferredTools([]core.ToolWire{wire("read_file"), wire("mcp__db__query")}, history)
+	s := provider.SplitDeferredTools([]core.ToolWire{namedWire("read_file"), namedWire("mcp__db__query")}, history)
 	if !s.IsDeferred("mcp__db__query") {
 		t.Fatal("usage AFTER the marker must not un-defer: the pass is forward and the " +
 			"decision is made at the marker")
@@ -211,7 +213,7 @@ func TestUsageBeforeTheMarkerPreventsDeferral(t *testing.T) {
 		core.AssistantMessage{Content: core.Content{toolUse(t, "c1", "shared", `{}`)}},
 		addedResult("shared"),
 	}
-	s := provider.SplitDeferredTools([]core.ToolWire{wire("shared")}, history)
+	s := provider.SplitDeferredTools([]core.ToolWire{namedWire("shared")}, history)
 	if s.IsDeferred("shared") {
 		t.Fatal("a tool already used before the add marker is part of the prefix the " +
 			"model has been conditioned on; deferring it would move a declaration the " +
@@ -223,7 +225,7 @@ func TestUsageBeforeTheMarkerPreventsDeferral(t *testing.T) {
 // bullet: with nothing immediate there is no prefix to anchor against.
 func TestTheSafetyValveFiresWhenEveryToolWouldDefer(t *testing.T) {
 	history := core.Messages{addedResult("a", "b")}
-	s := provider.SplitDeferredTools([]core.ToolWire{wire("a"), wire("b")}, history)
+	s := provider.SplitDeferredTools([]core.ToolWire{namedWire("a"), namedWire("b")}, history)
 
 	if len(s.Deferred) != 0 {
 		t.Fatalf("deferred = %+v, want none: all promoted back", s.Deferred)
@@ -244,7 +246,7 @@ func TestTheSafetyValveFiresWhenEveryToolWouldDefer(t *testing.T) {
 // a SCHEMA CHANGE is not.
 func TestAddingAToolDoesNotInvalidateThePrefix(t *testing.T) {
 	var p provider.ToolPrefix
-	a, b := wire("a"), wire("b")
+	a, b := namedWire("a"), namedWire("b")
 
 	if _, rep, err := p.Sync([]core.ToolWire{a}); err != nil || rep.Invalidated {
 		t.Fatalf("first sync: err=%v report=%+v", err, rep)
@@ -269,7 +271,7 @@ func TestAddingAToolDoesNotInvalidateThePrefix(t *testing.T) {
 
 func TestRemovingAToolInvalidatesThePrefix(t *testing.T) {
 	var p provider.ToolPrefix
-	a, b := wire("a"), wire("b")
+	a, b := namedWire("a"), namedWire("b")
 	_, _, _ = p.Sync([]core.ToolWire{a, b})
 
 	_, rep, err := p.Sync([]core.ToolWire{a})
@@ -286,7 +288,7 @@ func TestRemovingAToolInvalidatesThePrefix(t *testing.T) {
 
 func TestChangingAToolsSchemaInvalidatesThePrefix(t *testing.T) {
 	var p provider.ToolPrefix
-	a := wire("a")
+	a := namedWire("a")
 	_, _, _ = p.Sync([]core.ToolWire{a})
 
 	changed := core.ToolWire{Name: "a", Description: "a",
@@ -308,9 +310,9 @@ func TestChangingAToolsSchemaInvalidatesThePrefix(t *testing.T) {
 // would report a prefix invalidation that never happened.
 func TestRebuildingAnIdenticalToolDoesNotInvalidate(t *testing.T) {
 	var p provider.ToolPrefix
-	_, _, _ = p.Sync([]core.ToolWire{wire("a")})
+	_, _, _ = p.Sync([]core.ToolWire{namedWire("a")})
 
-	_, rep, err := p.Sync([]core.ToolWire{wire("a")}) // a fresh, equal schema value
+	_, rep, err := p.Sync([]core.ToolWire{namedWire("a")}) // a fresh, equal schema value
 	if err != nil {
 		t.Fatal(err)
 	}

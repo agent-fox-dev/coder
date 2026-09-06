@@ -1,11 +1,27 @@
-package skills
+package toml
 
 import (
 	"fmt"
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/agentfox/agentkit-go/internal/diag"
 )
+
+// Diagnostic and Severity are the shared report type (internal/diag), aliased
+// so a caller of this package needs one import rather than two.
+type (
+	Diagnostic = diag.Diagnostic
+	Severity   = diag.Severity
+)
+
+const (
+	SeverityWarning = diag.SeverityWarning
+	SeverityError   = diag.SeverityError
+)
+
+const bomPrefix = diag.BOMPrefix
 
 // ---------------------------------------------------------------- TOML subset
 //
@@ -35,12 +51,14 @@ import (
 //   - multi-line strings (""" and ''')
 //   - inline tables { }
 //   - arrays that are not arrays of strings (numbers, nested arrays, tables)
+//
+// SUPPORTED since REQ-MCP-CLIENT-07 needed it:
+//   - arrays of tables [[a.b]]
 //   - non-decimal integers (0x, 0o, 0b)
 //
 // NOT SUPPORTED and a HARD ERROR, because after one of these the file's
 // structure is unknown and every later key would be filed under the wrong
 // table — a silently misplaced key is worse than a rejected manifest:
-//   - arrays of tables [[a]]
 //   - an unterminated string, array or table header
 //   - anything that is not a comment, a table header or `key = value`
 
@@ -72,12 +90,14 @@ type Value struct {
 // the unknown-key diagnostics of REQ-SKILL-10 deterministic: a map iteration
 // would reorder the warnings between runs and turn a golden test into a flake.
 type Table struct {
-	name    string
-	line    int
-	keys    []string
-	vals    map[string]Value
-	subKeys []string
-	subs    map[string]*Table
+	name      string
+	line      int
+	keys      []string
+	vals      map[string]Value
+	arrays    map[string][]*Table
+	arrayKeys []string
+	subKeys   []string
+	subs      map[string]*Table
 }
 
 func newTable(name string, line int) *Table {
@@ -114,7 +134,40 @@ func (t *Table) Sub(key string) (*Table, bool) {
 	return s, ok
 }
 
-func (t *Table) qualify(key string) string {
+// Array returns the elements of an array of tables ([[key]]), in document
+// order.
+func (t *Table) Array(key string) ([]*Table, bool) {
+	if t == nil {
+		return nil, false
+	}
+	a, ok := t.arrays[key]
+	return a, ok
+}
+
+// ArrayKeys returns the names of the arrays of tables declared here.
+func (t *Table) ArrayKeys() []string {
+	if t == nil {
+		return nil
+	}
+	return append([]string(nil), t.arrayKeys...)
+}
+
+// appendArray adds one element to an array of tables.
+func (t *Table) appendArray(key, qualified string, line int) *Table {
+	if t.arrays == nil {
+		t.arrays = map[string][]*Table{}
+	}
+	if _, exists := t.arrays[key]; !exists {
+		t.arrayKeys = append(t.arrayKeys, key)
+	}
+	el := newTable(qualified, line)
+	t.arrays[key] = append(t.arrays[key], el)
+	return el
+}
+
+// Qualify renders a key with its table prefix, for a diagnostic that has to
+// name where in the document the problem is.
+func (t *Table) Qualify(key string) string {
 	if t.name == "" {
 		return key
 	}
@@ -135,9 +188,19 @@ func (t *Table) set(key string, v Value) bool {
 func (t *Table) ensure(path []string, line int) *Table {
 	cur := t
 	for _, part := range path {
+		// A path segment naming an array of tables descends into its MOST
+		// RECENT element. That is what [[a]] followed by [a.b] means in TOML:
+		// b belongs to the a that was just declared, not to a fourth table
+		// hanging off the root. Walking past the array instead files every key
+		// under [a.b] in a table nobody reads — silently, since both spellings
+		// parse.
+		if arr, ok := cur.arrays[part]; ok && len(arr) > 0 {
+			cur = arr[len(arr)-1]
+			continue
+		}
 		nxt, ok := cur.subs[part]
 		if !ok {
-			nxt = newTable(cur.qualify(part), line)
+			nxt = newTable(cur.Qualify(part), line)
 			cur.subs[part] = nxt
 			cur.subKeys = append(cur.subKeys, part)
 		}
@@ -287,8 +350,12 @@ func (p *tomlParser) parse() error {
 func (p *tomlParser) parseHeader() error {
 	line := p.line
 	p.i++ // '['
+	array := false
 	if p.peek() == '[' {
-		return p.errf("arrays of tables ([[...]]) are not supported")
+		// [[a.b]] — an array of tables. Added for REQ-MCP-CLIENT-07's
+		// [[mcp.servers]]; nothing else in the module uses one.
+		array = true
+		p.i++
 	}
 	path, err := p.parseKeyPath()
 	if err != nil {
@@ -299,10 +366,27 @@ func (p *tomlParser) parseHeader() error {
 		return p.errf("expected ']' to close table header [%s]", strings.Join(path, "."))
 	}
 	p.i++
+	if array {
+		if p.peek() != ']' {
+			return p.errf("expected ']]' to close array-of-tables header [[%s]]",
+				strings.Join(path, "."))
+		}
+		p.i++
+	}
 	if err := p.endOfLine(); err != nil {
 		return err
 	}
-	p.cur = p.root.ensure(path, line)
+
+	if !array {
+		p.cur = p.root.ensure(path, line)
+		return nil
+	}
+	if len(path) == 0 {
+		return p.errf("array-of-tables header needs a name")
+	}
+	parent := p.root.ensure(path[:len(path)-1], line)
+	key := path[len(path)-1]
+	p.cur = parent.appendArray(key, parent.Qualify(key), line)
 	return nil
 }
 
@@ -379,12 +463,12 @@ func (p *tomlParser) parseKeyValue() error {
 	}
 	key := path[len(path)-1]
 	if !ok {
-		p.warnf(line, "key %q skipped: %s", tbl.qualify(key), why)
+		p.warnf(line, "key %q skipped: %s", tbl.Qualify(key), why)
 		return nil
 	}
 	v.Line = line
 	if !tbl.set(key, v) {
-		p.warnf(line, "duplicate key %q; the last value wins", tbl.qualify(key))
+		p.warnf(line, "duplicate key %q; the last value wins", tbl.Qualify(key))
 	}
 	return nil
 }

@@ -4,39 +4,24 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/agentfox/agentkit-go/internal/diag"
 )
 
-// Severity distinguishes a diagnostic that skipped something from one that
-// rejected a skill outright.
-type Severity string
+// Severity and Diagnostic are the shared report type (internal/diag), aliased
+// here because they are part of this package's public surface and were before
+// the move.
+type Severity = diag.Severity
 
 const (
-	SeverityWarning Severity = "warning"
-	SeverityError   Severity = "error"
+	SeverityWarning = diag.SeverityWarning
+	SeverityError   = diag.SeverityError
 )
 
 // Diagnostic is a non-fatal report from parsing or discovery. Skills are
 // authored content, so almost everything that goes wrong here is a warning the
 // embedder may log; only SeverityError means something was not loaded.
-type Diagnostic struct {
-	// Path is the file the diagnostic concerns, empty when it is about a byte
-	// stream the caller supplied directly.
-	Path     string
-	Line     int
-	Severity Severity
-	Message  string
-}
-
-func (d Diagnostic) String() string {
-	loc := d.Path
-	if d.Line > 0 {
-		loc = fmt.Sprintf("%s:%d", loc, d.Line)
-	}
-	if loc == "" {
-		return fmt.Sprintf("%s: %s", d.Severity, d.Message)
-	}
-	return fmt.Sprintf("%s: %s: %s", loc, d.Severity, d.Message)
-}
+type Diagnostic = diag.Diagnostic
 
 // ErrNoDescription is the ONLY manifest content that rejects a skill
 // (REQ-SKILL-10). Without a description the skill cannot be offered to the
@@ -254,7 +239,7 @@ type tableReader struct {
 func (r *tableReader) typeWarn(diags *[]Diagnostic, key string, v Value, want string) {
 	*diags = append(*diags, Diagnostic{
 		Path: r.path, Line: v.Line, Severity: SeverityWarning,
-		Message: fmt.Sprintf("%q is not %s; ignoring it", r.tbl.qualify(key), want),
+		Message: fmt.Sprintf("%q is not %s; ignoring it", r.tbl.Qualify(key), want),
 	})
 }
 
@@ -356,9 +341,9 @@ func (r *tableReader) reportUnknown(diags *[]Diagnostic) {
 			continue
 		}
 		v, _ := r.tbl.Get(k)
-		msg := fmt.Sprintf("unknown key %q; ignoring it", r.tbl.qualify(k))
+		msg := fmt.Sprintf("unknown key %q; ignoring it", r.tbl.Qualify(k))
 		if why, removed := removedFields[k]; removed {
-			msg = fmt.Sprintf("%q is %s", r.tbl.qualify(k), why)
+			msg = fmt.Sprintf("%q is %s", r.tbl.Qualify(k), why)
 		}
 		*diags = append(*diags, Diagnostic{
 			Path: r.path, Line: v.Line, Severity: SeverityWarning, Message: msg,
