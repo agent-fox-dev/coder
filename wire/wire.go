@@ -38,6 +38,12 @@ func Defaults() Limits {
 	return Limits{MaxMessageBytes: 16 << 20, MaxContainerLen: 1_000_000, MaxDepth: 64}
 }
 
+// WithDefaults fills the zero fields. It is exported because a caller that
+// bounds a read BEFORE handing bytes to Parse — an SSE event, an HTTP body —
+// needs the same number Parse will use, and re-deriving it is how two bounds
+// drift apart.
+func (l Limits) WithDefaults() Limits { return l.withDefaults() }
+
 func (l Limits) withDefaults() Limits {
 	d := Defaults()
 	if l.MaxMessageBytes <= 0 {

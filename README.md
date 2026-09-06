@@ -137,6 +137,60 @@ item**: a server returning two hundred blocks of 49K each passes a per-item cap
 and delivers ten megabytes into the model's context. It counts runes, not
 bytes, or a CJK result gets a third of the room an ASCII one does.
 
+**The server advertises `listChanged`, so it sends it**
+([`mcp/server.go`](mcp/server.go)). Registering or withdrawing a tool after a
+client has connected emits `notifications/tools/list_changed` to every
+initialized session. A capability advertised in the handshake and then never
+honoured is worse than one never claimed: a client that trusts it caches its
+tool list forever. The notification is sent *after* the registry lock is
+released, so one wedged client's transport cannot block every registration on
+the server.
+
+**Resource URIs are templated** ([`mcp/resources.go`](mcp/resources.go)).
+REQ-MCP-SERVER-05's own examples are parameterised —
+`nightshift://issues/{number}/triage-report` — which exact-URI registration
+cannot express at all; a host would have to register every issue it has ever
+seen. A plain `{var}` matches one path segment and `{+var}` is RFC 6570's
+reserved expansion and may span `/`. An exact registration always beats a
+matching template, or registration order would decide which answers and a
+specific registration would become silently unreachable.
+
+**A cancelled request goes unanswered.** `notifications/cancelled` cancels the
+handler's context and suppresses its reply, because a response the client has
+stopped waiting for looks like an answer to whatever it asked next. The
+correlation key encodes the id's *type*, so cancelling the string `"5"` does
+not cancel the numeric `5`. Tearing a transport down cancels everything still
+in flight before waiting for it — otherwise one slow handler holds the
+shutdown open and then writes to a pipe that is already gone.
+
+**A remote server's `endpoint` event may not leave its origin**
+([`mcp/httpsse.go`](mcp/httpsse.go)). In the 2024-11-05 transport the server
+names the URL its client should POST to. Every POST carries the configured
+headers, which is where a bearer token for that server lives — so a server that
+could name any origin would be choosing where our credential gets sent, as
+traffic that looks exactly like the protocol working. The named URL is resolved
+against the stream's own URL and then checked: same scheme, same host, same
+port, or we do not send. Relative endpoints (`/messages?sessionId=…`) are the
+common case and are precisely what the rule makes safe.
+
+**The remote transports auto-negotiate, but only on the server's own answer.**
+`transport` unset POSTs as 2025-03-26 and falls back to 2024-11-05 when the
+server rejects the POST with 405/404/400 — the spec's own backwards-
+compatibility procedure, so an operator does not have to know which revision a
+third-party server implements. A 5xx or a transport failure never triggers the
+fallback: that is a working server having a bad day, and silently changing
+which revision we speak because of one turns a transient failure into a
+permanent misconfiguration. The fallback swaps the transport under a read loop
+that is parked inside the old one, so `Receive` carries a generation counter to
+tell "the transport under me was exchanged" from "the session ended".
+
+**Pagination cursors name an entry, not an index.** Unregister a tool between
+two pages and an index-based cursor silently skips whatever moved into its
+place. A cursor for an entry that no longer exists is refused rather than
+restarted from the top, and one this server did not issue is refused by its
+prefix — cursors are opaque by spec, and a client that guessed the format
+should learn that rather than get a page computed from a name it invented.
+
 **A plugin hook can only narrow, never widen**
 ([`plugins/`](plugins/)). REQ-PLUGIN-04's original ordering put a static
 command allowlist ahead of hooks; REQ-SEC-03 removed the allowlist and made the
@@ -415,6 +469,33 @@ confirmed to turn the corresponding test red:
 | Serve MCP over HTTP with no API key | `TestHTTPModeRequiresAnAPIKey` |
 | Check the HTTP method before authenticating | `TestAuthenticationRunsBeforeTheMethodCheck` |
 | Resynchronize after a malformed MCP frame | `TestAMalformedFrameTearsTheConnectionDown` |
+| Answer a method before the MCP handshake completes | `TestAMethodBeforeInitializeIsRefused` |
+| Always answer `initialize` with our newest version | `TestTheServerEchoesAProtocolVersionItSpeaks` |
+| Advertise `listChanged` without ever sending it | `TestRegisteringAToolNotifiesConnectedClients` |
+| Notify a session that has not finished initializing | `TestNoNotificationBeforeTheHandshakeCompletes` |
+| Answer a request the client cancelled | `TestACancelledRequestStopsTheHandlerAndGoesUnanswered` |
+| Key a cancellation on the id's value, not its type | `TestAStringAndANumericRequestIDDoNotCollideWhenCancelling` |
+| Leave in-flight handlers running through a shutdown | `TestShutdownCancelsInFlightHandlers` |
+| Let a `{var}` swallow a path separator | `TestATemplateVariableDoesNotSpanASlash` |
+| Let a template shadow an exact resource registration | `TestAnExactResourceWinsOverAMatchingTemplate` |
+| Resume a listing AT the cursor's entry | `TestListingPagesAndResumesAfterTheCursor` |
+| Accept a cursor this server never issued | `TestAFabricatedCursorIsRefused` |
+| Bind MCP HTTP mode to every interface | `TestHTTPModeBindsLoopback` |
+| POST where a server's `endpoint` event points, off-origin | `TestAnEndpointOnAnotherOriginIsRefused` |
+| Compare endpoint origins without the port | `TestAnEndpointOnAnotherOriginIsRefused` |
+| Fall back to the older revision on a 5xx | `TestAutoDoesNotSwitchRevisionOnAServerError` |
+| Kill the session when the auto transport swaps | `TestAutoFallsBackToTheOlderRevision` |
+| Echo an unbounded server-chosen session id | `TestAnOversizedSessionIDIsRefused` |
+| Treat a 404 for a live session as any other error | `TestA404ForAKnownSessionIsDistinguishable` |
+| Treat 405 on the standalone GET as fatal | `TestAServerWithoutAStandaloneStreamStillWorks` |
+| Read an SSE-answered POST as JSON | `TestStreamableHTTPAcceptsAnSSEAnsweredPOST` |
+| Buffer an unbounded `data:` field | `TestAnOversizedSSELineIsRefused` |
+| Dispatch an event the stream ended in the middle of | `TestAStreamThatEndsMidEventIsAnError` |
+| Send `Bearer ` when the token variable is unset | `TestAHeaderThatResolvesToNothingIsDroppedNotSentBlank` |
+| Let an interpolated secret smuggle a header | `TestAHeaderCarryingAControlByteIsRefused` |
+| Accept a non-http scheme as a transport | `TestOnlyHTTPSchemesAreTransports` |
+| Start HTTP mode when `api_key_env` is unset | `TestHTTPModeRefusesToStartWithoutAKey` |
+| Fall back to stdio on an unknown transport | `TestRunRejectsAnUnknownTransport` |
 | Walk past an array of tables resolving `[a.b]` | `TestASubTableUnderAnArrayElementBelongsToThatElement` |
 | Expose MCP tools unqualified | `TestMCPToolsAreGatedByQualifiedNameEverywhere` |
 | Adapt an MCP tool without its server name | `TestAnMCPToolCallIsAuditedWithItsServerName` |
@@ -483,9 +564,13 @@ Stated plainly so nobody reports it as done.
   exits 1, which is NFR-TEST-07.3's required answer rather than a bug. The
   unit suite pins the wire format against *regression*; only a reference pins
   it against *truth*, and the weaker claim is the honest one until then.
-- **MCP HTTP/SSE and streamable-HTTP client transports.** stdio ships and is
-  tested against a real subprocess; the two HTTP client transports of
-  REQ-MCP-CLIENT-02 do not. The server's HTTP mode does ship.
+- **SSE stream resumption.** All three of REQ-MCP-CLIENT-02's transports ship
+  — stdio against a real subprocess, and both HTTP revisions against real
+  `httptest` servers. What is *not* built is reconnecting a dropped event
+  stream with `Last-Event-ID`: an optional part of the 2025-03-26 spec that
+  needs a retry policy and duplicate suppression to be worth anything. The
+  decoder therefore parses `id:` and discards it, rather than storing an id it
+  would never send and implying support that is not there.
 - **Plugin implementations.** The four categories, the registry, discovery, the
   lint and `validate-plugins` ship; no first-party plugin does. That is the
   intended shape — a plugin is the embedder's code — but it means the
