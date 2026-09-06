@@ -40,11 +40,12 @@ func TestTheReferenceBinaryServesOverRealStdio(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if err := conn.Initialize(ctx); err != nil {
-		t.Fatalf("initialize: %v (stderr: %v)", err, stderr)
+	if err := conn.Discover(ctx); err != nil {
+		t.Fatalf("server/discover: %v (stderr: %v)", err, stderr)
 	}
-	if got := conn.Info().ProtocolVersion; got != mcp.ProtocolVersion {
-		t.Fatalf("negotiated %q, want %q", got, mcp.ProtocolVersion)
+	got := conn.Info().SupportedVersions
+	if len(got) == 0 || got[0] != mcp.ProtocolVersion {
+		t.Fatalf("supportedVersions = %v, want %s", got, mcp.ProtocolVersion)
 	}
 
 	tools, err := conn.ListTools(ctx)

@@ -29,8 +29,11 @@ func (t ResourceTemplate) Validate() error {
 
 // ResourceTemplatesListResult answers resources/templates/list.
 type ResourceTemplatesListResult struct {
+	ResultType        ResultType         `json:"resultType"`
 	ResourceTemplates []ResourceTemplate `json:"resourceTemplates"`
 	NextCursor        string             `json:"nextCursor,omitzero"`
+	Meta              *ResultMeta        `json:"_meta,omitzero"`
+	CacheHints
 }
 
 // uriPattern is a compiled template.

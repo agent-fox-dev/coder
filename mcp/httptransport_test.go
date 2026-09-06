@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/agentfox/agentkit-go/internal/diag"
 	"github.com/agentfox/agentkit-go/mcp"
@@ -24,12 +23,12 @@ import (
 // client, over the SHIPPED transport, against a server that answers the way
 // the 2025-03-26 spec says to.
 func TestStreamableHTTPCarriesAWholeSession(t *testing.T) {
-	srv := httptest.NewServer(streamableHandler(t, streamableOptions{sessionID: "sess-1"}))
+	srv := httptest.NewServer(streamableHandler(t, streamableOptions{}))
 	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
 
-	conn := httpConn(t, mcp.HTTPTransportOptions{URL: srv.URL, Mode: mcp.HTTPModeStreamable})
+	conn := httpConn(t, mcp.HTTPTransportOptions{URL: srv.URL})
 	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
+	must(t, conn.Discover(ctx))
 
 	tools, err := conn.ListTools(ctx)
 	must(t, err)
@@ -52,151 +51,13 @@ func TestStreamableHTTPAcceptsAnSSEAnsweredPOST(t *testing.T) {
 	srv := httptest.NewServer(streamableHandler(t, streamableOptions{answerWithSSE: true}))
 	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
 
-	conn := httpConn(t, mcp.HTTPTransportOptions{URL: srv.URL, Mode: mcp.HTTPModeStreamable})
+	conn := httpConn(t, mcp.HTTPTransportOptions{URL: srv.URL})
 	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
+	must(t, conn.Discover(ctx))
 	res, err := conn.Call(ctx, "echo", map[string]any{"message": "streamed"})
 	must(t, err)
 	if len(res.Content) != 1 || res.Content[0].Text != "streamed" {
 		t.Fatalf("an SSE-answered POST must decode the same as a JSON one; got %+v", res)
-	}
-}
-
-// TestTheSessionIDIsEchoedOnEverySubsequentRequest. The server issues it once,
-// on the initialize response, and every later request must carry it — without
-// that a stateful server treats each call as a new, un-initialized session.
-func TestTheSessionIDIsEchoedOnEverySubsequentRequest(t *testing.T) {
-	var (
-		mu   sync.Mutex
-		seen []string
-	)
-	opts := streamableOptions{sessionID: "sess-42", onRequest: func(r *http.Request) {
-		mu.Lock()
-		seen = append(seen, r.Header.Get(mcp.MCPSessionHeader))
-		mu.Unlock()
-	}}
-	srv := httptest.NewServer(streamableHandler(t, opts))
-	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
-
-	conn := httpConn(t, mcp.HTTPTransportOptions{URL: srv.URL, Mode: mcp.HTTPModeStreamable})
-	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
-	if _, err := conn.ListTools(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seen) < 2 {
-		t.Fatalf("expected at least the initialize and the list; saw %d requests", len(seen))
-	}
-	if seen[0] != "" {
-		t.Fatalf("the first request cannot carry a session id: %q", seen[0])
-	}
-	for i, got := range seen[1:] {
-		if got != "sess-42" {
-			t.Fatalf("request %d carried session %q, want %q", i+1, got, "sess-42")
-		}
-	}
-}
-
-// TestAnOversizedSessionIDIsRefused. The value comes from the server and goes
-// into a header on every later request; nothing in net/http bounds it below
-// MaxResponseHeaderBytes, which is 10 MB by default, so unbounded it is the
-// server choosing how many bytes we send per call.
-//
-// Control characters are deliberately not tested through HTTP: Go's response
-// reader rejects the whole response for any of them, so no such value can
-// reach adoptSession. isHeaderSafe is still checked there as a second line of
-// defence, and it is exercised where it IS reachable — resolveHeaders, whose
-// input is a config file and an interpolated secret.
-func TestAnOversizedSessionIDIsRefused(t *testing.T) {
-	for _, bad := range []string{strings.Repeat("x", mcp.MaxSessionIDBytes+1)} {
-		var warnings []string
-		srv := httptest.NewServer(streamableHandler(t, streamableOptions{sessionID: bad}))
-
-		tr, err := mcp.StartStreamableHTTP(context.Background(), mcp.HTTPTransportOptions{
-			URL: srv.URL, Mode: mcp.HTTPModeStreamable,
-			Warnf: func(f string, a ...any) { warnings = append(warnings, fmt.Sprintf(f, a...)) },
-		})
-		must(t, err)
-		conn := mcp.NewConnection(mcp.ServerConfig{Name: "s"}, tr, mcp.ConnectionOptions{})
-		// A header Go itself would reject makes the NEXT request fail, so the
-		// handshake either warns and drops it or breaks here.
-		_ = conn.Initialize(context.Background())
-		got := tr.SessionID()
-		_ = conn.Close()
-		srv.Close()
-
-		if got != "" {
-			t.Fatalf("session id %q was adopted; it must be refused", got)
-		}
-		if len(warnings) == 0 {
-			t.Fatalf("refusing session id %q must warn, or it is silently ignored", bad)
-		}
-	}
-}
-
-// TestA404ForAKnownSessionIsDistinguishable. The spec's meaning is "start a
-// new session", and a caller that cannot tell it from any other 404 either
-// retries forever or gives up on a server that is fine.
-func TestA404ForAKnownSessionIsDistinguishable(t *testing.T) {
-	var calls int
-	var mu sync.Mutex
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		id, _, _ := readRPC(t, r)
-		if !id.IsSet() {
-			// A notification. Answering it with 404 would make Initialize
-			// itself fail, and this test is about a 404 on a LATER call.
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-		mu.Lock()
-		calls++
-		n := calls
-		mu.Unlock()
-		if n == 1 {
-			w.Header().Set(mcp.MCPSessionHeader, "sess-x")
-			writeJSONRPC(t, w, id, map[string]any{
-				"protocolVersion": mcp.ProtocolVersion,
-				"capabilities":    map[string]any{},
-				"serverInfo":      map[string]any{"name": "s", "version": "1"},
-			})
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
-
-	tr, err := mcp.StartStreamableHTTP(context.Background(), mcp.HTTPTransportOptions{
-		URL: srv.URL, Mode: mcp.HTTPModeStreamable})
-	must(t, err)
-	defer tr.Close()
-	conn := mcp.NewConnection(mcp.ServerConfig{Name: "s"}, tr, mcp.ConnectionOptions{})
-	must(t, conn.Initialize(context.Background()))
-
-	err = tr.Send([]byte(`{"jsonrpc":"2.0","id":9,"method":"ping"}`))
-	if !errors.Is(err, mcp.ErrSessionExpired) {
-		t.Fatalf("a 404 for a session we hold must report ErrSessionExpired; got %v", err)
-	}
-}
-
-// TestAServerWithoutAStandaloneStreamStillWorks. 405 on the GET is the spec's
-// documented "I have no server-initiated stream", not a failure — a client
-// that treats it as one cannot talk to a stateless server at all.
-func TestAServerWithoutAStandaloneStreamStillWorks(t *testing.T) {
-	srv := httptest.NewServer(streamableHandler(t, streamableOptions{refuseGET: true}))
-	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
-
-	conn := httpConn(t, mcp.HTTPTransportOptions{URL: srv.URL, Mode: mcp.HTTPModeStreamable})
-	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
-	if _, err := conn.ListTools(ctx); err != nil {
-		t.Fatalf("a 405 on the standalone GET must not break the session: %v", err)
 	}
 }
 
@@ -212,157 +73,20 @@ func TestAnOversizedJSONResponseIsRefused(t *testing.T) {
 	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
 
 	tr, err := mcp.StartStreamableHTTP(context.Background(), mcp.HTTPTransportOptions{
-		URL: srv.URL, Mode: mcp.HTTPModeStreamable,
+		URL:    srv.URL,
 		Limits: wire.Limits{MaxMessageBytes: 512},
 	})
 	must(t, err)
 	defer tr.Close()
 
-	if err := tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)); err == nil {
+	if err := tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)); err == nil {
 		t.Fatal("a response body past the limit must be refused, not buffered")
 	}
 }
 
 // ---- 2024-11-05 HTTP+SSE
 
-// TestHTTPSSECarriesAWholeSession.
-func TestHTTPSSECarriesAWholeSession(t *testing.T) {
-	h := newSSEServer(t)
-	srv := httptest.NewServer(h)
-	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
-	h.base = srv.URL
-
-	conn := httpConn(t, mcp.HTTPTransportOptions{URL: srv.URL + "/sse", Mode: mcp.HTTPModeSSE})
-	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
-
-	res, err := conn.Call(ctx, "echo", map[string]any{"message": "over sse"})
-	must(t, err)
-	if len(res.Content) != 1 || res.Content[0].Text != "over sse" {
-		t.Fatalf("tools/call over http+sse returned %+v", res)
-	}
-}
-
-// TestAnEndpointOnAnotherOriginIsRefused is the security-critical case.
-//
-// Every POST carries the configured Headers, which is where a bearer token
-// lives. A server that could name any origin in its `endpoint` event would be
-// choosing where our credential gets sent — a redirect that looks like normal
-// protocol traffic. Same scheme, host and port, or we do not send.
-func TestAnEndpointOnAnotherOriginIsRefused(t *testing.T) {
-	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("a POST reached the foreign origin carrying %q",
-			r.Header.Get("Authorization"))
-	}))
-	t.Cleanup(elsewhere.Close)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "event: endpoint\ndata: %s/messages\n\n", elsewhere.URL)
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	}))
-	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
-
-	_, err := mcp.StartHTTPSSE(context.Background(), mcp.HTTPTransportOptions{
-		URL:     srv.URL,
-		Headers: map[string]string{"Authorization": "Bearer secret-token"},
-	})
-	if !errors.Is(err, mcp.ErrEndpointOrigin) {
-		t.Fatalf("an endpoint on a foreign origin must be refused; got %v", err)
-	}
-}
-
-// TestARelativeEndpointIsResolvedAgainstTheStream. Relative is the common case
-// and is exactly what the same-origin rule makes safe.
-func TestARelativeEndpointIsResolvedAgainstTheStream(t *testing.T) {
-	h := newSSEServer(t)
-	h.endpoint = "/messages?sessionId=abc"
-	srv := httptest.NewServer(h)
-	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
-	h.base = srv.URL
-
-	tr, err := mcp.StartHTTPSSE(context.Background(), mcp.HTTPTransportOptions{URL: srv.URL + "/sse"})
-	must(t, err)
-	defer tr.Close()
-	if got, want := tr.PostURL(), srv.URL+"/messages?sessionId=abc"; got != want {
-		t.Fatalf("relative endpoint resolved to %q, want %q", got, want)
-	}
-}
-
-// TestAStreamThatNeverNamesAnEndpointFailsAtConnect. A transport that cannot
-// send is not usable, and finding out at connect time names the server that is
-// broken instead of surfacing as a failed initialize.
-func TestAStreamThatNeverNamesAnEndpointFailsAtConnect(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, ": waiting\n\n")
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	}))
-	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
-
-	_, err := mcp.StartHTTPSSE(context.Background(), mcp.HTTPTransportOptions{
-		URL: srv.URL, EndpointTimeout: 250 * time.Millisecond,
-	})
-	if !errors.Is(err, mcp.ErrNoEndpoint) {
-		t.Fatalf("want ErrNoEndpoint, got %v", err)
-	}
-}
-
 // ---- auto-negotiation
-
-// TestAutoFallsBackToTheOlderRevision is the spec's own backwards-
-// compatibility procedure. Without it an operator has to know which revision a
-// third-party server implements before they can configure it.
-func TestAutoFallsBackToTheOlderRevision(t *testing.T) {
-	h := newSSEServer(t)
-	h.refusePOSTAt = "/sse" // a 2024-11-05 server rejects a POST to its stream url
-	srv := httptest.NewServer(h)
-	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
-	h.base = srv.URL
-
-	conn := httpConn(t, mcp.HTTPTransportOptions{URL: srv.URL + "/sse"})
-	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
-	res, err := conn.Call(ctx, "echo", map[string]any{"message": "fell back"})
-	must(t, err)
-	if len(res.Content) != 1 || res.Content[0].Text != "fell back" {
-		t.Fatalf("after falling back the session must work; got %+v", res)
-	}
-}
-
-// TestAutoDoesNotSwitchRevisionOnAServerError. A 500 is a working server
-// having a bad day; silently changing which protocol revision we speak because
-// of one would turn a transient failure into a permanent misconfiguration.
-func TestAutoDoesNotSwitchRevisionOnAServerError(t *testing.T) {
-	var gets int
-	var mu sync.Mutex
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			mu.Lock()
-			gets++
-			mu.Unlock()
-		}
-		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
-
-	tr, err := mcp.StartHTTP(context.Background(), mcp.HTTPTransportOptions{URL: srv.URL})
-	must(t, err)
-	defer tr.Close()
-
-	if err := tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)); err == nil {
-		t.Fatal("a 500 must surface as an error")
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if gets != 0 {
-		t.Fatalf("a 500 must not trigger the 2024-11-05 fallback; saw %d GETs", gets)
-	}
-}
 
 // ---- construction
 
@@ -371,20 +95,10 @@ func TestAutoDoesNotSwitchRevisionOnAServerError(t *testing.T) {
 // something local; there is no MCP server behind either.
 func TestOnlyHTTPSchemesAreTransports(t *testing.T) {
 	for _, bad := range []string{"file:///etc/passwd", "ftp://h/x", "ws://h/x", "", "http://"} {
-		if _, err := mcp.StartHTTP(context.Background(),
-			mcp.HTTPTransportOptions{URL: bad, Mode: mcp.HTTPModeStreamable}); err == nil {
+		if _, err := mcp.StartStreamableHTTP(context.Background(),
+			mcp.HTTPTransportOptions{URL: bad}); err == nil {
 			t.Fatalf("url %q must be refused", bad)
 		}
-	}
-}
-
-// TestAnUnknownHTTPModeIsRefused. Falling back to auto-negotiation would run a
-// revision the operator did not choose.
-func TestAnUnknownHTTPModeIsRefused(t *testing.T) {
-	_, err := mcp.StartHTTP(context.Background(),
-		mcp.HTTPTransportOptions{URL: "http://example.invalid", Mode: "websocket"})
-	if err == nil || !strings.Contains(err.Error(), "websocket") {
-		t.Fatalf("an unknown mode must be refused by name; got %v", err)
 	}
 }
 
@@ -392,7 +106,7 @@ func TestAnUnknownHTTPModeIsRefused(t *testing.T) {
 
 func httpConn(t *testing.T, opts mcp.HTTPTransportOptions) *mcp.ServerConnection {
 	t.Helper()
-	tr, err := mcp.StartHTTP(context.Background(), opts)
+	tr, err := mcp.StartStreamableHTTP(context.Background(), opts)
 	must(t, err)
 	conn := mcp.NewConnection(mcp.ServerConfig{Name: "remote"}, tr, mcp.ConnectionOptions{
 		Warnf: func(f string, a ...any) { t.Logf("client: "+f, a...) },
@@ -402,7 +116,6 @@ func httpConn(t *testing.T, opts mcp.HTTPTransportOptions) *mcp.ServerConnection
 }
 
 type streamableOptions struct {
-	sessionID     string
 	answerWithSSE bool
 	refuseGET     bool
 	onRequest     func(*http.Request)
@@ -411,11 +124,7 @@ type streamableOptions struct {
 // streamableHandler is a minimal 2025-03-26 server.
 func streamableHandler(t *testing.T, opts streamableOptions) http.Handler {
 	t.Helper()
-	var (
-		mu        sync.Mutex
-		assigned  bool
-		theAnswer = answerRPC
-	)
+	theAnswer := answerRPC
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if opts.onRequest != nil {
 			opts.onRequest(r)
@@ -441,14 +150,6 @@ func streamableHandler(t *testing.T, opts streamableOptions) http.Handler {
 		}
 
 		id, method, params := readRPC(t, r)
-		if opts.sessionID != "" {
-			mu.Lock()
-			if !assigned {
-				w.Header().Set(mcp.MCPSessionHeader, opts.sessionID)
-				assigned = true
-			}
-			mu.Unlock()
-		}
 		if !id.IsSet() {
 			w.WriteHeader(http.StatusAccepted) // a notification
 			return
@@ -539,25 +240,29 @@ func (s *sseServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func answerRPC(t *testing.T, method string, params json.RawMessage) any {
 	t.Helper()
 	switch method {
-	case mcp.MethodInitialize:
+	case mcp.MethodDiscover:
 		return map[string]any{
-			"protocolVersion": mcp.ProtocolVersion,
-			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "remote", "version": "1"},
+			"resultType":        "complete",
+			"supportedVersions": []string{mcp.ProtocolVersion},
+			"capabilities":      map[string]any{"tools": map[string]any{}},
+			"ttlMs":             0,
+			"cacheScope":        "private",
+			"_meta": map[string]any{
+				mcp.MetaServerInfo: map[string]any{"name": "remote", "version": "1"}},
 		}
 	case mcp.MethodToolsList:
-		return map[string]any{"tools": []any{map[string]any{
-			"name": "echo", "description": "echo", "inputSchema": map[string]any{"type": "object"},
-		}}}
+		return map[string]any{"resultType": "complete", "ttlMs": 0, "cacheScope": "private",
+			"tools": []any{map[string]any{
+				"name": "echo", "description": "echo", "inputSchema": map[string]any{"type": "object"},
+			}}}
 	case mcp.MethodToolsCall:
 		var p struct {
 			Arguments map[string]any `json:"arguments"`
 		}
 		must(t, json.Unmarshal(params, &p))
 		msg, _ := p.Arguments["message"].(string)
-		return map[string]any{"content": []any{map[string]any{"type": "text", "text": msg}}}
-	case mcp.MethodPing:
-		return map[string]any{}
+		return map[string]any{"resultType": "complete",
+			"content": []any{map[string]any{"type": "text", "text": msg}}}
 	}
 	return map[string]any{}
 }
@@ -599,7 +304,7 @@ func TestARemoteServersHeadersAreInterpolatedFromSecrets(t *testing.T) {
 	p := mcp.NewPool(mcp.ConnectionOptions{})
 	t.Cleanup(func() { _ = p.Close() })
 	_, err := p.Connect(context.Background(), mcp.ServerConfig{
-		Name: "remote", URL: srv.URL, Transport: mcp.HTTPModeStreamable,
+		Name: "remote", URL: srv.URL,
 		Headers: map[string]string{"Authorization": "Bearer ${GH_TOKEN}"},
 	}, nil, func(name string) string {
 		if name == "GH_TOKEN" {
@@ -628,7 +333,7 @@ func TestAHeaderThatResolvesToNothingIsDroppedNotSentBlank(t *testing.T) {
 	})
 	t.Cleanup(func() { _ = p.Close() })
 	_, err := p.Connect(context.Background(), mcp.ServerConfig{
-		Name: "remote", URL: srv.URL, Transport: mcp.HTTPModeStreamable,
+		Name: "remote", URL: srv.URL,
 		Headers: map[string]string{"Authorization": "Bearer ${MISSING}"},
 	}, nil, func(string) string { return "" })
 	must(t, err)
@@ -653,7 +358,7 @@ func TestAHeaderCarryingAControlByteIsRefused(t *testing.T) {
 	p := mcp.NewPool(mcp.ConnectionOptions{})
 	t.Cleanup(func() { _ = p.Close() })
 	_, err := p.Connect(context.Background(), mcp.ServerConfig{
-		Name: "remote", URL: srv.URL, Transport: mcp.HTTPModeStreamable,
+		Name: "remote", URL: srv.URL,
 		Headers: map[string]string{"X-Token": "abc${INJECT}"},
 	}, nil, func(string) string { return "def\r\nX-Smuggled: yes" })
 	must(t, err)
@@ -663,52 +368,6 @@ func TestAHeaderCarryingAControlByteIsRefused(t *testing.T) {
 	}
 	if got.Get("X-Smuggled") != "" {
 		t.Fatal("a smuggled header reached the server")
-	}
-}
-
-// TestAnUnknownTransportInConfigIsRefused. Silently auto-negotiating would run
-// a revision the operator did not choose.
-func TestAnUnknownTransportInConfigIsRefused(t *testing.T) {
-	cfg, diags, err := mcp.ParseConfig("c.toml", []byte(`
-[[mcp.servers]]
-name = "remote"
-url = "https://example.com/mcp"
-transport = "http"
-`))
-	must(t, err)
-	if len(cfg.Servers) != 0 {
-		t.Fatalf("a server with an unusable transport must not be returned; got %+v", cfg.Servers)
-	}
-	if !hasError(diags) {
-		t.Fatalf("an unknown transport must be an error diagnostic; got %+v", diags)
-	}
-}
-
-// TestAKnownTransportInConfigIsCarriedThrough.
-func TestAKnownTransportInConfigIsCarriedThrough(t *testing.T) {
-	cfg, diags, err := mcp.ParseConfig("c.toml", []byte(`
-[[mcp.servers]]
-name = "remote"
-url = "https://example.com/mcp"
-transport = "sse"
-
-[mcp.servers.headers]
-Authorization = "Bearer ${TOKEN}"
-`))
-	must(t, err)
-	if hasError(diags) {
-		t.Fatalf("unexpected errors: %+v", diags)
-	}
-	if len(cfg.Servers) != 1 {
-		t.Fatalf("want 1 server, got %d", len(cfg.Servers))
-	}
-	s := cfg.Servers[0]
-	if s.Transport != mcp.HTTPModeSSE {
-		t.Fatalf("transport was %q, want %q", s.Transport, mcp.HTTPModeSSE)
-	}
-	if s.Headers["Authorization"] != "Bearer ${TOKEN}" {
-		t.Fatalf("headers must reach the config unexpanded (they resolve at connect "+
-			"time); got %+v", s.Headers)
 	}
 }
 
@@ -780,13 +439,13 @@ func TestAnOversizedSSEEventIsRefused(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr, err := mcp.StartStreamableHTTP(context.Background(), mcp.HTTPTransportOptions{
-		URL: srv.URL, Mode: mcp.HTTPModeStreamable,
+		URL:    srv.URL,
 		Limits: wire.Limits{MaxMessageBytes: 512},
 	})
 	must(t, err)
 	t.Cleanup(func() { _ = tr.Close() })
 
-	must(t, tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)))
+	must(t, tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)))
 	_, err = tr.Receive()
 	if !errors.Is(err, mcp.ErrSSEEventTooLarge) {
 		t.Fatalf("an event past the limit must be refused; got %v", err)
@@ -822,11 +481,11 @@ func TestASSEEventJoinsItsDataLines(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr, err := mcp.StartStreamableHTTP(context.Background(), mcp.HTTPTransportOptions{
-		URL: srv.URL, Mode: mcp.HTTPModeStreamable})
+		URL: srv.URL})
 	must(t, err)
 	t.Cleanup(func() { _ = tr.Close() })
 
-	must(t, tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)))
+	must(t, tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)))
 	frame, err := tr.Receive()
 	must(t, err)
 	// Either half alone is invalid JSON, so this parses only if both lines
@@ -861,11 +520,11 @@ func TestAStreamThatEndsMidEventIsAnError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr, err := mcp.StartStreamableHTTP(context.Background(), mcp.HTTPTransportOptions{
-		URL: srv.URL, Mode: mcp.HTTPModeStreamable})
+		URL: srv.URL})
 	must(t, err)
 	t.Cleanup(func() { _ = tr.Close() })
 
-	must(t, tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)))
+	must(t, tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)))
 	if _, err := tr.Receive(); err == nil {
 		t.Fatal("a stream that ends mid-event must report an error, not deliver a " +
 			"truncated frame")
@@ -895,13 +554,13 @@ func TestAnOversizedSSELineIsRefused(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr, err := mcp.StartStreamableHTTP(context.Background(), mcp.HTTPTransportOptions{
-		URL: srv.URL, Mode: mcp.HTTPModeStreamable,
+		URL:    srv.URL,
 		Limits: wire.Limits{MaxMessageBytes: 4096},
 	})
 	must(t, err)
 	t.Cleanup(func() { _ = tr.Close() })
 
-	must(t, tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)))
+	must(t, tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)))
 	if _, err := tr.Receive(); !errors.Is(err, mcp.ErrSSEEventTooLarge) {
 		t.Fatalf("a single unterminated data line must be refused; got %v", err)
 	}

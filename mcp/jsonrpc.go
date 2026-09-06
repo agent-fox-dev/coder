@@ -55,6 +55,20 @@ const (
 	CodeMethodNotFound = -32601
 	CodeInvalidParams  = -32602
 	CodeInternalError  = -32603
+
+	// The MCP-reserved sub-range. 2026-07-28 partitions the JSON-RPC
+	// server-error space: -32000..-32019 stays implementation-defined and
+	// -32020..-32099 belongs to the specification. These three are the only
+	// ones it has allocated, and they were RENUMBERED from the draft's
+	// -32001/-32003/-32004 — an implementation still sending the draft codes
+	// is now colliding with somebody's private range.
+	CodeHeaderMismatch = -32020
+	// CodeMissingRequiredClientCapability is returned when a server needs a
+	// capability the request's clientCapabilities did not declare. With the
+	// handshake gone, capabilities arrive per request, so this is a per-request
+	// answer rather than a connection that fails to open.
+	CodeMissingRequiredClientCapability = -32021
+	CodeUnsupportedProtocolVersion      = -32022
 )
 
 // ID is a JSON-RPC id: a string, a number, or absent.

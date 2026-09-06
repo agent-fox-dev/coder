@@ -50,7 +50,6 @@ func TestTheProviderLedgerMatchesTheCode(t *testing.T) {
 		{"ollama base URL", ollama.DefaultBaseURL},
 		{"ollama path", ollama.Path},
 		{"MCP protocol version", mcp.ProtocolVersion},
-		{"MCP legacy protocol version", mcp.LegacyProtocolVersion},
 	} {
 		if !strings.Contains(doc, tc.value) {
 			t.Errorf("docs/PROVIDERS.md does not mention the %s (%q).\n"+

@@ -38,8 +38,22 @@ header rather than the feature. It is opt-in for that reason.
 
 | Surface | Pinned version | Also accepted | Notes |
 |---|---|---|---|
-| Model Context Protocol | `2025-03-26` | `2024-11-05` | REQ-MCP-SERVER-06. Server echoes a version it speaks and otherwise answers with the newest; client warns on an unrecognized negotiated version rather than failing. |
-| MCP transports | streamable HTTP (2025-03-26), HTTP+SSE (2024-11-05), stdio | — | REQ-MCP-CLIENT-02. `transport` unset auto-negotiates per the spec's own backwards-compatibility procedure. |
+| Model Context Protocol | `2026-07-28` | none | REQ-MCP-SERVER-06, amended in PRD 0.4.0. **Modern-only**: no handshake, no sessions, no `ping`. Every request carries its version in `_meta`; a version we do not speak is rejected with `UnsupportedProtocolVersion` (`-32022`) listing what we do. |
+| MCP transports | Streamable HTTP (`2026-07-28`), stdio | — | REQ-MCP-CLIENT-02, amended in 0.4.0. The GET stream, `Mcp-Session-Id` and `Last-Event-ID` resumability are gone; HTTP+SSE (2024-11-05) is Deprecated upstream and removed here. |
+
+### The cost of modern-only
+
+The spec defines a *dual-era* mode for implementations that support both the
+handshake and the stateless core. AgentKit does not: it speaks `2026-07-28`
+alone, by the product decision recorded in PRD 0.4.0.
+
+That has a price worth stating plainly, because it is not visible from the
+code: **an AgentKit client cannot talk to a server that has not migrated**, and
+at the time of writing most deployed servers have not. The failure is clean
+rather than silent — a modern request against a legacy server gets an
+implementation-defined error, and our server answers a legacy `initialize` with
+a message naming the versions it speaks — but it is still a failure. Revisiting
+this means implementing the legacy era, not flipping a flag.
 
 ## Goldens: what they are and are not
 

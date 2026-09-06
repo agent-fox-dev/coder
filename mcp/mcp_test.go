@@ -76,20 +76,23 @@ func must(t *testing.T, err error) {
 	}
 }
 
-// TestTheClientAndServerCompleteAHandshakeAndACall is the end-to-end shape.
-func TestTheClientAndServerCompleteAHandshakeAndACall(t *testing.T) {
+// TestTheClientAndServerDiscoverAndCall is the end-to-end shape.
+//
+// There is no handshake to complete: server/discover is an OPTIONAL probe and
+// the call below would work without it.
+func TestTheClientAndServerDiscoverAndCall(t *testing.T) {
 	conn := pair(t, echoServer(t), mcp.ServerConfig{Name: "test"}, mcp.ConnectionOptions{})
 	ctx := context.Background()
 
-	if err := conn.Initialize(ctx); err != nil {
+	if err := conn.Discover(ctx); err != nil {
 		t.Fatal(err)
 	}
 	info := conn.Info()
-	if info.ProtocolVersion != mcp.ProtocolVersion {
-		t.Fatalf("negotiated %q, want %q", info.ProtocolVersion, mcp.ProtocolVersion)
+	if len(info.SupportedVersions) == 0 || info.SupportedVersions[0] != mcp.ProtocolVersion {
+		t.Fatalf("supportedVersions = %v, want %s", info.SupportedVersions, mcp.ProtocolVersion)
 	}
-	if info.ServerInfo.Name != "test-server" {
-		t.Fatalf("server info = %+v", info.ServerInfo)
+	if info.Meta == nil || info.Meta.ServerInfo == nil || info.Meta.ServerInfo.Name != "test-server" {
+		t.Fatalf("server identity = %+v", info.Meta)
 	}
 
 	tools, err := conn.ListTools(ctx)
@@ -119,7 +122,7 @@ func TestTheClientAndServerCompleteAHandshakeAndACall(t *testing.T) {
 func TestAFailingHandlerIsAToolErrorNotAProtocolError(t *testing.T) {
 	conn := pair(t, echoServer(t), mcp.ServerConfig{Name: "test"}, mcp.ConnectionOptions{})
 	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
+	must(t, conn.Discover(ctx))
 
 	res, err := conn.Call(ctx, "boom", nil)
 	if err != nil {
@@ -148,7 +151,7 @@ func TestAPanickingHandlerDoesNotKillTheConnection(t *testing.T) {
 		}))
 	conn := pair(t, s, mcp.ServerConfig{Name: "test"}, mcp.ConnectionOptions{})
 	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
+	must(t, conn.Discover(ctx))
 
 	res, err := conn.Call(ctx, "panicky", nil)
 	if err != nil {
@@ -175,7 +178,7 @@ func TestToolListsAreCachedAndInvalidatedByTheNotification(t *testing.T) {
 	conn := pair(t, s, mcp.ServerConfig{Name: "test"}, mcp.ConnectionOptions{})
 	_ = lists
 	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
+	must(t, conn.Discover(ctx))
 
 	for i := 0; i < 5; i++ {
 		if _, err := conn.ListTools(ctx); err != nil {
@@ -261,7 +264,7 @@ func TestThePerSessionCallLimitIsEnforced(t *testing.T) {
 	cfg := mcp.ServerConfig{Name: "test", PerSessionCallLimit: 3}
 	conn := pair(t, echoServer(t), cfg, mcp.ConnectionOptions{})
 	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
+	must(t, conn.Discover(ctx))
 
 	for i := 0; i < 3; i++ {
 		if _, err := conn.Call(ctx, "echo", map[string]any{"message": "x"}); err != nil {
@@ -278,14 +281,14 @@ func TestTheDefaultCallLimitIsAThousandAndNegativeMeansUnlimited(t *testing.T) {
 	cfg := mcp.ServerConfig{Name: "test"} // zero => default
 	conn := pair(t, echoServer(t), cfg, mcp.ConnectionOptions{})
 	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
+	must(t, conn.Discover(ctx))
 	if _, err := conn.Call(ctx, "echo", map[string]any{"message": "x"}); err != nil {
 		t.Fatal(err)
 	}
 
 	unlimited := mcp.ServerConfig{Name: "u", PerSessionCallLimit: -1}
 	conn2 := pair(t, echoServer(t), unlimited, mcp.ConnectionOptions{})
-	must(t, conn2.Initialize(ctx))
+	must(t, conn2.Discover(ctx))
 	for i := 0; i < 5; i++ {
 		if _, err := conn2.Call(ctx, "echo", map[string]any{"message": "x"}); err != nil {
 			t.Fatalf("unlimited must not cap: %v", err)
@@ -301,7 +304,7 @@ func TestEveryToolCallIsAudited(t *testing.T) {
 		Audit: func(e core.AuditEvent) { mu.Lock(); events = append(events, e); mu.Unlock() },
 	})
 	ctx := context.Background()
-	must(t, conn.Initialize(ctx))
+	must(t, conn.Discover(ctx))
 	if _, err := conn.Call(ctx, "echo", map[string]any{"message": "secret-value"}); err != nil {
 		t.Fatal(err)
 	}
@@ -357,21 +360,27 @@ func TestSamplingIsRefusedUnlessEnabledAndAlwaysAudited(t *testing.T) {
 				Audit:    func(e core.AuditEvent) { mu.Lock(); events = append(events, e); mu.Unlock() },
 			})
 			ctx := context.Background()
-			must(t, conn.Initialize(ctx))
+			must(t, conn.Discover(ctx))
 
 			res, err := conn.Call(ctx, "ask", nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			text := ""
-			if len(res.Content) > 0 {
-				text = res.Content[0].Text
-			}
-			if tc.wantErr && !strings.Contains(text, "refused") {
-				t.Fatalf("sampling should have been refused; server saw %q", text)
-			}
-			if !tc.wantErr && !strings.Contains(text, "sampled") {
-				t.Fatalf("sampling should have succeeded; server saw %q", text)
+			if tc.wantErr {
+				// Under MRTR a refusal happens CLIENT-side, before the retry:
+				// the client never sends the answer, so the call fails rather
+				// than returning a server-authored "refused" string.
+				if !errors.Is(err, mcp.ErrSamplingNotAllowed) {
+					t.Fatalf("want ErrSamplingNotAllowed, got %v (result %+v)", err, res)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				text := ""
+				if len(res.Content) > 0 {
+					text = res.Content[0].Text
+				}
+				if !strings.Contains(text, "sampled") {
+					t.Fatalf("sampling should have succeeded; server saw %q", text)
+				}
 			}
 
 			mu.Lock()
@@ -395,20 +404,32 @@ func okSampler(context.Context, mcp.SamplingParams) (mcp.SamplingResult, error) 
 		Content: mcp.Content{Type: "text", Text: "sampled"}}, nil
 }
 
-// samplingServer answers `ask` by turning around and asking the CLIENT to
-// sample, so the client's gate is exercised through the real protocol.
+// samplingServer answers `ask` through MRTR: the first call returns an input
+// request, and the client's RETRY carries the answer.
+//
+// This is the shape 2026-07-28 forces. The server can no longer block inside
+// the handler waiting for the client, so "ask the client something" becomes
+// two invocations of the same handler with the answer threaded between them by
+// the client itself.
 func samplingServer(t *testing.T) *mcp.Server {
 	t.Helper()
 	s := mcp.NewServer(mcp.ServerOptions{})
 	must(t, s.RegisterTool(mcp.ToolDefinition{Name: "ask"},
 		func(ctx context.Context, _ map[string]any) (mcp.ToolsCallResult, error) {
-			res, err := mcp.RequestSampling(ctx, mcp.SamplingParams{
-				Messages:  []mcp.SamplingMessage{{Role: "user", Content: mcp.Content{Type: "text", Text: "hi"}}},
-				MaxTokens: 16,
-			})
-			if err != nil {
-				return mcp.ToolsCallResult{Content: []mcp.Content{{Type: "text",
-					Text: "refused: " + err.Error()}}}, nil
+			in, retry := mcp.InputFrom(ctx)
+			if !retry {
+				return mcp.ToolsCallResult{}, mcp.NeedSampling("asked-once", "s1",
+					mcp.SamplingParams{
+						Messages:  []mcp.SamplingMessage{{Role: "user", Content: mcp.Content{Type: "text", Text: "hi"}}},
+						MaxTokens: 16,
+					})
+			}
+			if in.RequestState != "asked-once" {
+				t.Errorf("requestState must come back verbatim; got %q", in.RequestState)
+			}
+			var res mcp.SamplingResult
+			if err := json.Unmarshal(in.Responses["s1"], &res); err != nil {
+				return mcp.ToolsCallResult{}, err
 			}
 			return mcp.ToolsCallResult{Content: []mcp.Content{{Type: "text", Text: res.Content.Text}}}, nil
 		}))
@@ -434,7 +455,8 @@ func TestUnauthenticatedHTTPRequestsGet401(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{%q:%q,%q:{}}}}`,
+		mcp.MetaProtocolVersion, mcp.ProtocolVersion, mcp.MetaClientCapabilities)
 	for _, tc := range []struct {
 		name   string
 		header [2]string
@@ -450,6 +472,10 @@ func TestUnauthenticatedHTTPRequestsGet401(t *testing.T) {
 			if tc.header[0] != "" {
 				req.Header.Set(tc.header[0], tc.header[1])
 			}
+			// 2026-07-28 requires these on every POST, and the server rejects
+			// a request without them before it ever reaches a handler.
+			req.Header.Set(mcp.HeaderProtocolVersion, mcp.ProtocolVersion)
+			req.Header.Set(mcp.HeaderMethod, mcp.MethodToolsList)
 			resp, err := srv.Client().Do(req)
 			if err != nil {
 				t.Fatal(err)
@@ -577,7 +603,7 @@ func poolWith(t *testing.T, cfgs ...mcp.ServerConfig) *mcp.Pool {
 	p := mcp.NewPool(mcp.ConnectionOptions{})
 	for _, cfg := range cfgs {
 		conn := pair(t, echoServer(t), cfg, mcp.ConnectionOptions{})
-		must(t, conn.Initialize(context.Background()))
+		must(t, conn.Discover(context.Background()))
 		must(t, p.Add(conn))
 	}
 	t.Cleanup(func() { _ = p.Close() })

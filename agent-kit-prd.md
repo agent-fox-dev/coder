@@ -3,7 +3,7 @@
 **Author:** [Platform Engineering]
 **Date:** 2026-09-05
 **Status:** Draft
-**Version:** 0.3.5
+**Version:** 0.4.0
 
 > **Revision note (0.3.0).** This revision incorporates a review of a shipped, zero-dependency
 > Go agent SDK and coding agent of comparable scope and identical constraints
@@ -12,6 +12,17 @@
 > real-world artifact to what this document specifies, and several of its shipped designs
 > **contradict** rather than extend the 0.2.0 draft. Those corrections are marked in place;
 > see [Appendix A](#appendix-a-prior-art-review) for the provenance and the full list.
+>
+> **0.4.0 (BREAKING)** retargets MCP from revision `2025-03-26` to `2026-07-28`, the current
+> revision, and drops the legacy era entirely. This is not a version-string bump: the
+> 2026-07-28 revision removes the `initialize`/`notifications/initialized` handshake, removes
+> protocol-level sessions and the `Mcp-Session-Id` header, removes `ping`, removes the HTTP GET
+> stream and SSE resumability, and replaces server-initiated requests with Multi Round-Trip
+> Requests. Version, identity and capabilities move to per-request `_meta`. The spec calls an
+> implementation that supports both eras *dual-era*; AgentKit is **modern-only** by explicit
+> product decision, which is recorded here because it has a cost: an AgentKit client cannot
+> talk to a server that has not migrated, and most deployed servers have not. See §6.7 and
+> REQ-MCP-CLIENT-02, -08, REQ-MCP-SERVER-06.
 >
 > **0.3.1** adds REQ-PROV-11 **rule 2b**, found while implementing the spec: the seven repair
 > rules as written produce an invalid request on the commonest damaged transcript. See §6.2.
@@ -794,13 +805,19 @@ A context file is repository-authored standing instruction text (house style, bu
   Three smaller facts point the same way. REQ-GO-06 already assigns JSON-RPC id generation and response correlation to AgentKit, which would be an odd thing to specify about a dependency. REQ-GO-11 confines third-party modules to a nested module to keep the root standard-library-only, and with no third-party module the goal is met more directly than the mechanism protecting it. And REQ-GO-11.2 requires a nested module to depend on a *tagged* root release, which does not exist — so the specified path is not merely less good, it is not currently buildable.
 
   The cost is real and is recorded rather than argued away: this is a partial implementation of a moving specification, and every capability it does not model is a capability AgentKit does not have. What ships covers the client and server subset the §6.7 and §6.8 requirements name.
-- **REQ-MCP-CLIENT-02:** Three transports: stdio (subprocess + NDJSON), HTTP/SSE (2024-11-05 spec), streamable HTTP (2025-03-26 spec).
-- **REQ-MCP-CLIENT-03:** `MCPServerConnection` wraps an mcp-go client session and provides: initialization (protocol handshake + capability negotiation), tool list caching with refresh on `notifications/tools/list_changed`, `Call(toolName string, arguments map[string]any) (map[string]any, error)`, and audit logging of every call via `afaudit`.
+- **REQ-MCP-CLIENT-02 (amended in 0.4.0):** Two transports: stdio (subprocess + NDJSON) and Streamable HTTP (`2026-07-28` spec). The original text named three, including HTTP/SSE (2024-11-05). That transport is Deprecated as of `2026-07-28` under the spec's own feature-lifecycle policy, and the 2025-03-26 form of Streamable HTTP no longer exists — the GET stream and SSE resumability were removed. Both are dropped rather than carried, per 0.4.0's modern-only decision.
+  1. Every POST carries `MCP-Protocol-Version`, `Mcp-Method`, and — for `tools/call`, `resources/read` and `prompts/get` — `Mcp-Name`. A value that is not header-safe ASCII is carried as `=?base64?…?=`.
+  2. A server MUST reject a request whose headers disagree with the body, with HTTP 400 and `HeaderMismatch` (`-32020`). AgentKit's server does; AgentKit's client never produces such a request.
+  3. There is no GET endpoint and no `Last-Event-ID` resumption. A broken response stream loses the in-flight request and the client MUST re-issue it with a new request id.
+- **REQ-MCP-CLIENT-03 (amended in 0.3.5 and 0.4.0):** `MCPServerConnection` provides tool list caching with refresh on `notifications/tools/list_changed`, `Call(toolName string, arguments map[string]any) (map[string]any, error)`, and audit logging of every call. The original text's "initialization (protocol handshake + capability negotiation)" is **removed**: `2026-07-28` has no handshake. Version, client identity and client capabilities travel in every request's `_meta` under `io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientInfo` and `io.modelcontextprotocol/clientCapabilities`. `server/discover` replaces the handshake as an OPTIONAL up-front probe, not a required step.
 - **REQ-MCP-CLIENT-04:** `MCPServerPool` holds `server_name -> MCPServerConnection`, instantiated during session initialization, torn down after the session ends.
 - **REQ-MCP-CLIENT-05:** MCP tools exposed through the unified tool registry with qualified names using `server_name__tool_name` convention (e.g., `github__create_issue`). Configurable per-server prefix.
 - **REQ-MCP-CLIENT-06:** MCP tool names may not shadow native tool names. Collision raises `MCPNameCollisionError` at connection time.
 - **REQ-MCP-CLIENT-07:** Servers configured in `config.toml` as `[[mcp.servers]]` with fields: `name`, `command`, `url`, `env` (with `${VAR}` interpolation), `tool_prefix`, `allow_sampling`, `per_session_call_limit` (default 1000), `timeout_s` (default 30.0).
-- **REQ-MCP-CLIENT-08:** Sampling requests require explicit `allow_sampling = true` per server. All sampling requests are logged in the audit trail.
+- **REQ-MCP-CLIENT-08 (amended in 0.4.0):** Sampling requires explicit `allow_sampling = true` per server and every sampling request is logged in the audit trail. The MECHANISM changes: `2026-07-28` removes server-initiated requests entirely. A server that needs sampling returns an `InputRequiredResult` (`resultType: "input_required"`) carrying `inputRequests`; the client answers by RETRYING the original request with `inputResponses` and the opaque `requestState`. The gate and the audit obligation are unchanged and now apply at the retry.
+  1. `requestState` is opaque. A client that interprets it is reading server-private state.
+  2. A retry loop MUST be bounded. Without a bound a server can hold a client in an unbounded round-trip cycle, which the old server-initiated model made impossible by construction.
+  3. Sampling, Roots and Logging are **Deprecated** in `2026-07-28` with a twelve-month window. AgentKit keeps sampling because the requirement names it; it adds no new dependency on Roots or Logging.
 - **REQ-MCP-CLIENT-09:** MCP tool result content is capped at 50K characters per result with truncation and a note to the LLM.
 - **REQ-MCP-CLIENT-10:** Stdio server processes spawned with a reduced environment. Credentials resolved from the secrets store at spawn time.
 - **REQ-MCP-CLIENT-11:** `AllowlistPolicy` and `PermissionCallback` include MCP qualified tool names. `OnToolUse` event hooks fire for MCP tool calls with the qualified name.
@@ -812,7 +829,12 @@ A context file is repository-authored standing instruction text (house style, bu
 - **REQ-MCP-SERVER-03 (amended in 0.3.5):** Server implementation provides explicit tool and resource registration. Per REQ-MCP-CLIENT-01 above, the primitives are AgentKit's own.
 - **REQ-MCP-SERVER-04 (scoped in 0.3.5):** Exposed tools: `process_issue(issue_number, mode)`, `get_session_status(session_id)`, `list_active_sessions()`, `cancel_session(session_id)`. These are **nightshift's** tools, not AgentKit's: a library has no issues to process and no sessions to list. AgentKit ships REQ-MCP-SERVER-03's registration mechanism and the host registers this inventory — the same split as REQ-PLUGIN-10's `nightshift --validate-plugins`.
 - **REQ-MCP-SERVER-05 (scoped in 0.3.5):** Exposed resources: `nightshift://issues/{number}/triage-report`, `nightshift://sessions/{id}/audit-log`, `nightshift://config`. Scoped as REQ-MCP-SERVER-04: the `nightshift://` scheme is the daemon's, and AgentKit ships the resource registration and read dispatch it needs.
-- **REQ-MCP-SERVER-06:** Implements MCP 2025-03-26 protocol version.
+- **REQ-MCP-SERVER-06 (amended in 0.4.0):** Implements MCP protocol version `2026-07-28`, and only that version.
+  1. The server MUST implement `server/discover`, advertising `supportedVersions`, `capabilities` and identity.
+  2. A request naming an unsupported version is rejected with `UnsupportedProtocolVersion` (`-32022`) whose `data.supported` lists what the server speaks. On HTTP the status is 400.
+  3. There is no `initialize`, no `notifications/initialized`, no `ping`, and no session. An `initialize` request is answered with an error that NAMES the supported versions: a legacy client has no fall-forward mechanism and that message is the only diagnostic its user will see (the spec makes this a SHOULD; AgentKit does it because dropping legacy support is our choice and the resulting failure should not be mute).
+  4. Every result carries `resultType`. `tools/list`, `resources/list`, `resources/templates/list` and `resources/read` additionally carry `ttlMs` and `cacheScope`.
+  5. Server-to-client notifications are delivered only on a `subscriptions/listen` response stream, to the notification types the client opted in to. The server MUST NOT send a type that was not requested.
 - **REQ-MCP-SERVER-07:** HTTP mode requires API key authentication on every request. Unauthenticated requests return HTTP 401. Stdio mode relies on OS-level process isolation.
 
 ### 6.9 Go Implementation

@@ -3,34 +3,32 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
+	"strings"
 )
 
-// StreamableHTTPTransport is REQ-MCP-CLIENT-02's 2025-03-26 transport.
+// StreamableHTTPTransport is REQ-MCP-CLIENT-02's remote transport at
+// revision 2026-07-28.
 //
-// One endpoint. Every client message is a POST; the server answers with 202
-// (nothing to say), a single JSON body, or an SSE stream carrying one or more
-// messages. A separate long-lived GET carries messages the server originates
-// on its own — sampling requests and notifications — and a server that does
-// not support that answers the GET with 405, which is not an error.
+// One endpoint, POST only. Every client message is its own request; the server
+// answers with a single JSON object or an SSE stream scoped to THAT request.
+//
+// What is deliberately absent, because the revision removed it: the standalone
+// GET stream, protocol-level sessions and the `Mcp-Session-Id` header, and
+// `Last-Event-ID` resumability. A broken response stream loses the in-flight
+// request and the caller must re-issue it with a new id — there is no replay.
 type StreamableHTTPTransport struct {
 	*httpCommon
-
-	sessMu    sync.RWMutex
-	sessionID string
-
-	// listenOnce starts the standalone GET after the first successful POST,
-	// because before the handshake there is no session id to open it with.
-	listenOnce sync.Once
 }
 
-// StartStreamableHTTP opens a 2025-03-26 transport. Nothing is sent until the
-// first Send: the protocol has no separate connect step, and dialling eagerly
-// would report an unreachable server from a constructor rather than from the
-// handshake that needed it.
+// StartStreamableHTTP opens a transport. Nothing is sent until the first Send:
+// there is no connect step in this revision, and dialling eagerly would report
+// an unreachable server from a constructor rather than from the call that
+// needed it.
 func StartStreamableHTTP(ctx context.Context, opts HTTPTransportOptions) (*StreamableHTTPTransport, error) {
 	c, err := newHTTPCommon(ctx, opts)
 	if err != nil {
@@ -39,14 +37,7 @@ func StartStreamableHTTP(ctx context.Context, opts HTTPTransportOptions) (*Strea
 	return &StreamableHTTPTransport{httpCommon: c}, nil
 }
 
-// SessionID is the server-assigned session, empty until the server assigns
-// one. Exposed for diagnostics: a 404 mid-session is only interpretable next
-// to the id it was for.
-func (t *StreamableHTTPTransport) SessionID() string {
-	t.sessMu.RLock()
-	defer t.sessMu.RUnlock()
-	return t.sessionID
-}
+var _ Transport = (*StreamableHTTPTransport)(nil)
 
 func (t *StreamableHTTPTransport) Send(frame []byte) error {
 	if err := t.ctx.Err(); err != nil {
@@ -56,16 +47,97 @@ func (t *StreamableHTTPTransport) Send(frame []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := t.consume(resp); err != nil {
-		return err
+	return t.consume(resp)
+}
+
+// routingHeaders derives the required headers FROM THE BODY.
+//
+// They are derived, never accepted from a caller, because the server MUST
+// reject a request whose headers disagree with its body (-32020). Two sources
+// of truth is exactly the split the requirement exists to prevent: a gateway
+// routes on the header while the server executes the body.
+func routingHeaders(frame []byte) (map[string]string, error) {
+	var m struct {
+		Method string `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+			URI  string `json:"uri"`
+			Meta struct {
+				ProtocolVersion string `json:"io.modelcontextprotocol/protocolVersion"`
+			} `json:"_meta"`
+		} `json:"params"`
 	}
-	// Only now: the server has answered at least once, so a session id (if it
-	// issues them) is in hand and the GET can carry it.
-	t.listenOnce.Do(func() {
-		t.wg.Add(1)
-		go func() { defer t.wg.Done(); t.listen() }()
-	})
-	return nil
+	if err := json.Unmarshal(frame, &m); err != nil {
+		return nil, fmt.Errorf("mcp: cannot derive routing headers: %w", err)
+	}
+
+	version := m.Params.Meta.ProtocolVersion
+	if version == "" {
+		version = ProtocolVersion
+	}
+	h := map[string]string{
+		HeaderProtocolVersion: version,
+		HeaderMethod:          m.Method,
+	}
+	// Mcp-Name mirrors params.name or params.uri, and is required only for the
+	// methods that have one.
+	switch m.Method {
+	case MethodToolsCall:
+		if m.Params.Name != "" {
+			h[HeaderName] = EncodeHeaderValue(m.Params.Name)
+		}
+	case MethodResourcesRead:
+		if m.Params.URI != "" {
+			h[HeaderName] = EncodeHeaderValue(m.Params.URI)
+		}
+	}
+	return h, nil
+}
+
+// EncodeHeaderValue applies the spec's Base64 sentinel to anything that is not
+// safe as a plain ASCII header value.
+//
+// A tool name is only SHOULD-constrained to header-safe characters, so a
+// server may legitimately offer one this cannot be sent verbatim. Sending it
+// raw would either be rejected by net/http or, worse, split the header.
+func EncodeHeaderValue(v string) string {
+	if headerSafeValue(v) {
+		return v
+	}
+	return Base64SentinelPrefix + base64.StdEncoding.EncodeToString([]byte(v)) + Base64SentinelSuffix
+}
+
+// DecodeHeaderValue reverses EncodeHeaderValue. A value that is not wrapped in
+// the sentinel is returned unchanged, which is what the spec requires of a
+// server comparing the header against the body.
+func DecodeHeaderValue(v string) string {
+	if !strings.HasPrefix(v, Base64SentinelPrefix) || !strings.HasSuffix(v, Base64SentinelSuffix) {
+		return v
+	}
+	inner := v[len(Base64SentinelPrefix) : len(v)-len(Base64SentinelSuffix)]
+	raw, err := base64.StdEncoding.DecodeString(inner)
+	if err != nil {
+		// Not decodable: return it verbatim so the server's comparison fails
+		// and reports a mismatch, rather than silently comparing garbage.
+		return v
+	}
+	return string(raw)
+}
+
+// headerSafeValue reports whether v may travel as a plain header value:
+// visible ASCII and spaces, with no leading or trailing whitespace.
+func headerSafeValue(v string) bool {
+	if v == "" || v != strings.TrimSpace(v) {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	// A value that would itself look like the sentinel must be encoded, or a
+	// server cannot tell an encoded value from a literal one.
+	return !strings.HasPrefix(v, Base64SentinelPrefix)
 }
 
 func (t *StreamableHTTPTransport) post(ctx context.Context, frame []byte) (*http.Response, error) {
@@ -79,35 +151,36 @@ func (t *StreamableHTTPTransport) post(ctx context.Context, frame []byte) (*http
 	// notification gets 202, a request that streams gets an event stream, and
 	// a request answered in one shot gets JSON.
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if id := t.SessionID(); id != "" {
-		req.Header.Set(MCPSessionHeader, id)
+
+	routing, err := routingHeaders(frame)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range routing {
+		req.Header.Set(k, v)
 	}
 	return t.hc.Do(req)
 }
 
 // consume handles one POST response.
 func (t *StreamableHTTPTransport) consume(resp *http.Response) error {
-	if id := resp.Header.Get(MCPSessionHeader); id != "" {
-		t.adoptSession(id)
-	}
-
 	switch {
 	case resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusNoContent:
-		// The frame was a notification or a response; there is nothing to
-		// read, and reading anyway would hold the connection open.
+		// A notification. There is nothing to read, and reading anyway would
+		// hold the connection open.
 		drainAndClose(resp.Body, 4<<10)
 		return nil
 
-	case resp.StatusCode == http.StatusNotFound && t.SessionID() != "":
-		// A 404 for a session we hold is the spec's "your session is gone".
-		// Distinguishable so a caller re-initializes instead of retrying a
-		// request that can never succeed again.
-		drainAndClose(resp.Body, 4<<10)
-		t.clearSession()
-		return ErrSessionExpired
-
 	case resp.StatusCode >= 400:
 		body := drainAndClose(resp.Body, 8<<10)
+		// A 400 may carry a JSON-RPC error the caller needs to act on —
+		// -32022 names the versions the server speaks, -32020 says the
+		// headers and body disagreed. Delivering it as a frame lets the
+		// correlator route it to the waiting call, where a transport error
+		// would surface as an unexplained failure.
+		if delivered := t.deliverRPCError(body); delivered {
+			return nil
+		}
 		return &HTTPStatusError{
 			Status: resp.StatusCode, Method: http.MethodPost,
 			URL: t.endpoint.String(), Body: string(bytes.TrimSpace(body)),
@@ -118,8 +191,8 @@ func (t *StreamableHTTPTransport) consume(resp *http.Response) error {
 	switch {
 	case isEventStream(ct):
 		// The stream stays open until the server finishes answering, which may
-		// be after several messages. Reading it on this goroutine would block
-		// Send until then, and Send is called from the caller's request path.
+		// be after several notifications. Reading it on this goroutine would
+		// block Send until then, and Send is on the caller's request path.
 		t.wg.Add(1)
 		go func() { defer t.wg.Done(); t.readStream(resp.Body, nil) }()
 		return nil
@@ -149,92 +222,30 @@ func (t *StreamableHTTPTransport) consume(resp *http.Response) error {
 		"application/json or text/event-stream", ct)
 }
 
-// listen holds the standalone GET open for server-initiated messages.
-func (t *StreamableHTTPTransport) listen() {
-	req, err := http.NewRequestWithContext(t.ctx, http.MethodGet, t.endpoint.String(), nil)
-	if err != nil {
-		t.warn("cannot open the server-initiated stream: %v", err)
-		return
+// deliverRPCError routes a JSON-RPC error body carried by a 4xx to the waiting
+// call. It reports whether it did.
+func (t *StreamableHTTPTransport) deliverRPCError(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return false
 	}
-	t.applyHeaders(req)
-	req.Header.Set("Accept", "text/event-stream")
-	if id := t.SessionID(); id != "" {
-		req.Header.Set(MCPSessionHeader, id)
+	var probe struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   *struct {
+			Code int `json:"code"`
+		} `json:"error"`
 	}
-
-	resp, err := t.hc.Do(req)
-	if err != nil {
-		if t.ctx.Err() == nil {
-			// Not fatal. Requests and their replies flow over POSTs; only
-			// server-initiated messages need this stream, so a server without
-			// one still works for everything except sampling.
-			t.warn("server-initiated stream unavailable: %v", err)
-		}
-		return
+	if err := json.Unmarshal(trimmed, &probe); err != nil {
+		return false
 	}
-	switch {
-	case resp.StatusCode == http.StatusMethodNotAllowed:
-		// The spec's documented "I have no server-initiated stream".
-		drainAndClose(resp.Body, 4<<10)
-		return
-	case resp.StatusCode >= 400:
-		body := drainAndClose(resp.Body, 4<<10)
-		t.warn("server-initiated stream refused with %d: %s",
-			resp.StatusCode, bytes.TrimSpace(body))
-		return
+	if probe.JSONRPC != Version || probe.Error == nil || len(probe.ID) == 0 || string(probe.ID) == "null" {
+		// An error with no id cannot be correlated with anything; the caller
+		// gets the HTTP error instead, which at least names the status.
+		return false
 	}
-	if !isEventStream(resp.Header.Get("Content-Type")) {
-		drainAndClose(resp.Body, 4<<10)
-		t.warn("server-initiated stream is %q, not text/event-stream",
-			resp.Header.Get("Content-Type"))
-		return
-	}
-	t.readStream(resp.Body, nil)
-}
-
-// adoptSession stores a server-assigned id after validating it.
-//
-// The LENGTH bound is the one doing work. Go's own response reader rejects a
-// header value containing any control byte — the whole response fails as a
-// malformed MIME header — so CR/LF injection cannot reach here; but nothing
-// bounds the value's size below MaxResponseHeaderBytes, which defaults to
-// 10 MB. Unbounded, a server picks how many bytes we send on every subsequent
-// request. isHeaderSafe stays as the second line of that defence, so the rule
-// does not depend on a guarantee made by a package we do not own.
-func (t *StreamableHTTPTransport) adoptSession(id string) {
-	if len(id) > MaxSessionIDBytes || !isHeaderSafe(id) {
-		t.warn("ignoring an unusable %s from the server (%d bytes)", MCPSessionHeader, len(id))
-		return
-	}
-	t.sessMu.Lock()
-	t.sessionID = id
-	t.sessMu.Unlock()
-}
-
-func (t *StreamableHTTPTransport) clearSession() {
-	t.sessMu.Lock()
-	t.sessionID = ""
-	t.sessMu.Unlock()
-}
-
-// Close ends the session politely, then tears the transport down.
-//
-// The DELETE is best-effort and bounded by its own context: a server that has
-// gone away must not make Close hang, and the local teardown is the part that
-// actually matters.
-func (t *StreamableHTTPTransport) Close() error {
-	if id := t.SessionID(); id != "" {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.ctx), DefaultTimeout)
-		if req, err := http.NewRequestWithContext(ctx, http.MethodDelete, t.endpoint.String(), nil); err == nil {
-			t.applyHeaders(req)
-			req.Header.Set(MCPSessionHeader, id)
-			if resp, err := t.hc.Do(req); err == nil {
-				drainAndClose(resp.Body, 4<<10)
-			}
-		}
-		cancel()
-	}
-	return t.httpCommon.Close()
+	t.deliver(append([]byte(nil), trimmed...))
+	return true
 }
 
 // HTTPStatusError is a non-2xx from an MCP endpoint. The body is included

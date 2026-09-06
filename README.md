@@ -197,16 +197,38 @@ against the stream's own URL and then checked: same scheme, same host, same
 port, or we do not send. Relative endpoints (`/messages?sessionId=…`) are the
 common case and are precisely what the rule makes safe.
 
-**The remote transports auto-negotiate, but only on the server's own answer.**
-`transport` unset POSTs as 2025-03-26 and falls back to 2024-11-05 when the
-server rejects the POST with 405/404/400 — the spec's own backwards-
-compatibility procedure, so an operator does not have to know which revision a
-third-party server implements. A 5xx or a transport failure never triggers the
-fallback: that is a working server having a bad day, and silently changing
-which revision we speak because of one turns a transient failure into a
-permanent misconfiguration. The fallback swaps the transport under a read loop
-that is parked inside the old one, so `Receive` carries a generation counter to
-tell "the transport under me was exchanged" from "the session ended".
+**MCP is pinned to `2026-07-28`, modern-only.** That revision removed the
+`initialize` handshake, protocol-level sessions and `Mcp-Session-Id`, `ping`,
+the HTTP GET stream and SSE resumability, and server-initiated requests.
+Version, identity and capabilities travel in every request's `_meta`;
+`server/discover` replaces the handshake as an *optional* probe; sampling
+becomes Multi Round-Trip Requests, where the server returns
+`resultType: "input_required"` and the client answers by **retrying** with
+`inputResponses` and the server's opaque `requestState`. The spec allows a
+*dual-era* implementation that also speaks the handshake — this one does not,
+by the decision recorded in PRD 0.4.0, and the cost is that a server which has
+not migrated is unreachable. A legacy `initialize` is answered with an error
+that NAMES the versions we speak, because a legacy client has no fall-forward
+mechanism and that message is the only diagnostic its user will ever see.
+
+**The MRTR retry loop is bounded.** The old server-initiated model made an
+unbounded exchange impossible by construction — the server asked, the client
+answered, the call continued. MRTR turns that into "the client retries the
+whole request", so a server returning `input_required` every time would hold a
+client forever. Three rounds, then an error.
+
+**Notifications are opt-in.** `subscriptions/listen` replaced the GET stream: a
+client names the types it wants and the server MUST NOT send one it did not
+name. A connection with no subscription receives nothing — which is why the
+tool cache also honours the `ttlMs` hint every list result now carries, since a
+client that never subscribed has no other way to learn its cache went stale.
+
+**Routing headers are derived from the body, never accepted from a caller.**
+Every POST carries `MCP-Protocol-Version`, `Mcp-Method` and — for `tools/call`
+and `resources/read` — `Mcp-Name`, base64-sentinel-encoded when the value is
+not header-safe ASCII. A server MUST reject a request whose headers disagree
+with its body (`-32020`), because two sources of truth is exactly the split
+that lets a gateway route on one request while the server executes another.
 
 **Pagination cursors name an entry, not an index.** Unregister a tool between
 two pages and an index-based cursor silently skips whatever moved into its
@@ -493,8 +515,6 @@ confirmed to turn the corresponding test red:
 | Serve MCP over HTTP with no API key | `TestHTTPModeRequiresAnAPIKey` |
 | Check the HTTP method before authenticating | `TestAuthenticationRunsBeforeTheMethodCheck` |
 | Resynchronize after a malformed MCP frame | `TestAMalformedFrameTearsTheConnectionDown` |
-| Answer a method before the MCP handshake completes | `TestAMethodBeforeInitializeIsRefused` |
-| Always answer `initialize` with our newest version | `TestTheServerEchoesAProtocolVersionItSpeaks` |
 | Advertise `listChanged` without ever sending it | `TestRegisteringAToolNotifiesConnectedClients` |
 | Notify a session that has not finished initializing | `TestNoNotificationBeforeTheHandshakeCompletes` |
 | Answer a request the client cancelled | `TestACancelledRequestStopsTheHandlerAndGoesUnanswered` |
@@ -505,14 +525,12 @@ confirmed to turn the corresponding test red:
 | Resume a listing AT the cursor's entry | `TestListingPagesAndResumesAfterTheCursor` |
 | Accept a cursor this server never issued | `TestAFabricatedCursorIsRefused` |
 | Bind MCP HTTP mode to every interface | `TestHTTPModeBindsLoopback` |
-| POST where a server's `endpoint` event points, off-origin | `TestAnEndpointOnAnotherOriginIsRefused` |
-| Compare endpoint origins without the port | `TestAnEndpointOnAnotherOriginIsRefused` |
-| Fall back to the older revision on a 5xx | `TestAutoDoesNotSwitchRevisionOnAServerError` |
-| Kill the session when the auto transport swaps | `TestAutoFallsBackToTheOlderRevision` |
-| Echo an unbounded server-chosen session id | `TestAnOversizedSessionIDIsRefused` |
-| Treat a 404 for a live session as any other error | `TestA404ForAKnownSessionIsDistinguishable` |
-| Treat 405 on the standalone GET as fatal | `TestAServerWithoutAStandaloneStreamStillWorks` |
 | Read an SSE-answered POST as JSON | `TestStreamableHTTPAcceptsAnSSEAnsweredPOST` |
+| Serve a request that carries no `_meta` version | `TestARequestWithoutProtocolVersionMetaIsRefused` |
+| Reject an old version without naming the supported set | `TestAnUnsupportedVersionIsRejectedWithTheSupportedList` |
+| Answer a legacy `initialize` with a bare method-not-found | `TestALegacyInitializeGetsADiagnosticNamingTheSupportedVersions` |
+| Keep answering `ping` after the revision removed it | `TestPingIsGone` |
+| Omit `server/discover` | `TestServerDiscoverAdvertisesVersionsAndCapabilities` |
 | Buffer an unbounded `data:` field | `TestAnOversizedSSELineIsRefused` |
 | Dispatch an event the stream ended in the middle of | `TestAStreamThatEndsMidEventIsAnError` |
 | Send `Bearer ` when the token variable is unset | `TestAHeaderThatResolvesToNothingIsDroppedNotSentBlank` |
@@ -611,13 +629,14 @@ Stated plainly so nobody reports it as done.
   exits 1, which is NFR-TEST-07.3's required answer rather than a bug. The
   unit suite pins the wire format against *regression*; only a reference pins
   it against *truth*, and the weaker claim is the honest one until then.
-- **SSE stream resumption.** All three of REQ-MCP-CLIENT-02's transports ship
-  — stdio against a real subprocess, and both HTTP revisions against real
-  `httptest` servers. What is *not* built is reconnecting a dropped event
-  stream with `Last-Event-ID`: an optional part of the 2025-03-26 spec that
-  needs a retry policy and duplicate suppression to be worth anything. The
-  decoder therefore parses `id:` and discards it, rather than storing an id it
-  would never send and implying support that is not there.
+- **The legacy MCP era.** AgentKit speaks `2026-07-28` and nothing else, so it
+  cannot talk to a server that has not migrated — which today is most of them.
+  This is a decision, not an oversight (PRD 0.4.0), and reversing it means
+  implementing the handshake era rather than setting a flag.
+- **MCP surface AgentKit never had.** Prompts, completions, elicitation,
+  resource subscriptions and the Tasks extension are defined by the revision
+  and not implemented here; `subscriptions/listen` ships, but only the
+  list-changed filters have producers.
 - **Plugin implementations.** The four categories, the registry, discovery, the
   lint and `validate-plugins` ship; no first-party plugin does. That is the
   intended shape — a plugin is the embedder's code — but it means the

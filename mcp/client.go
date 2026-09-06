@@ -39,6 +39,8 @@ var (
 	// ErrSamplingNotAllowed is REQ-MCP-CLIENT-08's gate.
 	ErrSamplingNotAllowed = errors.New("mcp: sampling is not enabled for this server")
 	ErrNotInitialized     = errors.New("mcp: connection is not initialized")
+	// ErrTooManyInputRounds is REQ-MCP-CLIENT-08.2's bound.
+	ErrTooManyInputRounds = errors.New("mcp: too many multi-round-trip input requests")
 )
 
 // ServerConfig is one `[[mcp.servers]]` entry (REQ-MCP-CLIENT-07).
@@ -48,12 +50,6 @@ type ServerConfig struct {
 	Args    []string
 	URL     string
 	Dir     string
-	// Transport selects the remote revision for a URL server
-	// (REQ-MCP-CLIENT-02). Empty auto-negotiates: 2025-03-26 first, falling
-	// back to 2024-11-05 when the server rejects the POST. A field is needed
-	// because REQ-MCP-CLIENT-07's `url` alone does not say which of the two
-	// specs is behind it.
-	Transport HTTPMode
 	// Headers are sent on every request to a URL server. Values may carry
 	// ${VAR} references, resolved from the secrets store exactly like Env — a
 	// remote server's bearer token has the same reason not to sit in a config
@@ -127,13 +123,20 @@ type ServerConnection struct {
 	tr   Transport
 	corr *correlator
 
-	mu          sync.Mutex
-	initialized bool
-	info        InitializeResult
-	tools       []ToolDefinition
-	toolsValid  bool
+	mu         sync.Mutex
+	info       DiscoverResult
+	discovered bool
+	tools      []ToolDefinition
+	toolsValid bool
+	// toolsExpire is the ttlMs deadline from the list result. 2026-07-28
+	// requires servers to send a freshness hint; honouring it is what keeps a
+	// cached list from outliving a server that has no subscription stream open
+	// to tell us it changed.
+	toolsExpire time.Time
 	calls       int
-	closed      bool
+	// subscribed is set when the server acknowledges a subscriptions/listen.
+	subscribed bool
+	closed     bool
 
 	readerDone chan struct{}
 	readErr    error
@@ -159,76 +162,99 @@ func NewConnection(cfg ServerConfig, tr Transport, opts ConnectionOptions) *Serv
 func (c *ServerConnection) Name() string { return c.cfg.Name }
 
 // Info returns the handshake result.
-func (c *ServerConnection) Info() InitializeResult {
+func (c *ServerConnection) Info() DiscoverResult {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.info
 }
 
 // Initialize performs the handshake and capability negotiation.
-func (c *ServerConnection) Initialize(ctx context.Context) error {
-	var caps ClientCapabilities
-	if c.cfg.AllowSampling && c.opts.Sampling != nil {
-		// Advertised only when we will actually honour it (REQ-MCP-CLIENT-08).
-		// Advertising a capability we then refuse invites a server to build a
-		// flow around it and fail at the worst moment.
-		caps.Sampling = &struct{}{}
+// Discover is 2026-07-28's OPTIONAL up-front probe (REQ-MCP-CLIENT-03,
+// amended in 0.4.0).
+//
+// It is not a handshake and nothing requires calling it: every request carries
+// its own version and capabilities, so a client may invoke any RPC inline and
+// handle UnsupportedProtocolVersion if it comes back. It is called here
+// because a pool that knows a server's capabilities before the first tool call
+// can report an unusable server at connect time rather than mid-turn.
+func (c *ServerConnection) Discover(ctx context.Context) error {
+	var res DiscoverResult
+	if err := c.call(ctx, MethodDiscover, DiscoverParams{}, &res); err != nil {
+		var rpcErr *Error
+		if errors.As(err, &rpcErr) && rpcErr.Code == CodeUnsupportedProtocolVersion {
+			return fmt.Errorf("mcp: %s: %w", c.cfg.Name, unsupportedVersionError(rpcErr))
+		}
+		return fmt.Errorf("mcp: %s: server/discover: %w", c.cfg.Name, err)
 	}
-
-	var res InitializeResult
-	err := c.call(ctx, MethodInitialize, InitializeParams{
-		ProtocolVersion: ProtocolVersion,
-		Capabilities:    caps,
-		ClientInfo:      c.opts.ClientInfo,
-	}, &res)
-	if err != nil {
-		return fmt.Errorf("mcp: %s: initialize: %w", c.cfg.Name, err)
+	if err := res.Validate(); err != nil {
+		return fmt.Errorf("mcp: %s: server/discover: %w", c.cfg.Name, err)
 	}
-	if res.ProtocolVersion != ProtocolVersion && res.ProtocolVersion != LegacyProtocolVersion {
-		// Not fatal. A version we do not recognise may still speak the subset
-		// we use, and refusing outright would break against every future
-		// server; the warning is what makes the mismatch findable when
-		// something later does not work.
-		c.warnf("server %q negotiated protocol %q, which this build does not model "+
-			"(known: %s, %s)", c.cfg.Name, res.ProtocolVersion, ProtocolVersion, LegacyProtocolVersion)
+	if !containsVersion(res.SupportedVersions, ProtocolVersion) {
+		// Not fatal on its own — the server answered our request, so it
+		// evidently tolerates the version we sent — but a server whose
+		// advertised set excludes ours will reject something later, and saying
+		// so now beats a confusing failure three calls in.
+		c.warnf("server %q advertises %v and does not list %s; later requests may be "+
+			"rejected with UnsupportedProtocolVersion",
+			c.cfg.Name, res.SupportedVersions, ProtocolVersion)
 	}
 
 	c.mu.Lock()
-	c.info, c.initialized = res, true
+	c.info, c.discovered = res, true
 	c.mu.Unlock()
-
-	// The initialized notification is fire-and-forget by protocol design.
-	if err := c.notify(MethodInitialized, struct{}{}); err != nil {
-		return fmt.Errorf("mcp: %s: initialized notification: %w", c.cfg.Name, err)
-	}
 	return nil
 }
 
-// ListTools returns the server's tools, cached (REQ-CACHE-07).
-//
-// The cache is invalidated ONLY by notifications/tools/list_changed or by
-// RefreshTools. Re-listing per turn would put a round trip on the critical
-// path of every request for a list that changes approximately never.
+// unsupportedVersionError renders a -32022 into something a human can act on.
+func unsupportedVersionError(e *Error) error {
+	var data UnsupportedVersionData
+	if len(e.Data) > 0 {
+		_ = json.Unmarshal(e.Data, &data)
+	}
+	if len(data.Supported) == 0 {
+		return fmt.Errorf("the server does not support protocol version %s and named no "+
+			"alternative", ProtocolVersion)
+	}
+	return fmt.Errorf("the server supports %v, not %s; this build is modern-only and "+
+		"speaks no earlier revision", data.Supported, ProtocolVersion)
+}
+
+func containsVersion(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *ServerConnection) ListTools(ctx context.Context) ([]ToolDefinition, error) {
 	c.mu.Lock()
-	if c.toolsValid {
+	// The cache is valid until list_changed invalidates it OR its ttlMs
+	// expires. A zero deadline means the server sent no hint, which under
+	// 2026-07-28 it is required to do — treat that as "no expiry" rather than
+	// "expired", so a non-conforming server degrades to the old behaviour
+	// instead of re-listing on every turn.
+	if c.toolsValid && (c.toolsExpire.IsZero() || c.opts.Now().Before(c.toolsExpire)) {
 		out := append([]ToolDefinition(nil), c.tools...)
 		c.mu.Unlock()
 		return out, nil
 	}
-	initialized := c.initialized
 	c.mu.Unlock()
 
-	if !initialized {
-		return nil, ErrNotInitialized
-	}
-
 	var all []ToolDefinition
+	var ttl int64
 	cursor := ""
 	for {
 		var res ToolsListResult
 		if err := c.call(ctx, MethodToolsList, ToolsListParams{Cursor: cursor}, &res); err != nil {
 			return nil, fmt.Errorf("mcp: %s: tools/list: %w", c.cfg.Name, err)
+		}
+		// The SHORTEST hint across pages wins: one page going stale makes the
+		// assembled list stale, and caching to the longest would keep serving
+		// a list the server already said had expired in part.
+		if res.TTLMs > 0 && (ttl == 0 || res.TTLMs < ttl) {
+			ttl = res.TTLMs
 		}
 		all = append(all, res.Tools...)
 		if res.NextCursor == "" || res.NextCursor == cursor {
@@ -244,6 +270,10 @@ func (c *ServerConnection) ListTools(ctx context.Context) ([]ToolDefinition, err
 
 	c.mu.Lock()
 	c.tools, c.toolsValid = all, true
+	c.toolsExpire = time.Time{}
+	if ttl > 0 {
+		c.toolsExpire = c.opts.Now().Add(time.Duration(ttl) * time.Millisecond)
+	}
 	c.mu.Unlock()
 	return append([]ToolDefinition(nil), all...), nil
 }
@@ -252,6 +282,7 @@ func (c *ServerConnection) ListTools(ctx context.Context) ([]ToolDefinition, err
 func (c *ServerConnection) RefreshTools() {
 	c.mu.Lock()
 	c.toolsValid, c.tools = false, nil
+	c.toolsExpire = time.Time{}
 	c.mu.Unlock()
 }
 
@@ -260,10 +291,6 @@ func (c *ServerConnection) Call(ctx context.Context, toolName string, args map[s
 	start := c.opts.Now()
 
 	c.mu.Lock()
-	if !c.initialized {
-		c.mu.Unlock()
-		return ToolsCallResult{}, ErrNotInitialized
-	}
 	limit := c.cfg.callLimit()
 	if limit >= 0 && c.calls >= limit {
 		c.mu.Unlock()
@@ -277,8 +304,7 @@ func (c *ServerConnection) Call(ctx context.Context, toolName string, args map[s
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.timeout())
 	defer cancel()
 
-	var res ToolsCallResult
-	err := c.call(ctx, MethodToolsCall, ToolsCallParams{Name: toolName, Arguments: args}, &res)
+	res, err := c.callWithMRTR(ctx, toolName, args)
 	elapsed := c.opts.Now().Sub(start).Milliseconds()
 	if err != nil {
 		c.auditCall(toolName, args, true, elapsed, start)
@@ -288,6 +314,83 @@ func (c *ServerConnection) Call(ctx context.Context, toolName string, args map[s
 	res.Content = CapContent(res.Content)
 	c.auditCall(toolName, args, res.IsError, elapsed, start)
 	return res, nil
+}
+
+// resultTypeOf reads the discriminator without binding the body.
+func resultTypeOf(raw []byte, limits wire.Limits) (ResultType, error) {
+	if len(raw) == 0 {
+		return ResultComplete, nil
+	}
+	v, err := wire.Parse(raw, limits)
+	if err != nil {
+		return "", err
+	}
+	rt, ok := v.Object["resultType"]
+	if !ok {
+		return ResultComplete, nil
+	}
+	return ResultType(rt.String), nil
+}
+
+// MaxInputRounds bounds the MRTR retry loop (REQ-MCP-CLIENT-08.2).
+//
+// The old server-initiated model made an unbounded exchange impossible by
+// construction: the server asked, the client answered, the call continued.
+// MRTR turns that into "the client retries the whole request", and a server
+// that returns input_required every time would hold the client in a loop
+// forever. Three rounds is enough for the flows the spec illustrates and
+// small enough that a runaway is a reported error rather than a hang.
+const MaxInputRounds = 3
+
+// callWithMRTR runs tools/call, answering any input requests and retrying.
+func (c *ServerConnection) callWithMRTR(ctx context.Context, toolName string, args map[string]any) (ToolsCallResult, error) {
+	params := ToolsCallParams{Name: toolName, Arguments: args}
+
+	for round := 0; ; round++ {
+		var raw json.RawMessage
+		if err := c.call(ctx, MethodToolsCall, params, &raw); err != nil {
+			return ToolsCallResult{}, err
+		}
+
+		// resultType decides how to read the body. It is read WITHOUT binding
+		// the rest: a probe struct declaring only resultType would reject
+		// every other field under REQ-SEC-12.1's unknown-property rule, and
+		// binding the full result before knowing which shape it is would
+		// pick the wrong struct half the time.
+		//
+		// An earlier-revision server omits the field, and the spec says to
+		// treat that as "complete".
+		kind, err := resultTypeOf(raw, c.opts.Limits)
+		if err != nil {
+			return ToolsCallResult{}, err
+		}
+		if kind != ResultInputRequired {
+			var res ToolsCallResult
+			if err := decodeParams(raw, &res, c.opts.Limits); err != nil {
+				return ToolsCallResult{}, err
+			}
+			return res, nil
+		}
+
+		if round+1 >= MaxInputRounds {
+			return ToolsCallResult{}, fmt.Errorf(
+				"%w: %s asked for input %d times without completing",
+				ErrTooManyInputRounds, c.cfg.Name, round+1)
+		}
+		var need InputRequiredResult
+		if err := decodeParams(raw, &need, c.opts.Limits); err != nil {
+			return ToolsCallResult{}, err
+		}
+		answers, err := c.resolveInputRequests(ctx, need.InputRequests)
+		if err != nil {
+			return ToolsCallResult{}, err
+		}
+		// The retry carries the answers AND the server's opaque state, which
+		// is how it reconstructs where it was — there is no session holding
+		// that for it any more.
+		params.InputResponses = answers
+		params.RequestState = need.RequestState
+	}
 }
 
 // CapContent applies REQ-MCP-CLIENT-09's 50K cap across the whole result.
@@ -356,7 +459,7 @@ func (c *ServerConnection) Close() error {
 // ---------------------------------------------------------------- plumbing
 
 func (c *ServerConnection) call(ctx context.Context, method string, params, out any) error {
-	raw, err := json.Marshal(params)
+	raw, err := c.withMeta(params)
 	if err != nil {
 		return err
 	}
@@ -396,6 +499,52 @@ func (c *ServerConnection) call(ctx context.Context, method string, params, out 
 	}
 }
 
+// withMeta injects the per-request `_meta` that replaced the handshake.
+//
+// Every request carries the protocol version and the client's capabilities:
+// there is no session in which they could have been agreed once, so omitting
+// them makes the request uninterpretable and a conforming server rejects it.
+//
+// The injection goes through a map rather than a struct field on every params
+// type. A field per type would be seven places to forget it, and the one that
+// got forgotten would fail against a strict server only.
+func (c *ServerConnection) withMeta(params any) (json.RawMessage, error) {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil, err
+	}
+	obj := map[string]json.RawMessage{}
+	if len(raw) > 0 && raw[0] == '{' {
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, err
+		}
+	}
+	meta, err := json.Marshal(c.requestMeta())
+	if err != nil {
+		return nil, err
+	}
+	obj["_meta"] = meta
+	return json.Marshal(obj)
+}
+
+// requestMeta is what this client says about itself on every request.
+func (c *ServerConnection) requestMeta() RequestMeta {
+	caps := ClientCapabilities{}
+	if c.cfg.AllowSampling && c.opts.Sampling != nil {
+		// Advertised only when we will actually honour it
+		// (REQ-MCP-CLIENT-08). Under MRTR the cost of over-advertising is
+		// higher than it was: a server builds an input request, we refuse it,
+		// and the work it did to get there is wasted.
+		caps.Sampling = &struct{}{}
+	}
+	info := c.opts.ClientInfo
+	return RequestMeta{
+		ProtocolVersion:    ProtocolVersion,
+		ClientInfo:         &info,
+		ClientCapabilities: caps,
+	}
+}
+
 // cancelRemote sends notifications/cancelled for an abandoned request. A send
 // failure is deliberately ignored: the call has already failed, and the
 // cancellation is a courtesy to a peer that may itself be the reason the send
@@ -409,11 +558,11 @@ func (c *ServerConnection) cancelRemote(id ID, cause error) {
 	if cause != nil {
 		reason = cause.Error()
 	}
-	_ = c.notify(MethodCancelled, CancelledParams{RequestID: rawID, Reason: reason})
+	_ = c.notify(MethodCancelled, map[string]any{"requestId": json.RawMessage(rawID), "reason": reason})
 }
 
 func (c *ServerConnection) notify(method string, params any) error {
-	raw, err := json.Marshal(params)
+	raw, err := c.withMeta(params)
 	if err != nil {
 		return err
 	}
@@ -458,50 +607,68 @@ func (c *ServerConnection) readLoop() {
 		case m.IsNotification():
 			c.handleNotification(&m)
 		case m.IsRequest():
-			go c.handleRequest(&m)
+			// 2026-07-28 removed server-initiated requests entirely: what a
+			// server used to ask for mid-call now comes back as an
+			// InputRequiredResult and is answered by retrying (MRTR). A server
+			// still sending one is speaking an earlier revision, and answering
+			// it would be pretending to be dual-era.
+			c.warnf("server %q sent a %q REQUEST; this revision has no server-initiated "+
+				"requests and the message was ignored", c.cfg.Name, m.Method)
 		}
 	}
 }
 
 func (c *ServerConnection) handleNotification(m *Message) {
-	if m.Method == MethodToolsChanged {
+	switch m.Method {
+	case MethodSubscriptionsAck:
+		c.mu.Lock()
+		c.subscribed = true
+		c.mu.Unlock()
+	case MethodToolsChanged:
 		c.RefreshTools()
 	}
 }
 
-func (c *ServerConnection) handleRequest(m *Message) {
-	switch m.Method {
-	case MethodPing:
-		c.respond(m.ID, struct{}{}, nil)
-
-	case MethodSampling:
-		var p SamplingParams
-		if err := decodeParams(m.Params, &p, c.opts.Limits); err != nil {
-			c.auditSampling(false, "malformed params")
-			c.respond(m.ID, nil, Errorf(CodeInvalidParams, "%v", err))
-			return
+// resolveInputRequests answers an InputRequiredResult (REQ-MCP-CLIENT-08,
+// amended in 0.4.0).
+//
+// Every entry is audited, refusals included: a refusal that leaves no trace is
+// indistinguishable from a server that never asked, and the two want very
+// different responses.
+func (c *ServerConnection) resolveInputRequests(ctx context.Context, reqs map[string]json.RawMessage) (map[string]any, error) {
+	out := make(map[string]any, len(reqs))
+	for key, raw := range reqs {
+		var ir InputRequest
+		if err := decodeParams(raw, &ir, c.opts.Limits); err != nil {
+			return nil, fmt.Errorf("mcp: %s: undecodable input request %q: %w",
+				c.cfg.Name, key, err)
 		}
-		// REQ-MCP-CLIENT-08: EVERY sampling request is audited, refused ones
-		// included. A refusal that leaves no trace is indistinguishable from a
-		// server that never asked, and the two want very different responses.
-		if !c.cfg.AllowSampling || c.opts.Sampling == nil {
-			c.auditSampling(false, "sampling is not enabled for this server")
-			c.respond(m.ID, nil, Errorf(CodeMethodNotFound, "%v", ErrSamplingNotAllowed))
-			return
+		switch ir.Method {
+		case MethodSampling:
+			var p SamplingParams
+			if err := decodeParams(ir.Params, &p, c.opts.Limits); err != nil {
+				c.auditSampling(false, "malformed params")
+				return nil, fmt.Errorf("mcp: %s: sampling params: %w", c.cfg.Name, err)
+			}
+			if !c.cfg.AllowSampling || c.opts.Sampling == nil {
+				c.auditSampling(false, "sampling is not enabled for this server")
+				return nil, fmt.Errorf("%w: %s", ErrSamplingNotAllowed, c.cfg.Name)
+			}
+			c.auditSampling(true, "")
+			res, err := c.opts.Sampling(ctx, p)
+			if err != nil {
+				return nil, fmt.Errorf("mcp: %s: sampling: %w", c.cfg.Name, err)
+			}
+			out[key] = res
+		default:
+			// Roots and elicitation are not implemented here. Refusing by name
+			// beats answering with something shaped wrong, which the server
+			// would then act on.
+			return nil, fmt.Errorf("mcp: %s: server asked for %q, which this client does "+
+				"not implement", c.cfg.Name, ir.Method)
 		}
-		c.auditSampling(true, "")
-		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.timeout())
-		defer cancel()
-		res, err := c.opts.Sampling(ctx, p)
-		if err != nil {
-			c.respond(m.ID, nil, Errorf(CodeInternalError, "%v", err))
-			return
-		}
-		c.respond(m.ID, res, nil)
-
-	default:
-		c.respond(m.ID, nil, Errorf(CodeMethodNotFound, "method %q is not implemented", m.Method))
 	}
+	return out, nil
 }
 
 func (c *ServerConnection) respond(id ID, result any, rpcErr *Error) {
