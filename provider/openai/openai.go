@@ -9,7 +9,7 @@
 // OpenAI Responses is a SEPARATE wire API and therefore a separate package: it
 // differs in the message model, the tool-call identity model, the reasoning
 // replay model and the billing model. It is not this implementation with a
-// flag. (Not implemented in v1.)
+// flag; see provider/openairesponses.
 package openai
 
 import (

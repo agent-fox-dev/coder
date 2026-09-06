@@ -617,9 +617,19 @@ Also included: `FuzzRepairAlwaysSendable` (432k executions clean),
 
 Stated plainly so nobody reports it as done.
 
-- **OpenAI Responses.** It is a separate wire API, not this one with a flag —
-  different message model, tool-call identity, reasoning replay and billing.
-- **Image normalization** (REQ-TOOL-14).
+- **`run_command` and `powershell`** (REQ-TOOL-06). The requirement names both
+  alongside `execute`: `run_command(argv []string)` for structured invocation
+  with no shell interpolation, and `powershell` as a *separately named* tool
+  registered on every platform with the platform check deferred to execution,
+  so the tool list — and therefore the cached prompt prefix — stays
+  platform-stable. `execute` ships; neither of these does.
+- **REQ-TOOL-04d's whitespace-tolerant fallback.** The BOM and CRLF half is
+  built (`NormalizeForEdit`/`Restore`). The fallback pass that runs *only after
+  exact matching fails for every edit* — NFKC, per-line trailing-whitespace
+  trim, and folding of smart quotes, dash variants and exotic spaces to ASCII —
+  is not. The requirement flags the cost itself: NFKC is not in the standard
+  library, so closing this means a hand-rolled fold over the confusable set,
+  paid deliberately against REQ-GO-11.
 - **Reference bodies for the differential harness.** The harness itself ships
   ([`difftest/`](difftest/), a separate module) and its own suite is
   mutation-verified. It has no scenarios, because NFR-TEST-06.3 forbids

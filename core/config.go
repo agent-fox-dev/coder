@@ -59,10 +59,9 @@ type Hooks struct {
 
 	// OnSessionStart and OnSessionEnd are REQ-OBS-03.
 	//
-	// The requirement names EventHookPlugin, and plugins are not built. The
-	// hook POINTS are not a plugin feature though — a plugin would be one more
-	// registrant — so they ship here, and a plugin host later becomes a
-	// registrant rather than a redesign.
+	// The requirement names EventHookPlugin. The hook POINTS are not a plugin
+	// feature — a plugin is one more registrant — so they live here, and the
+	// plugins package registers against them rather than replacing them.
 	//
 	// OnSessionEnd fires exactly once per run, including on an error or an
 	// abort. A hook that fires only on the happy path is worse than none: an

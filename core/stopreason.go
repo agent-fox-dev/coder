@@ -77,10 +77,10 @@ type API string
 const (
 	APIAnthropicMessages API = "anthropic-messages"
 	APIOpenAICompletions API = "openai-completions"
-	APIOpenAIResponses   API = "openai-responses"     // reserved; not implemented in v1
-	APIGoogleGenerative  API = "google-generative-ai" // reserved; not implemented in v1
-	APIOllamaChat        API = "ollama-chat"          // reserved; not implemented in v1
-	APIFaux              API = "faux"                 // NFR-TEST-05, shipped and supported
+	APIOpenAIResponses   API = "openai-responses"
+	APIGoogleGenerative  API = "google-generative-ai"
+	APIOllamaChat        API = "ollama-chat"
+	APIFaux              API = "faux" // NFR-TEST-05, shipped and supported
 )
 
 // ThinkingLevel is REQ-PROV-15's request parameter and assistant provenance.
