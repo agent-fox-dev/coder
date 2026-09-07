@@ -1,9 +1,12 @@
 # AgentKit examples
 
-Five runnable programs, smallest first. Each is a single self-contained
-`main.go` you can read top to bottom and copy into your own project — they
-deliberately repeat their setup rather than sharing a helper package, so
-nothing you need is in a file you have not opened.
+Ten examples, smallest first. Each is a single self-contained `main.go` you
+can read top to bottom and copy into your own project — they deliberately
+repeat their setup rather than sharing a helper package, so nothing you need
+is in a file you have not opened.
+
+**Four of them need no API key at all**: `agentdemo`, `testing`, `plugins` and
+`mcp` do their real work before any model call, so you can run them right now.
 
 | Example | Run it | What it teaches |
 |---|---|---|
@@ -12,6 +15,17 @@ nothing you need is in a file you have not opened.
 | [`codingagent`](codingagent) | `go run ./examples/codingagent --dir . "which files define the tool policy?"` | Built-in file/shell tools, a workspace root, and the `execute` authorization boundary. |
 | [`session`](session) | `go run ./examples/session "pick a number"` then `go run ./examples/session "which number?"` | Durable append-only sessions. The second run answers from the first one's transcript, on disk. |
 | [`delegation`](delegation) | `go run ./examples/delegation "which files define the agent loop?"` | Named specialists, per-child tool scoping, budget propagation. |
+
+Then the ones that go deeper. `testing`, `plugins` and `mcp` run fully without
+a key:
+
+| Example | Run it | What it teaches |
+|---|---|---|
+| [`testing`](testing) | `go test ./examples/testing/ -v` | **How to test the agent code *you* write.** A test file, not a program: scripting turns with `provider/faux`, asserting what was actually sent, and testing your handlers, interceptors and middleware offline. |
+| [`customtools`](customtools) | `go run ./examples/customtools` | Writing tools well: the schema combinators, `Handler` vs `Execute`, argument repair, sequential execution, per-tool prompt guidelines, and a tool that ends the run. |
+| [`plugins`](plugins) | `go run ./examples/plugins` | The four plugin categories, manifest discovery, load ordering, the `disabled` list, and why a plugin hook can only narrow what the host already allowed. |
+| [`mcp`](mcp) | `go run ./examples/mcp` · `--serve` | Model Context Protocol both ways: consuming a server's tools under qualified names, and exposing your own over stdio. |
+| [`interactive`](interactive) | `go run ./examples/interactive` | Typing *while* the agent works: steering a running turn, queued follow-ups, out-of-band abort, phase and snapshot. |
 
 There is also [`agentdemo`](agentdemo), which needs **no API key and no
 network**: it drives the real loop against a scripted provider and prints
@@ -189,17 +203,7 @@ level as construction inputs; use `NewAgentFromSession`. See
 **Nothing streams** — a non-streaming provider emits no delta events at all.
 Deltas are an optimization; the authoritative events always arrive.
 
-## Beyond these five
-
-**MCP.** AgentKit is both an MCP client and an MCP server, on the standard
-library. `mcp.NewPool` connects to servers declared in `config.toml` under
-`[[mcp.servers]]`, and their tools reach the registry under qualified names
-(`github__create_issue`) so every gate — allowlist, interceptor, plugin hook,
-audit — sees the same name the model called. Declare your own tool names in
-`Pool.NativeTools` before connecting: a server that would shadow `read_file`
-is then refused at connect rather than silently standing in front of it.
-`mcp_wiring_test.go` in the repository root is a working end-to-end wiring
-against an in-process server.
+## Not yet covered by an example
 
 **Skills and project context.** Repository-authored prompt material is loaded
 only when your application says so. `agentkit.SkillsConfigFor` derives the

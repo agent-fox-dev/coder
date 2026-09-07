@@ -12,11 +12,13 @@ go test ./...          # everything, offline, no API key
 go run ./examples/agentdemo
 ```
 
-[`examples/`](examples/) has five runnable programs — chat, streaming, a
-coding agent, durable sessions and multi-agent delegation — and
-[`examples/README.md`](examples/README.md) is the configuration reference:
-which environment variable each vendor reads, what a base URL does and does
-not buy you, and the three decisions every embedding application has to make.
+[`examples/`](examples/) has ten of them — chat, streaming, a coding agent,
+durable sessions, delegation, writing your own tools, plugins, MCP in both
+directions, mid-run steering, and a test file showing how to test the agent
+code *you* write. Four need no API key. [`examples/README.md`](examples/README.md)
+is the configuration reference: which environment variable each vendor reads,
+what a base URL does and does not buy you, and the three decisions every
+embedding application has to make.
 
 To talk to a real model, register a wire API on the config. Nothing is
 registered by import side effect, so the root package never drags `net/http`
