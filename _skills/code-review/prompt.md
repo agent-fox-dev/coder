@@ -130,9 +130,13 @@ them; if one seems wrong, cite the requirement it implements and mark it
   header is reported by every subsequent `Load`, because an append-only log
   is not rewritten in place. Repeated reporting is the contract
   (REQ-SESS-05.4), not a failure to repair.
-- **`taskPrompt` accepted and ignored** in `LoadForSession`. REQ-SKILL-06
-  removed keyword triggering; the parameter stays so the call site reads as
-  the PRD writes it.
+- **`taskPrompt` accepted and ignored** in `LoadForSession(archetype,
+  taskPrompt, config)`. REQ-SKILL-06 removed keyword triggering, so nothing in
+  a manifest says what task text a skill matches and the MODEL chooses from
+  the descriptions; the parameter stays so the call site reads as the PRD
+  writes it and so a future ranker has a signature to land in. The `config`
+  parameter is not decoration either: it re-applies the trust gate per CALL,
+  which is why a zero `Config` selects nothing.
 - **Comments in emphatic capitals** ("EMPTY IS A VALID AND EXPECTED STATE").
   House style for the sentence that a future reader is most likely to
   "fix". Not shouting; not a finding.

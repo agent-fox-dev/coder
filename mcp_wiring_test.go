@@ -11,6 +11,7 @@ import (
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/mcp"
 	"github.com/agentfox/agentkit-go/plugins"
+	"github.com/agentfox/agentkit-go/tools"
 	"github.com/agentfox/agentkit-go/wire"
 )
 
@@ -46,6 +47,12 @@ func mcpTools(t *testing.T, serverName string) []core.Tool {
 		t.Fatal(err)
 	}
 	pool := mcp.NewPool(mcp.ConnectionOptions{})
+	// REQ-MCP-CLIENT-06: the host declares the names no server may shadow,
+	// BEFORE connecting. This wiring is the pattern an embedder copies, so it
+	// sets the field even though this test attaches an already-open
+	// connection with Add — leaving it empty here would demonstrate a pool
+	// whose connect-time collision check is disarmed.
+	pool.NativeTools = builtinToolNames(t)
 	if err := pool.Add(conn); err != nil {
 		t.Fatal(err)
 	}
@@ -193,4 +200,24 @@ func TestAnMCPToolCallIsAuditedWithItsServerName(t *testing.T) {
 	if calls[0].ToolName != "github__create_issue" {
 		t.Fatalf("tool_name = %q, want the qualified name", calls[0].ToolName)
 	}
+}
+
+// builtinToolNames is the SDK's own tool set by name — what an embedder hands
+// Pool.NativeTools so a server cannot stand in front of `read_file`
+// (REQ-MCP-CLIENT-06).
+func builtinToolNames(t *testing.T) []string {
+	t.Helper()
+	ws, err := tools.NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := tools.All(tools.Options{Workspace: ws})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(all))
+	for _, tl := range all {
+		names = append(names, tl.Name)
+	}
+	return names
 }

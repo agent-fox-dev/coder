@@ -45,14 +45,43 @@
 // second, weaker reader of the same text. Conformance is reviewed, and the
 // built-in skill is the review's reference.
 //
+// # Seams the embedder wires (REQ-SKILL-07, REQ-SKILL-08, REQ-SKILL-11)
+//
+// Three requirements end outside this package by design, because acting on
+// them means touching a session, a provider or an audit sink and a skills
+// package that could reach those is the coupling REQ-SKILL-08 forbids. Each
+// one therefore ships a seam here and a single line at the call site:
+//
+//   - A skill activating MID-SESSION (REQ-SKILL-07, REQ-CACHE-10). Activate
+//     merges the tools and returns the names that became available;
+//     Activation.Mark stamps them onto the core.ToolResultMessage at whose
+//     transcript position the skill appeared. provider.SplitDeferredTools then
+//     defers those definitions instead of invalidating the cached prefix.
+//
+//   - The declarative subagent step (REQ-SKILL-08, OQ-1). RunSubagents walks
+//     the [skill.subagent] declarations, calls the embedder's SubagentRunner,
+//     applies on_failure (abort | warn | skip, defaulting to warn) and returns
+//     the analyses; Assemble injects them under result_key.
+//
+//   - The audit event (REQ-SKILL-11, REQ-OBS-04). Record wraps the selection —
+//     skills.Record(agent, reg.LoadForSession(archetype, task, reg.Config())) —
+//     so the names reach the sink from the same call that injects the skills,
+//     rather than from a second call that a refactor can drop.
+//
 // What this package does NOT do, stated so nobody reports it as done:
 //
-//   - It does not load Go plugin code, so REQ-SKILL-09's import lint and the
-//     [skill.tools] module/factory pair are parsed and carried, not executed.
-//     MergeTools takes the tool values from the embedder.
-//   - It does not spawn subagents (REQ-SKILL-08); [skill.subagent] is parsed
-//     and carried for the session runner.
-//   - It does not emit the audit event of REQ-SKILL-11; Registry.Names gives
-//     the caller the list to record.
-//   - It does not mark tools for REQ-CACHE-10.
+//   - It does not LOAD Go plugin code. [skill.tools] names a module and
+//     factory that the host links at build time (REQ-PLUGIN-08), and
+//     MergeTools takes the tool values from the embedder. What it does do is
+//     REJECT a skill whose plugin source is present and imports agentkit
+//     internals, an LLM client library or a model API package (REQ-SKILL-09),
+//     by running plugins.LintSkillImports over the skill directory. Honest
+//     limit, per REQ-SEC-07: that is an IMPORT-PATH LINT, NOT A SANDBOX — an
+//     admitted skill's tools run in this process with these privileges.
+//
+//   - It does not spawn subagents or emit audit events; it produces the
+//     request and the list, and the runner acts (see the seams above).
+//
+//   - It does not decide WHEN a subagent step runs. [skill.subagent].mode is
+//     carried to the runner uninterpreted.
 package skills

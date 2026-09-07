@@ -344,19 +344,67 @@ func NormalizeToolCallID(s string) string {
 	return out
 }
 
+// Vertex is the Vertex AI deployment's coordinates (NFR-COMPAT-05). The zero
+// value is the Generative Language (API-key) deployment.
+//
+// NFR-COMPAT-05 requires that switching between the two is "only a config
+// change, not a provider swap", and the two differ in exactly three things:
+// host, path shape and credential. This type carries the second; ResolveVertex
+// derives it from the resolved base URL and the configured project/location,
+// so a deployment moves from AI Studio to Vertex by setting configuration
+// (Options.VertexProject/VertexLocation, GOOGLE_CLOUD_PROJECT, or a Vertex
+// base URL on the catalog row or GOOGLE_GEMINI_BASE_URL) and nothing else.
+// The credential is already handled: VendorAuth.Ambient reports ADC as
+// REQ-AUTH-04's ambient state rather than as "no key".
+type Vertex struct {
+	Project  string
+	Location string
+}
+
+// On reports whether the Vertex path shape applies. A project is the whole
+// signal: the Vertex path cannot be spelled without one.
+func (v Vertex) On() bool { return v.Project != "" }
+
+// BaseURL is the endpoint for this deployment's location. The global endpoint
+// has no regional prefix; every other location does.
+func (v Vertex) BaseURL() string {
+	if v.Location == "" || v.Location == VertexGlobalLocation {
+		return "https://" + vertexHostSuffix
+	}
+	return "https://" + v.Location + "-" + vertexHostSuffix
+}
+
 // Path returns the request path for a model. The model id is a URL SEGMENT on
 // this API, which is why request carries no model field.
 //
 // The streaming form appends ?alt=sse: without it, streamGenerateContent
 // answers with one enormous JSON ARRAY delivered incrementally, not SSE, and
 // an SSE reader waits for a data: line that never arrives.
-func Path(m *core.Model, stream bool) string {
-	id := strings.TrimPrefix(m.ID, "models/")
+//
+// The two shapes are the ONLY body-independent difference between the two
+// deployments (NFR-COMPAT-05):
+//
+//	AI Studio: /v1beta/models/{id}:generateContent
+//	Vertex:    /v1/projects/{p}/locations/{l}/publishers/google/models/{id}:generateContent
+func (v Vertex) Path(m *core.Model, stream bool) string {
+	verb := ":generateContent"
 	if stream {
-		return "/v1beta/models/" + id + ":streamGenerateContent?alt=sse"
+		verb = ":streamGenerateContent?alt=sse"
 	}
-	return "/v1beta/models/" + id + ":generateContent"
+	id := strings.TrimPrefix(m.ID, "models/")
+	if !v.On() {
+		return "/v1beta/models/" + id + verb
+	}
+	// The id is a bare model name here too: a "publishers/google/models/"
+	// prefix carried on a Vertex catalog row would otherwise be doubled.
+	id = strings.TrimPrefix(id, "publishers/google/models/")
+	return "/v1/projects/" + v.Project + "/locations/" + v.Location +
+		"/publishers/google/models/" + id + verb
 }
+
+// Path is the Generative Language path shape. It is the zero Vertex, kept as a
+// function because it is the shape every non-Vertex caller wants.
+func Path(m *core.Model, stream bool) string { return Vertex{}.Path(m, stream) }
 
 // ------------------------------------------------------------ request building
 
@@ -368,10 +416,57 @@ func Path(m *core.Model, stream bool) string {
 // provider contract, not the loop's, because the loop is not running when a
 // transcript is loaded from disk.
 func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairReport, error) {
+	out, rep, _, err := BuildRequestCached(m, req, nil)
+	return out, rep, err
+}
+
+// BuildRequestCached is BuildRequest with REQ-CACHE-06's per-session schema
+// cache attached. A nil prefix marshals every schema, which is what
+// BuildRequest does and what a one-shot caller wants.
+//
+// NFR-PERF-03 is why this exists rather than being an internal detail: tool
+// schema serialization "must be computed once per session and cached, not
+// recomputed on every model call". This wire is the one where that costs most:
+// ConvertSchema does not just marshal, it TRANSLATES — upper-casing types,
+// stripping rejected keywords, rewriting nullability — so re-deriving it every
+// turn re-pays a full walk of every schema for bytes that did not change. The
+// marshaller passed to SyncWith is this dialect's own; a cache keyed on the
+// canonical form would hand Gemini the wrong bytes.
+func BuildRequestCached(m *core.Model, req core.Request, prefix *provider.ToolPrefix) (
+	*request, provider.RepairReport, provider.SyncReport, error) {
+	var sync provider.SyncReport
 	compat := CompatFor(m)
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeToolCallID))
 
-	out := &request{Contents: encodeContents(repaired)}
+	// REQ-CACHE-10, third arm. This wire has neither Anthropic's
+	// defer_loading nor Responses' additional_tools, so a tool added
+	// mid-session is WITHHELD from the top-level declarations and re-declared
+	// at the transcript position where it appeared. Prepending it to the
+	// declarations instead would rewrite the cached prefix and cost the whole
+	// provider-side cache over one added tool.
+	split := provider.SplitDeferredTools(req.Tools, req.Messages)
+	// ONE Sync over the whole tool list, before the split. Syncing the two
+	// halves separately would make each call see the other half as removed —
+	// reporting a prefix invalidation on every turn and evicting the very
+	// entries the cache exists to keep.
+	schemas, srep, err := prefix.SyncWith(req.Tools, ConvertSchema)
+	if err != nil {
+		return nil, rep, sync, err
+	}
+	sync = srep
+	declOf := func(tw core.ToolWire) functionDeclaration {
+		var params json.RawMessage
+		for i, t := range req.Tools {
+			if t.Name == tw.Name {
+				params = schemas[i]
+				break
+			}
+		}
+		return functionDeclaration{Name: tw.Name, Description: tw.Description, Parameters: params}
+	}
+
+	out := &request{Contents: encodeContents(repaired, deferredNote(split, declOf),
+		deferredAnchor(repaired, split))}
 
 	// The system prompt is a top-level field, NOT a message. Prepending it as
 	// a content with role "system" is a 400 (there is no such role), and
@@ -395,17 +490,13 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 		out.GenerationConfig = gc
 	}
 
-	// ONE wrapper object holding every declaration (see toolSet).
-	if len(req.Tools) > 0 {
-		decls := make([]functionDeclaration, 0, len(req.Tools))
-		for _, tw := range req.Tools {
-			params, err := ConvertSchema(tw.InputSchema)
-			if err != nil {
-				return nil, rep, err
-			}
-			decls = append(decls, functionDeclaration{
-				Name: tw.Name, Description: tw.Description, Parameters: params,
-			})
+	// ONE wrapper object holding every declaration (see toolSet). Only the
+	// IMMEDIATE half is declared here (REQ-CACHE-10); the deferred half rode
+	// into the transcript above.
+	if len(split.Immediate) > 0 {
+		decls := make([]functionDeclaration, 0, len(split.Immediate))
+		for _, tw := range split.Immediate {
+			decls = append(decls, declOf(tw))
 		}
 		out.Tools = []toolSet{{FunctionDeclarations: decls}}
 	}
@@ -419,7 +510,65 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 		out.ToolConfig = &toolConfig{FunctionCallingConfig: functionCallingConfig{Mode: "NONE"}}
 	}
 
-	return out, rep, nil
+	return out, rep, sync, nil
+}
+
+// deferredNote renders REQ-CACHE-10's re-declaration.
+//
+// The declarations are rendered in the SAME dialect the tools array uses —
+// they come from the same schema cache — because a tool described in prose the
+// model has never seen in a declaration is a tool it will not call correctly.
+func deferredNote(split provider.DeferredSplit, declOf func(core.ToolWire) functionDeclaration) string {
+	if len(split.Deferred) == 0 {
+		return ""
+	}
+	decls := make([]functionDeclaration, 0, len(split.Deferred))
+	for _, tw := range split.Deferred {
+		decls = append(decls, declOf(tw))
+	}
+	raw, err := json.Marshal(decls)
+	if err != nil {
+		return ""
+	}
+	return "Additional tools became available at this point in the conversation " +
+		"and may be used from here on:\n" + string(raw)
+}
+
+// deferredAnchor is the message index the re-declaration follows: the last
+// message of the tool-result run that INTRODUCED the deferred tools.
+//
+// The position is the requirement — "declared at the transcript position where
+// they appeared, not prepended to the cached prompt prefix" — because
+// everything before it must stay byte-identical to the previous turn's
+// request. It returns -1 when no marker survives the repair pass, and the note
+// is then appended at the end, which is still after every tool result.
+func deferredAnchor(ms core.Messages, split provider.DeferredSplit) int {
+	anchor := -1
+	for i, m := range ms {
+		tr, ok := m.(core.ToolResultMessage)
+		if !ok {
+			continue
+		}
+		for _, name := range tr.AddedToolNames {
+			if split.IsDeferred(name) {
+				anchor = i
+				break
+			}
+		}
+	}
+	if anchor < 0 {
+		return -1
+	}
+	// Extend to the end of the run: the note goes after the WHOLE batch of
+	// results, not between two of them, or a parallel batch is split across
+	// two user contents and its results are re-paired by position.
+	for anchor+1 < len(ms) {
+		if _, ok := ms[anchor+1].(core.ToolResultMessage); !ok {
+			break
+		}
+		anchor++
+	}
+	return anchor
 }
 
 func encodeSystem(blocks []core.ContentBlock) *content {
@@ -454,7 +603,15 @@ func encodeSystem(blocks []core.ContentBlock) *content {
 //   - A ToolResultMessage whose ToolName is empty cannot be encoded from
 //     itself. The name is recovered from the tool_use it answers, which is why
 //     this function indexes the transcript first.
-func encodeContents(ms core.Messages) []content {
+//
+// note is REQ-CACHE-10's re-declaration of the deferred tools and rides as a
+// TEXT part immediately after the tool-result run at afterIdx. It is a part of
+// that user content rather than a content of its own because this wire has no
+// system role inside contents at all — systemInstruction is a top-level field
+// — and two adjacent user contents are the shape the coalescing below exists
+// to avoid. A part appended after the functionResponse parts is still, on the
+// wire, after the tool-result run, which is what the requirement asks for.
+func encodeContents(ms core.Messages, note string, afterIdx int) []content {
 	// id -> tool name, from the calls, for results that carry no name.
 	nameByID := make(map[string]string)
 	for _, m := range ms {
@@ -484,7 +641,7 @@ func encodeContents(ms core.Messages) []content {
 		out = append(out, content{Role: role, Parts: parts})
 	}
 
-	for _, m := range ms {
+	for i, m := range ms {
 		switch v := m.(type) {
 		case core.UserMessage:
 			appendTo(RoleUser, encodeParts(v.Content, nameByID)...)
@@ -506,6 +663,17 @@ func encodeContents(ms core.Messages) []content {
 				Name: name, Response: responseObject(v),
 			}})
 		}
+		if note != "" && i == afterIdx {
+			appendTo(RoleUser, part{Text: note})
+			note = ""
+		}
+	}
+	if note != "" {
+		// No surviving marker (the repair pass can drop the message that
+		// carried it). The end of the transcript is still after every tool
+		// result, and dropping the declaration entirely would leave the model
+		// with a tool it can neither see nor call.
+		appendTo(RoleUser, part{Text: note})
 	}
 	return out
 }

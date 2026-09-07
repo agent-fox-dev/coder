@@ -366,8 +366,16 @@ outer:
 
 			// A deferred response has no content and no tool calls, so under
 			// REQ-LOOP-01 it would exit the inner loop as "an empty
-			// completion" — the exact failure OQ-11 warns about. v1 has no
-			// poller, so say so instead of returning nothing (ruling P-50).
+			// completion" — the exact failure OQ-11 warns about.
+			//
+			// With a handle it is a CLEAN end (REQ-PROV-19): the receipt is
+			// on the message and in the session log, and the embedder redeems
+			// it with Agent.RedeemDeferred whenever it chooses. OQ-11 ships
+			// the handle and no poller, so the run does not wait.
+			//
+			// WITHOUT a handle there is nothing to redeem, and that is the
+			// empty completion the requirement exists to foreclose — so it
+			// stays an error (ruling P-50).
 			if assistant.StopReason == core.StopReasonDeferred {
 				a.setPhase(core.PhaseBetweenTurns)
 				turnCount++
@@ -378,7 +386,11 @@ outer:
 				te := core.TurnEndEvent{TurnIndex: turnCount - 1, Message: assistant, ToolResults: []core.ToolResultMessage{}, Usage: assistant.Usage}
 				s.Push(te)
 				a.fireTurnEnd(te)
-				runReason, runErr = core.RunStopError, core.ErrDeferredUnsupported
+				if assistant.Deferred != nil && !assistant.Deferred.IsZero() {
+					runReason = core.RunStopDeferred
+				} else {
+					runReason, runErr = core.RunStopError, core.ErrDeferredUnsupported
+				}
 				break outer
 			}
 
@@ -534,6 +546,9 @@ func (a *Agent) callModel(ctx context.Context, out *core.EventStream, view core.
 		ThinkingLevel:    cfg.ThinkingLevel,
 		EstContextTokens: EstimateContextTokens(view, checkpointOf(a.history)),
 		Options:          cfg.RequestOptions,
+		// REQ-PROV-19: carried from the options a caller can actually set
+		// onto the field a provider reads.
+		Deferred: cfg.RequestOptions.Deferred,
 	}
 	// The assembled prompt, not the raw field: per-tool guidelines
 	// (NFR-TEST-08a) and REQ-TOOL-04e's conditional guideline are only visible

@@ -45,19 +45,36 @@ type Options struct {
 	// store falls through, so adding one never breaks a working env setup.
 	Credentials  *provider.Credentials
 	MaxLineBytes int
+	// ToolPrefix is REQ-CACHE-06's per-session schema cache. Nil means this
+	// provider value owns one, which is the right scope in practice: a
+	// registry is built per agent config. Pass one explicitly to share it, or
+	// to read its reconciliation reports.
+	ToolPrefix *provider.ToolPrefix
+	// OnToolPrefixSync reports each reconciliation, so an embedder can feed
+	// REQ-CACHE-11's prefix-invalidation counter.
+	OnToolPrefixSync func(provider.SyncReport)
 }
 
 func Provider(opts Options) core.APIProvider {
-	c := &client{opts: opts}
+	c := &client{opts: opts, prefix: opts.ToolPrefix}
+	if c.prefix == nil {
+		c.prefix = &provider.ToolPrefix{}
+	}
 	return core.APIProvider{API: API, Stream: c.Stream}
 }
 
-type client struct{ opts Options }
+type client struct {
+	opts   Options
+	prefix *provider.ToolPrefix
+}
 
 func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o core.ProviderStreamOptions) *core.EventStream {
-	body, rep, err := BuildRequest(m, req)
+	body, rep, sync, err := BuildRequestCached(m, req, c.prefix)
 	if err != nil {
 		return core.ErrorStream(nil, fmt.Errorf("ollama: building request: %w", err))
+	}
+	if fn := c.opts.OnToolPrefixSync; fn != nil {
+		fn(sync)
 	}
 	if rep.Changed() && o.Warnf != nil {
 		o.Warnf("ollama: %s", rep.String())

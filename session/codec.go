@@ -373,7 +373,7 @@ var (
 	assistantKnown = []string{
 		msgKeyRole, "content", "stop_reason", "raw_stop_reason", "error_message",
 		"usage", "provider", "api", "model", "response_model", "response_id",
-		"thinking_level", msgKeyTime,
+		"thinking_level", "deferred", msgKeyTime,
 	}
 	toolResultKnown = []string{
 		msgKeyRole, "tool_use_id", "tool_name", "content", "is_error",
@@ -411,6 +411,12 @@ func encodeMessage(m core.Message) jsonx.OrderedValue {
 		setString(&o, "response_model", v.ResponseModel)
 		setString(&o, "response_id", v.ResponseID)
 		setString(&o, "thinking_level", string(v.ThinkingLevel))
+		// REQ-PROV-19: the handle is persisted with the message, because a
+		// deferred submission whose receipt died with the process is an
+		// answer nobody can collect.
+		if v.Deferred != nil {
+			o.Set("deferred", encodeDeferred(*v.Deferred))
+		}
 		setTime(&o, msgKeyTime, v.Timestamp)
 		appendRest(&o, v.Unknown)
 	case core.ToolResultMessage:
@@ -473,6 +479,10 @@ func decodeMessage(v jsonx.OrderedValue) (core.Message, error) {
 		if u, ok := getObject(o, "usage"); ok {
 			m.Usage = decodeUsage(u)
 		}
+		if d, ok := getObject(o, "deferred"); ok {
+			h := decodeDeferred(d)
+			m.Deferred = &h
+		}
 		return m, nil
 	case core.RoleToolResult:
 		m := core.ToolResultMessage{
@@ -506,4 +516,56 @@ func decodeMessage(v jsonx.OrderedValue) (core.Message, error) {
 // keeping a second, drifting copy of it.
 func EncodeMessage(m core.Message) (json.RawMessage, error) {
 	return json.Marshal(encodeMessage(m))
+}
+
+// encodeDeferred renders the REQ-PROV-19 receipt. `data` is provider-opaque
+// and is carried through as the bytes it arrived as — the SDK stores and
+// replays it and never inspects it, the same rule that governs thinking
+// signatures.
+func encodeDeferred(h core.DeferredHandle) jsonx.OrderedValue {
+	var o jsonx.OrderedObject
+	setString(&o, "provider", h.Provider)
+	setString(&o, "api", string(h.API))
+	setString(&o, "model_id", h.ModelID)
+	setString(&o, "id", h.ID)
+	setTime(&o, "expires_at", h.ExpiresAt)
+	if h.PollAfterMS != 0 {
+		o.Set("poll_after_ms", intValue(int64(h.PollAfterMS)))
+	}
+	if len(h.Data) > 0 {
+		if v, err := jsonx.DecodeOrdered(h.Data); err == nil {
+			o.Set("data", v)
+		}
+	}
+	return jsonx.OrderedValue{Kind: jsonx.KindObject, Object: o}
+}
+
+func decodeDeferred(o jsonx.OrderedObject) core.DeferredHandle {
+	h := core.DeferredHandle{
+		Provider:  getString(o, "provider"),
+		API:       core.API(getString(o, "api")),
+		ModelID:   getString(o, "model_id"),
+		ID:        getString(o, "id"),
+		ExpiresAt: getTime(o, "expires_at"),
+	}
+	if n, ok := getInt(o, "poll_after_ms"); ok {
+		h.PollAfterMS = int(n)
+	}
+	if v, ok := o.Get("data"); ok {
+		if b, err := v.MarshalJSON(); err == nil {
+			h.Data = b
+		}
+	}
+	return h
+}
+
+// DecodeMessage is the inverse of EncodeMessage: it reads one canonical
+// message back from the session log's shape, retaining keys this build does
+// not model so a re-encode is lossless (NFR-TEST-03).
+func DecodeMessage(raw json.RawMessage) (core.Message, error) {
+	v, err := jsonx.DecodeOrdered(raw)
+	if err != nil {
+		return nil, err
+	}
+	return decodeMessage(v)
 }

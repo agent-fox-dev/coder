@@ -47,6 +47,18 @@ func (e *UnresolvedVariableError) namesList() string {
 // Pool is REQ-MCP-CLIENT-04: server_name -> connection, built during session
 // initialization and torn down when the session ends.
 type Pool struct {
+	// NativeTools names the host's OWN tools, which no MCP server may shadow
+	// (REQ-MCP-CLIENT-06). The embedder populates it before connecting —
+	// it is the only party that knows what its native tool set is called.
+	//
+	// It exists because the check in Tools is not enough on its own: a host
+	// that connects its servers and never calls Tools (it drives connections
+	// directly, or assembles its tool list some other way) would ship a server
+	// whose `read_file` silently stands in front of the SDK's, and find out
+	// when the model called it. With this set, the same misconfiguration is a
+	// refused connection at startup.
+	NativeTools []string
+
 	mu    sync.Mutex
 	conns map[string]*ServerConnection
 	order []string
@@ -116,6 +128,10 @@ func (p *Pool) Connect(ctx context.Context, cfg ServerConfig, env []string, secr
 		_ = c.Close()
 		return nil, err
 	}
+	if err := p.refuseShadowedNames(ctx, c); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
 	// Reconnection is armed only AFTER discovery succeeded. A server that
 	// dies while being discovered is misconfigured, and re-spawning it three
 	// more times would report the same failure three times later.
@@ -160,6 +176,10 @@ func (p *Pool) connectHTTP(ctx context.Context, cfg ServerConfig, env []string, 
 
 	c := NewConnection(cfg, tr, p.opts)
 	if err := c.Discover(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := p.refuseShadowedNames(ctx, c); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -212,16 +232,68 @@ func (p *Pool) Close() error {
 	return nil
 }
 
+// refuseShadowedNames is REQ-MCP-CLIENT-06 raised at CONNECTION time.
+//
+// A shadowed native tool is a misconfiguration, and the cost of noticing it
+// late is not a confusing error — it is the WRONG TOOL having run, because the
+// model called `read_file` and a server answered. So the server's tool list is
+// pulled once, here, while the connection can still be torn down, rather than
+// at the first call.
+//
+// A server is listed only when there is something to shadow: with no native
+// names declared this costs nothing, and a host that has not told the pool
+// what its tools are called keeps the behaviour it had before.
+func (p *Pool) refuseShadowedNames(ctx context.Context, c *ServerConnection) error {
+	native := p.nativeNames()
+	if len(native) == 0 {
+		return nil
+	}
+	defs, err := c.ListTools(ctx)
+	if err != nil {
+		// Not verifiable is not the same as fine: a server whose list failed
+		// may expose anything, and the connection has not been added yet.
+		return fmt.Errorf("mcp: %s: listing tools to check for name collisions: %w",
+			c.Name(), err)
+	}
+	sort.SliceStable(defs, func(i, j int) bool { return defs[i].Name < defs[j].Name })
+	for _, d := range defs {
+		if qualified := QualifiedName(c.cfg, d.Name); native[qualified] {
+			return fmt.Errorf("%w: server %q exposes %q as %q, which is already a native tool",
+				ErrNameCollision, c.Name(), d.Name, qualified)
+		}
+	}
+	return nil
+}
+
+// nativeNames snapshots the declared native tool names as a set.
+func (p *Pool) nativeNames() map[string]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.NativeTools) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(p.NativeTools))
+	for _, n := range p.NativeTools {
+		out[n] = true
+	}
+	return out
+}
+
 // Tools adapts every connected server's tools into core.Tools with qualified
 // names (REQ-MCP-CLIENT-05).
 //
-// existing is the native tool set. A qualified name that collides with one is
-// ErrNameCollision (REQ-MCP-CLIENT-06), raised HERE — at connection time —
-// rather than when the model happens to call it, because a shadowed native
-// tool is a misconfiguration and discovering it at call time means
-// discovering it in production.
+// existing is the native tool set. A qualified name that collides with one —
+// or with a name in NativeTools, or with another server's — is
+// ErrNameCollision (REQ-MCP-CLIENT-06). This is the BACKSTOP: the collision is
+// raised at connect (refuseShadowedNames) for everything the pool knew about
+// then, and again here for the native tools a host registers afterwards and
+// for the tools a server grows during the session, neither of which a
+// connect-time check can see.
 func (p *Pool) Tools(ctx context.Context, existing []core.Tool) ([]core.Tool, error) {
 	taken := make(map[string]string, len(existing))
+	for name := range p.nativeNames() {
+		taken[name] = "a native tool"
+	}
 	for _, t := range existing {
 		taken[t.Name] = "a native tool"
 	}

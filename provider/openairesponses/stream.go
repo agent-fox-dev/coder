@@ -29,7 +29,15 @@ type Options struct {
 	// It is a client option rather than a per-request field because the tier
 	// is an account-level commercial arrangement, not something a turn
 	// chooses. A zero Multiplier leaves cost untouched.
-	ServiceTier      provider.ServiceTier
+	ServiceTier provider.ServiceTier
+	// ToolPrefix is REQ-CACHE-06's per-session schema cache. Nil means this
+	// provider value owns one, which is the right scope in practice: a
+	// registry is built per agent config. Pass one explicitly to share it, or
+	// to read its reconciliation reports.
+	ToolPrefix *provider.ToolPrefix
+	// OnToolPrefixSync reports each reconciliation, so an embedder can feed
+	// REQ-CACHE-11's prefix-invalidation counter.
+	OnToolPrefixSync func(provider.SyncReport)
 	MaxSSEEventBytes int
 }
 
@@ -42,16 +50,25 @@ func AuthFor(vendor string) provider.VendorAuth { return openai.AuthFor(vendor) 
 
 // Provider returns the registry entry (REQ-PROV-09).
 func Provider(opts Options) core.APIProvider {
-	c := &client{opts: opts}
+	c := &client{opts: opts, prefix: opts.ToolPrefix}
+	if c.prefix == nil {
+		c.prefix = &provider.ToolPrefix{}
+	}
 	return core.APIProvider{API: API, Stream: c.Stream}
 }
 
-type client struct{ opts Options }
+type client struct {
+	opts   Options
+	prefix *provider.ToolPrefix
+}
 
 func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o core.ProviderStreamOptions) *core.EventStream {
-	body, rep, err := BuildRequest(m, req)
+	body, rep, sync, err := BuildRequestCached(m, req, c.prefix)
 	if err != nil {
 		return core.ErrorStream(nil, fmt.Errorf("openai-responses: building request: %w", err))
+	}
+	if fn := c.opts.OnToolPrefixSync; fn != nil {
+		fn(sync)
 	}
 	if rep.Changed() && o.Warnf != nil {
 		o.Warnf("openai-responses: %s", rep.String())

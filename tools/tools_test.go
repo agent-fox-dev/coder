@@ -335,6 +335,64 @@ func TestGrandchildDoesNotSurviveTreeKill(t *testing.T) {
 	}
 }
 
+// TestDetachedDescendantOutputIsDrainedOnAReArmingTimer is REQ-TOOL-17.5.
+//
+// It is the inverse of the test above and the two are the whole contract:
+// there, a descendant must not SURVIVE a kill; here, a descendant that
+// legitimately outlives its parent must still have every byte it writes
+// drained. The grandchild writes for longer than any fixed post-exit deadline
+// (the old code closed the pipe 2s after the child exited), so a drain that
+// does not re-arm on each read loses the tail of the log — which in production
+// is the half of a background job's output that says what went wrong.
+func TestDetachedDescendantOutputIsDrainedOnAReArmingTimer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fractional sleep in a background job is not portable to the Windows shell")
+	}
+	if _, _, err := ResolveShell(); err != nil {
+		t.Skip("no shell available")
+	}
+	// The parent shell exits IMMEDIATELY — it does not wait for the job — so
+	// every line after the first arrives on a pipe whose only remaining writer
+	// is a process the tool never started.
+	const lines = 30
+	cmd := fmt.Sprintf(`( i=0; while [ $i -lt %d ]; do echo "late-$i"; sleep 0.1; i=$((i+1)); done ) &`, lines)
+
+	type outcome struct {
+		res ExecResult
+		err error
+	}
+	ch := make(chan outcome, 1)
+	go func() {
+		res, err := Run(context.Background(), cmd, ExecOptions{
+			MaxBytes: 1 << 16,
+			// Shortened only to keep the test quick. The property under test
+			// is that output ARRIVING inside the window re-arms it; the
+			// grandchild writes every 100ms for ~3s, so a non-re-arming drain
+			// of any length under 3s truncates it.
+			DrainIdle: 500 * time.Millisecond,
+		})
+		ch <- outcome{res, err}
+	}()
+
+	var got outcome
+	select {
+	case got = <-ch:
+	case <-time.After(30 * time.Second):
+		// A re-arming timer must still terminate: DrainCeiling is the bound.
+		t.Fatal("Run never returned; the post-exit drain must be bounded")
+	}
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	for _, want := range []string{"late-0", fmt.Sprintf("late-%d", lines-1)} {
+		if !strings.Contains(got.res.Output, want) {
+			t.Fatalf("output is missing %q:\n%s\n\nAfter the child exits, output must be "+
+				"drained on a RE-ARMING idle timer, not a fixed post-exit deadline "+
+				"(REQ-TOOL-17.5).", want, got.res.Output)
+		}
+	}
+}
+
 func TestExecuteDoesNotLeakAPIKeys(t *testing.T) {
 	env := ReducedEnv([]string{
 		"PATH=/usr/bin:/bin",

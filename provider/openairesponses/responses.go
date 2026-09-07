@@ -38,7 +38,13 @@ type request struct {
 	Instructions string `json:"instructions,omitzero"`
 	Input        []item `json:"input"`
 	Tools        []tool `json:"tools,omitzero"`
-	ToolChoice   string `json:"tool_choice,omitzero"`
+	// AdditionalTools is REQ-CACHE-10's Responses arm: a tool that appeared
+	// MID-SESSION is declared here instead of in `tools`, so the cached prompt
+	// prefix — of which `tools` is the head — stays byte-identical to the
+	// previous turn's. Prepending one added tool to `tools` invalidates the
+	// entire provider-side cache for the rest of the session.
+	AdditionalTools []tool `json:"additional_tools,omitzero"`
+	ToolChoice      string `json:"tool_choice,omitzero"`
 
 	MaxOutputTokens *int     `json:"max_output_tokens,omitzero"`
 	Temperature     *float64 `json:"temperature,omitzero"`
@@ -202,6 +208,21 @@ func CompatFor(m *core.Model) Compat {
 
 // BuildRequest translates a canonical request onto the Responses wire.
 func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairReport, error) {
+	out, rep, _, err := BuildRequestCached(m, req, nil)
+	return out, rep, err
+}
+
+// BuildRequestCached is BuildRequest with REQ-CACHE-06's per-session schema
+// cache attached. A nil prefix marshals every schema, which is what
+// BuildRequest does and what a one-shot caller wants.
+//
+// NFR-PERF-03 is why this is on the request path rather than an internal
+// detail: "tool schema serialization must be computed once per session and
+// cached, not recomputed on every model call", and this wire was
+// re-serializing every schema on every turn for bytes that had not changed.
+func BuildRequestCached(m *core.Model, req core.Request,
+	prefix *provider.ToolPrefix) (*request, provider.RepairReport, provider.SyncReport, error) {
+	var sync provider.SyncReport
 	compat := CompatFor(m)
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeCallID))
 
@@ -226,12 +247,41 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 	out.Input = append(out.Input, encodeItems(repaired, compat)...)
 
 	out.MaxOutputTokens = clampTokens(m, req)
-	for _, t := range req.Tools {
-		enc, err := encodeTool(t, compat)
-		if err != nil {
-			return nil, rep, err
+
+	// REQ-CACHE-06/NFR-PERF-03: ONE Sync over the WHOLE tool list, before the
+	// REQ-CACHE-10 split. Syncing the two halves separately would make each
+	// call see the other half as removed — a reported prefix invalidation on
+	// every turn, evicting the entries the cache exists to keep.
+	schemas, strict, srep, err := encodeSchemas(req.Tools, compat.SupportsFunctionStrict, prefix)
+	if err != nil {
+		return nil, rep, sync, err
+	}
+	sync = srep
+	index := make(map[string]int, len(req.Tools))
+	for i, tw := range req.Tools {
+		index[tw.Name] = i
+	}
+	encode := func(tw core.ToolWire) tool {
+		i := index[tw.Name]
+		// FLAT, unlike the Chat Completions wire's nested `function` object.
+		out := tool{Type: "function", Name: tw.Name, Description: tw.Description,
+			Parameters: schemas[i]}
+		if strict[i] {
+			yes := true
+			out.Strict = &yes
 		}
-		out.Tools = append(out.Tools, enc)
+		return out
+	}
+	// REQ-CACHE-10: a tool the transcript introduced mid-session rides in
+	// additional_tools; everything else stays in the cached `tools` prefix.
+	// SplitDeferredTools owns the safety valve — with nothing immediate there
+	// is no prefix to anchor against and every tool is promoted back.
+	split := provider.SplitDeferredTools(req.Tools, req.Messages)
+	for _, tw := range split.Immediate {
+		out.Tools = append(out.Tools, encode(tw))
+	}
+	for _, tw := range split.Deferred {
+		out.AdditionalTools = append(out.AdditionalTools, encode(tw))
 	}
 	if req.ToolChoice.IsSet() {
 		// The same two words as the Chat Completions wire, and unlike it a
@@ -241,7 +291,7 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 	}
 	applyReasoning(out, m, req, compat)
 	applyCaching(out, req, compat)
-	return out, rep, nil
+	return out, rep, sync, nil
 }
 
 // clampTokens is REQ-CAT-04 for this wire: the caller's bound, else the
@@ -260,45 +310,83 @@ func clampTokens(m *core.Model, req core.Request) *int {
 	return &limit
 }
 
-// encodeTool is REQ-TOOL-03 for this wire: the schema is PROBED through the
-// strict-subset rewrite before anything is sent, and strict:true rides only
-// on the rewritten schema. A bare strict:true on the raw schema is rejected
-// the moment a tool has an optional property or a $ref, and the 400 kills the
-// whole request. `prefer` falls back to unconstrained; `require` fails the
-// request with the rejection reason (a pre-closed error stream, REQ-PROV-04).
-// Emission is gated on the profile's SupportsFunctionStrict (REQ-PROV-12).
-func encodeTool(t core.ToolWire, compat Compat) (tool, error) {
-	// FLAT, unlike the Chat Completions wire's nested `function` object.
-	out := tool{Type: "function", Name: t.Name, Description: t.Description}
-	cs := t.ConstrainedSampling
-	if cs != nil && cs.Type == core.ConstrainJSONSchema {
-		var rewritten *schema.Schema
-		var err error
-		if !compat.SupportsFunctionStrict {
-			err = fmt.Errorf("agentkit: this endpoint's compat profile does not support strict tool schemas")
+// encodeSchemas serializes every tool's parameters THROUGH the session's
+// schema prefix (REQ-CACHE-06, NFR-PERF-03) and returns the per-tool strict
+// flag alongside.
+//
+// The strict-subset rewrite is decided here rather than inside the marshaller
+// because it is a property of the TOOL — its ConstrainedSampling — and the
+// Marshaller signature is schema in, bytes out. The decision is carried into
+// the marshaller by schema pointer, which is the identity the prefix itself
+// uses. A schema VALUE shared by two tools that disagree about constrained
+// sampling would need two encodings under one identity; that request falls
+// back to the uncached path rather than serving one tool the other's bytes.
+func encodeSchemas(tools []core.ToolWire, supportsStrict bool,
+	prefix *provider.ToolPrefix) ([]json.RawMessage, []bool, provider.SyncReport, error) {
+	var sync provider.SyncReport
+	strict := make([]bool, len(tools))
+	plan := make(map[*schema.Schema]*schema.Schema, len(tools))
+	mode := make(map[*schema.Schema]bool, len(tools))
+	conflict := false
+
+	for i, tw := range tools {
+		target, err := strictTarget(tw, supportsStrict)
+		if err != nil {
+			return nil, nil, sync, err
+		}
+		if target != nil {
+			strict[i] = true
 		} else {
-			rewritten, err = schema.StrictSubset(t.InputSchema)
+			target = tw.InputSchema
 		}
-		switch {
-		case err == nil:
-			raw, merr := json.Marshal(rewritten)
-			if merr != nil {
-				return tool{}, merr
-			}
-			yes := true
-			out.Parameters, out.Strict = raw, &yes
-			return out, nil
-		case cs.Strict == core.StrictRequire:
-			return tool{}, fmt.Errorf("tool %q requires constrained sampling: %w", t.Name, err)
+		if prev, ok := mode[tw.InputSchema]; ok && prev != strict[i] {
+			conflict = true
 		}
-		// prefer: fall through to the unconstrained schema.
+		mode[tw.InputSchema] = strict[i]
+		plan[tw.InputSchema] = target
 	}
-	raw, err := json.Marshal(t.InputSchema)
-	if err != nil {
-		return tool{}, err
+
+	p := prefix
+	if conflict {
+		p = nil
 	}
-	out.Parameters = raw
-	return out, nil
+	raws, rep, err := p.SyncWith(tools, func(s *schema.Schema) (json.RawMessage, error) {
+		if t, ok := plan[s]; ok {
+			s = t
+		}
+		return json.Marshal(s)
+	})
+	return raws, strict, rep, err
+}
+
+// strictTarget is REQ-TOOL-03 for this wire: the schema is PROBED through the
+// strict-subset rewrite before anything is sent, and strict:true rides only on
+// the rewritten schema, which is what this returns (nil means no strict). A
+// bare strict:true on the raw schema is rejected the moment a tool has an
+// optional property or a $ref, and the 400 kills the whole request. `prefer`
+// falls back to unconstrained; `require` fails the request with the rejection
+// reason (a pre-closed error stream, REQ-PROV-04). Emission is gated on the
+// profile's SupportsFunctionStrict (REQ-PROV-12).
+func strictTarget(t core.ToolWire, supportsStrict bool) (*schema.Schema, error) {
+	cs := t.ConstrainedSampling
+	if cs == nil || cs.Type != core.ConstrainJSONSchema {
+		return nil, nil
+	}
+	var rewritten *schema.Schema
+	var err error
+	if !supportsStrict {
+		err = fmt.Errorf("agentkit: this endpoint's compat profile does not support strict tool schemas")
+	} else {
+		rewritten, err = schema.StrictSubset(t.InputSchema)
+	}
+	switch {
+	case err == nil:
+		return rewritten, nil
+	case cs.Strict == core.StrictRequire:
+		return nil, fmt.Errorf("tool %q requires constrained sampling: %w", t.Name, err)
+	}
+	// prefer: fall through to the unconstrained schema.
+	return nil, nil
 }
 
 // systemText flattens the canonical system blocks.

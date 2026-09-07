@@ -95,17 +95,31 @@ type Options struct {
 	Credentials *provider.Credentials
 	// Auth overrides the per-vendor table for a vendor this build does not
 	// know. Nil uses AuthFor(model.Provider).
-	Auth             *provider.VendorAuth
+	Auth *provider.VendorAuth
+	// ToolPrefix is REQ-CACHE-06's per-session schema cache. Nil means this
+	// provider value owns one, which is the right scope in practice: a
+	// registry is built per agent config. Pass one explicitly to share it, or
+	// to read its reconciliation reports.
+	ToolPrefix *provider.ToolPrefix
+	// OnToolPrefixSync reports each reconciliation, so an embedder can feed
+	// REQ-CACHE-11's prefix-invalidation counter.
+	OnToolPrefixSync func(provider.SyncReport)
 	MaxSSEEventBytes int
 }
 
 // Provider returns the registry entry (REQ-PROV-09).
 func Provider(opts Options) core.APIProvider {
-	c := &client{opts: opts}
+	c := &client{opts: opts, prefix: opts.ToolPrefix}
+	if c.prefix == nil {
+		c.prefix = &provider.ToolPrefix{}
+	}
 	return core.APIProvider{API: API, Stream: c.Stream}
 }
 
-type client struct{ opts Options }
+type client struct {
+	opts   Options
+	prefix *provider.ToolPrefix
+}
 
 func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o core.ProviderStreamOptions) *core.EventStream {
 	retention := core.CacheRetentionShort
@@ -115,9 +129,12 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 	if r := req.Options.CacheRetention; r != nil {
 		retention = *r
 	}
-	body, rep, compat, err := buildRequest(m, req, retention)
+	body, rep, compat, sync, err := buildRequest(m, req, retention, c.prefix)
 	if err != nil {
 		return core.ErrorStream(nil, fmt.Errorf("openai: building request: %w", err))
+	}
+	if fn := c.opts.OnToolPrefixSync; fn != nil {
+		fn(sync)
 	}
 	if rep.Changed() && o.Warnf != nil {
 		o.Warnf("openai: %s", rep.String())
@@ -338,6 +355,12 @@ type wireChunk struct {
 	} `json:"error"`
 }
 
+// ReasoningContentSignature marks a thinking block that this wire CAN replay:
+// see the reasoning case in snapshot. It is not a credential and carries no
+// provider state; the vendors with no documented replay leave the signature
+// empty so REQ-PROV-11 rule 4 degrades the block to text.
+const ReasoningContentSignature = "openai-completions/reasoning_content"
+
 // ---------------------------------------------------------------- assembler
 
 type slot struct {
@@ -532,12 +555,24 @@ func (d *decoder) snapshot() core.Content {
 		case "text":
 			out = append(out, core.TextBlock{Text: s.text.String()})
 		case "reasoning":
-			// No signature: this wire carries none, and REQ-PROV-11 rule 4
-			// will demote it to plain text on replay. That is the correct
-			// outcome — replaying unsigned reasoning as reasoning is what the
-			// rule exists to prevent — and the compat profile's ThinkingFormat
-			// is where a vendor that DOES round-trip it belongs.
-			out = append(out, core.ThinkingBlock{Thinking: s.text.String()})
+			// This wire carries no signature of its own, and REQ-PROV-11
+			// rule 4 demotes an unsigned thinking block to plain text on
+			// replay. That is the correct outcome everywhere except the one
+			// profile that documents a round trip: DeepSeek reads
+			// reasoning_content back on the assistant message, and rule 4
+			// would strip exactly the block it wants (REQ-PROV-12
+			// ThinkingFormat).
+			//
+			// A signature is provider-issued and opaque — never inspected
+			// outside its own provider — so this one is a MARKER, not a
+			// credential. It survives rule 4 for a same-model replay and is
+			// downgraded to text by rule 3 for any other model, which is
+			// precisely the intended reach of a format-specific round trip.
+			tb := core.ThinkingBlock{Thinking: s.text.String()}
+			if d.compat.ThinkingFormat == "deepseek" {
+				tb.Signature = ReasoningContentSignature
+			}
+			out = append(out, tb)
 		case "tool":
 			raw := json.RawMessage(s.args.String())
 			if repaired, changed := provider.SalvageJSON(raw); changed {

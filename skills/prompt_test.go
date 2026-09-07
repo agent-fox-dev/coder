@@ -185,7 +185,7 @@ func TestASkillsBodyIsNeverInTheSystemPrompt(t *testing.T) {
 	writeFile(t, filepath.Join(dir, PromptName), "SECRET-BODY-MARKER\n"+strings.Repeat("filler\n", 500))
 
 	reg := Discover(Config{HomeDir: home})
-	out := Assemble(Input{Skills: reg.LoadForSession("", ""), Tools: []core.Tool{tool("read_file")}})
+	out := Assemble(Input{Skills: reg.LoadForSession("", "", reg.Config()), Tools: []core.Tool{tool("read_file")}})
 	if strings.Contains(out, "SECRET-BODY-MARKER") {
 		t.Fatalf("the skill body reached the prompt:\n%s", out)
 	}
@@ -210,7 +210,7 @@ func TestAnUntrustedProjectSkillIsAbsentFromTheAssembledPrompt(t *testing.T) {
 	reg := Discover(cfg)
 	files, _ := DiscoverContext(cfg)
 	out := Assemble(Input{
-		Skills:       reg.LoadForSession("", ""),
+		Skills:       reg.LoadForSession("", "", reg.Config()),
 		ContextFiles: files,
 		Tools:        []core.Tool{tool("read_file"), tool("execute")},
 	})
@@ -229,7 +229,7 @@ func TestAnUntrustedProjectSkillIsAbsentFromTheAssembledPrompt(t *testing.T) {
 	reg = Discover(cfg)
 	files, _ = DiscoverContext(cfg)
 	out = Assemble(Input{
-		Skills:       reg.LoadForSession("", ""),
+		Skills:       reg.LoadForSession("", "", reg.Config()),
 		ContextFiles: files,
 		Tools:        []core.Tool{tool("read_file")},
 	})

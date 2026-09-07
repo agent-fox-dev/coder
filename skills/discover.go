@@ -299,6 +299,18 @@ func loadSkill(dir string, tier Tier) (Skill, []Diagnostic, error) {
 		return Skill{}, diags, fmt.Errorf("%s is not a regular file", PromptName)
 	}
 
+	// REQ-SKILL-09: a skill that declares plugin code is import-linted BEFORE
+	// it is admitted, and a violation rejects the skill rather than warning
+	// about it. The check sits here, next to the symlink rules of REQ-SEC-06,
+	// because both answer the same question — may this directory's content
+	// enter the process at all — and a check placed later would run after
+	// something had already used the skill.
+	ldiags, err := lintPluginSource(dir, m)
+	diags = append(diags, ldiags...)
+	if err != nil {
+		return Skill{}, diags, err
+	}
+
 	return Skill{Manifest: m, Dir: dir, PromptPath: promptPath, Tier: tier}, diags, nil
 }
 
@@ -319,31 +331,91 @@ func (r *Registry) Names() []string {
 	return out
 }
 
-// LoadForSession is REQ-SKILL-05's selector.
+// Config returns the configuration discovery ran with, so the usual call
+// reads reg.LoadForSession(archetype, task, reg.Config()) and an embedder that
+// wants the selection gated more narrowly than discovery was passes its own.
+func (r *Registry) Config() Config { return r.cfg }
+
+// LoadForSession is REQ-SKILL-05's selector, with the requirement's own
+// signature: it applies the archetype filter AND the trust gate carried by the
+// config it is given.
 //
-// Two deviations from the literal signature, both deliberate:
+// The gate is applied TWICE, here and at Discover, and that is deliberate
+// rather than redundant. Discovery refuses to READ an untrusted project
+// directory, so untrusted bytes never enter the process; this second
+// application is what makes the gate travel with the CALL, so a registry
+// discovered once — a long-lived process, a cached registry — can serve a
+// session that has not established project trust without leaking the skills a
+// trusted session may use.
 //
-//  1. There is no config parameter. The trust gate ran at discovery, so the
-//     registry already holds only material the embedder admitted. Taking a
-//     config here would imply the gate could be re-decided after the untrusted
-//     bytes were already read, which is the wrong shape for a security check.
+// Its consequence is worth stating plainly because it is the fail-closed half:
+// a skill is admitted only if cfg still names the root it was found under. A
+// zero Config therefore selects NOTHING. That is the correct default for a
+// security gate — a caller that passes no roots has authorized no roots — and
+// it is why Config() exists for the caller who just wants what discovery
+// found.
 //
-//  2. taskPrompt is accepted and IGNORED, and that is the point of
-//     REQ-SKILL-06. Keyword triggering was removed from the manifest, so
-//     nothing here matches the task text against the skill: the MODEL chooses,
-//     from the description, at the moment it needs the skill. The parameter
-//     stays so the call site reads as the PRD writes it and so a future
-//     ranking pass has somewhere to live.
-func (r *Registry) LoadForSession(archetype, taskPrompt string) []Skill {
+// taskPrompt is accepted and IGNORED, and that is REQ-SKILL-06 working as
+// intended, not an unfinished feature. REQ-SKILL-03 removed `keywords`, so
+// nothing in a manifest describes what task text a skill matches, and
+// inventing a match here — substring, stemming, embeddings — would be this
+// package guessing at a decision progressive disclosure hands to the MODEL,
+// which reads the descriptions and picks. What would give the parameter
+// meaning is a ranking input the manifest does not have today: a restored
+// trigger field, or an embedder-supplied ranker scoring descriptions against
+// the task to cap how many skills a large library offers at once. The
+// parameter stays so the call site reads as the PRD writes it and so that
+// ranking, when it exists, has a signature to land in.
+func (r *Registry) LoadForSession(archetype, taskPrompt string, cfg Config) []Skill {
 	_ = taskPrompt
 	out := make([]Skill, 0, len(r.skills))
 	for _, s := range r.skills {
 		if !matchesArchetype(s, archetype) {
 			continue
 		}
+		if !cfg.admits(s) {
+			continue
+		}
 		out = append(out, s)
 	}
 	return out
+}
+
+// admits re-applies REQ-SKILL-05's trust gate to an already-discovered skill:
+// the skill's tier must still be enabled by this config, and the skill must
+// still live directly under that tier's root. Comparing the ROOT rather than
+// just the tier is what stops a registry built from one project's config from
+// serving another project's skills to a session configured for neither.
+func (c Config) admits(s Skill) bool {
+	switch s.Tier {
+	case TierBuiltin:
+		return c.BuiltinDir != "" && rooted(c.BuiltinDir, s.Dir)
+	case TierUser:
+		dir, ok := c.UserSkillsDir()
+		return ok && rooted(dir, s.Dir)
+	case TierProject:
+		// The gate itself: ProjectSkillsDir returns false when TrustProject is
+		// unset, so an untrusted config drops every project skill.
+		dir, ok := c.ProjectSkillsDir()
+		return ok && rooted(dir, s.Dir)
+	}
+	return false
+}
+
+// rooted reports whether a skill directory sits directly under root. Skills
+// are one level down by construction (scanTier reads the root's entries), so
+// this is a parent comparison and not a prefix test — a prefix test would also
+// accept "<root>x/evil".
+func rooted(root, dir string) bool {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	return filepath.Dir(absDir) == filepath.Clean(absRoot)
 }
 
 // matchesArchetype applies REQ-SKILL-05's archetype filter. A skill that

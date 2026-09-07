@@ -47,6 +47,12 @@ const (
 	RunStopToolTerminate  RunStopReason = "tool_terminate"
 	RunStopError          RunStopReason = "error"
 	RunStopAborted        RunStopReason = "aborted"
+	// RunStopDeferred: the provider accepted a background submission and the
+	// run ended holding a receipt rather than an answer (REQ-PROV-19). It is
+	// a CLEAN end, not an error — the handle is on the last assistant message
+	// and in the session log, and the embedder redeems it when it chooses
+	// (OQ-11 ships the handle and no poller).
+	RunStopDeferred RunStopReason = "deferred"
 )
 
 // ExtractToolUse is the continuation predicate of REQ-LOOP-01, by name. It

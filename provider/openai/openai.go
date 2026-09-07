@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/agentfox/agentkit-go/catalog"
@@ -63,6 +64,40 @@ type request struct {
 	// API rejects longer.
 	PromptCacheKey string `json:"prompt_cache_key,omitzero"`
 	Store          *bool  `json:"store,omitzero"`
+
+	// thinkingBudget is REQ-PROV-15's last bullet: an endpoint that shares
+	// max_tokens between the reasoning and the answer needs an explicit
+	// budget, or a reasoning-heavy turn spends the whole response thinking and
+	// emits no answer. The FIELD NAME is the compat profile's
+	// ThinkingTokenBudgetField (REQ-PROV-12) — vLLM spells it
+	// thinking_token_budget, Qwen thinking_budget, llama.cpp
+	// thinking_budget_tokens — so it cannot be a struct tag, and a
+	// map[string]any body would sort every key (REQ-PROV-16.5). It is spliced
+	// in by MarshalJSON instead, which keeps the rest of the body's authored
+	// order intact.
+	thinkingBudgetField string
+	thinkingBudget      *int
+}
+
+// MarshalJSON appends the profile-named reasoning budget to the encoded body.
+// Unexported fields are invisible to the alias, so the alias marshal is the
+// ordinary one and the only difference is the appended key.
+func (r *request) MarshalJSON() ([]byte, error) {
+	type alias request
+	raw, err := json.Marshal((*alias)(r))
+	if err != nil || r.thinkingBudgetField == "" || r.thinkingBudget == nil {
+		return raw, err
+	}
+	key, err := json.Marshal(r.thinkingBudgetField)
+	if err != nil {
+		return nil, err
+	}
+	// raw always ends in '}' and is never "{}": model is required.
+	out := append(raw[:len(raw)-1], ',')
+	out = append(out, key...)
+	out = append(out, ':')
+	out = strconv.AppendInt(out, int64(*r.thinkingBudget), 10)
+	return append(out, '}'), nil
 }
 
 // message is one Chat Completions message. Note the shape: a tool result is
@@ -89,6 +124,13 @@ type message struct {
 	// tool
 	ToolCallID string `json:"tool_call_id,omitzero"`
 	Name       string `json:"name,omitzero"`
+
+	// deferred marks the REQ-CACHE-10 declaration message. It sits AFTER the
+	// cached prefix, so it must never carry a §6.2a breakpoint — the same rule
+	// that keeps cache_control off Anthropic's deferred tools, for the same
+	// reason: a breakpoint there sits past the very content the deferral
+	// exists to keep cached. Unexported, so it never reaches the wire.
+	deferred bool
 }
 
 type contentPart struct {
@@ -165,17 +207,21 @@ type Compat struct {
 	// AllowsNullAssistantContent: some gateways reject content:null and want "".
 	AllowsNullAssistantContent bool `json:"allows_null_assistant_content"`
 	// AllowsUserAfterToolResult: where false, a user message directly after a
-	// tool result needs a synthetic assistant turn between them. Declared so
-	// the catalog can record it; not yet wired.
+	// tool result gets a synthetic assistant turn between them
+	// (encodeMessages). The gateways that need it are named in InferCompat.
 	AllowsUserAfterToolResult bool `json:"allows_user_after_tool_result"`
 	// RequiresToolResultName: some gateways require name on a tool message.
 	RequiresToolResultName bool `json:"requires_tool_result_name"`
-	// ThinkingFormat is the wire shape for reasoning replay: openai,
-	// deepseek, together, openrouter or chat-template. Declared; not yet wired.
+	// ThinkingFormat is the wire shape for REASONING REPLAY: openai,
+	// deepseek, together, openrouter or chat-template. Only `deepseek`
+	// documents a round trip — reasoning_content echoed back on the assistant
+	// message — and only that arm emits one; see encodeMessages for what the
+	// others do and why they can do nothing else.
 	ThinkingFormat string `json:"thinking_format"`
 	// ThinkingTokenBudgetField names the reasoning-budget field on servers
-	// that share max_tokens between reasoning and the answer. Declared; not
-	// yet wired.
+	// that share max_tokens between reasoning and the answer (REQ-PROV-15's
+	// last bullet): thinking_token_budget on vLLM, thinking_budget on Qwen,
+	// thinking_budget_tokens on llama.cpp. Empty emits no budget.
 	ThinkingTokenBudgetField string `json:"thinking_token_budget_field"`
 	// CacheControlFormat: "anthropic" emits cache_control on content parts
 	// (OpenRouter anthropic/* routes). Empty emits nothing.
@@ -255,6 +301,12 @@ func InferCompat(m *core.Model) Compat {
 		if strings.HasPrefix(id, "anthropic/") {
 			c.CacheControlFormat = "anthropic"
 			c.ThinkingFormat = "openrouter"
+			// A role:"tool" message is translated into an Anthropic
+			// tool_result, which rides on a USER turn — so a user message
+			// straight after one is two consecutive user turns upstream, which
+			// the Messages API rejects (REQ-PROV-12
+			// AllowsUserAfterToolResult).
+			c.AllowsUserAfterToolResult = false
 		}
 	case vendor == "deepseek" || strings.HasSuffix(host, "deepseek.com"):
 		c.UseMaxTokens = true
@@ -281,6 +333,32 @@ func InferCompat(m *core.Model) Compat {
 		c.SupportsLongCacheRetention = false
 	case vendor == "xai" || strings.HasSuffix(host, "api.x.ai"):
 		c.SupportsReasoningEffort = false
+	case vendor == "mistral" || strings.HasSuffix(host, "api.mistral.ai"):
+		c.UseMaxTokens = true
+		c.SupportsReasoningEffort = false
+		c.SupportsStrictTools = false
+		// Mistral rejects a user message that follows a tool result outright
+		// ("Conversation roles must alternate"), so one is bridged with a
+		// synthetic assistant turn (REQ-PROV-12 AllowsUserAfterToolResult).
+		c.AllowsUserAfterToolResult = false
+	case vendor == "vllm" || vendor == "sglang":
+		// A self-hosted OpenAI-compatible server shares ONE max_tokens between
+		// the reasoning and the answer, so a reasoning-heavy turn with no
+		// budget returns thinking and no answer (REQ-PROV-15). vLLM reads the
+		// budget as thinking_token_budget and has no reasoning_effort at all.
+		c.SupportsReasoningEffort = false
+		c.ThinkingTokenBudgetField = "thinking_token_budget"
+		c.ThinkingFormat = "chat-template"
+		c.SupportsStrictTools = false
+	case vendor == "llamacpp" || vendor == "llama.cpp" || vendor == "llama-cpp":
+		c.SupportsReasoningEffort = false
+		c.ThinkingTokenBudgetField = "thinking_budget_tokens"
+		c.ThinkingFormat = "chat-template"
+		c.SupportsStrictTools = false
+	case vendor == "qwen" || vendor == "dashscope" || strings.Contains(host, "dashscope"):
+		c.UseMaxTokens = true
+		c.SupportsReasoningEffort = false
+		c.ThinkingTokenBudgetField = "thinking_budget"
 	}
 	return c
 }
@@ -325,20 +403,47 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 	if r := req.Options.CacheRetention; r != nil {
 		retention = *r
 	}
-	out, rep, _, err := buildRequest(m, req, retention)
+	out, rep, _, _, err := buildRequest(m, req, retention, nil)
 	return out, rep, err
 }
 
-func buildRequest(m *core.Model, req core.Request, retention core.CacheRetention) (*request, provider.RepairReport, Compat, error) {
+// BuildRequestCached is BuildRequest with REQ-CACHE-06's per-session schema
+// cache attached. A nil prefix marshals every schema, which is what
+// BuildRequest does and what a one-shot caller wants.
+//
+// NFR-PERF-03 is why this is on the request path rather than an internal
+// detail: "tool schema serialization must be computed once per session and
+// cached, not recomputed on every model call", and this wire was
+// re-serializing every schema on every turn for bytes that had not changed.
+func BuildRequestCached(m *core.Model, req core.Request, retention core.CacheRetention,
+	prefix *provider.ToolPrefix) (*request, provider.RepairReport, provider.SyncReport, error) {
+	out, rep, _, sync, err := buildRequest(m, req, retention, prefix)
+	return out, rep, sync, err
+}
+
+func buildRequest(m *core.Model, req core.Request, retention core.CacheRetention,
+	prefix *provider.ToolPrefix) (*request, provider.RepairReport, Compat, provider.SyncReport, error) {
+	var sync provider.SyncReport
 	compat, err := CompatFor(m)
 	if err != nil {
-		return nil, provider.RepairReport{}, compat, err
+		return nil, provider.RepairReport{}, compat, sync, err
 	}
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeToolCallID))
 
+	// REQ-CACHE-06/NFR-PERF-03: ONE Sync over the WHOLE tool list, before the
+	// REQ-CACHE-10 split. Syncing the two halves separately would make each
+	// call see the other half as removed — a reported prefix invalidation on
+	// every turn, evicting the entries the cache exists to keep.
+	schemas, strict, srep, err := encodeSchemas(req.Tools, compat.SupportsStrictTools, prefix)
+	if err != nil {
+		return nil, rep, compat, sync, err
+	}
+	sync = srep
+	split := provider.SplitDeferredTools(req.Tools, req.Messages)
+
 	out := &request{
 		Model:    m.ID,
-		Messages: encodeMessages(repaired, req.System, compat),
+		Messages: encodeMessages(repaired, req.System, compat, deferredDeclaration(split.Deferred, schemas, req.Tools, compat)),
 		Stop:     req.StopSequences,
 		Stream:   true,
 
@@ -381,14 +486,22 @@ func buildRequest(m *core.Model, req core.Request, retention core.CacheRetention
 			out.ReasoningEffort = wire
 		}
 	}
+	applyThinkingBudget(out, m, req.ThinkingLevel, compat)
 
-	for _, tw := range req.Tools {
-		params, strict, err := encodeSchema(tw, compat.SupportsStrictTools)
-		if err != nil {
-			return nil, rep, compat, err
-		}
-		f := toolFunction{Name: tw.Name, Description: tw.Description, Parameters: params}
-		if strict {
+	// REQ-CACHE-10, third arm: this wire has neither Anthropic's
+	// defer_loading nor Responses' additional_tools, so a tool that appeared
+	// mid-session is WITHHELD from the tools array here and re-declared in a
+	// system message at its transcript position (deferredDeclaration above).
+	// Prepending it to the array instead would rewrite the cached prefix and
+	// cost the whole provider-side cache over one added tool.
+	byName := make(map[string]int, len(req.Tools))
+	for i, tw := range req.Tools {
+		byName[tw.Name] = i
+	}
+	for _, tw := range split.Immediate {
+		i := byName[tw.Name]
+		f := toolFunction{Name: tw.Name, Description: tw.Description, Parameters: schemas[i]}
+		if strict[i] {
 			t := true
 			f.Strict = &t
 		}
@@ -402,12 +515,122 @@ func buildRequest(m *core.Model, req core.Request, retention core.CacheRetention
 	case core.ToolChoiceNone:
 		out.ToolChoice = "none"
 	}
-	return out, rep, compat, nil
+	return out, rep, compat, sync, nil
 }
 
-// encodeSchema is REQ-TOOL-03 for this wire: the schema is PROBED through the
+// applyThinkingBudget is REQ-PROV-15's last bullet for this wire: an
+// `openai-completions` endpoint that shares max_tokens between the reasoning
+// and the answer "requires an explicit budget under the field name their
+// compat profile specifies — without one, a reasoning-heavy turn consumes the
+// whole response and emits no answer".
+//
+// The budget comes from the model's own ThinkingLevelMap, clamped the same way
+// every other level is (REQ-PROV-15), because a row that prices levels in
+// TOKENS is how a vLLM or llama.cpp row expresses them at all. A row whose
+// levels are effort STRINGS prices no budget and gets none: inventing one
+// would cap thinking the row never asked to cap.
+func applyThinkingBudget(out *request, m *core.Model, level core.ThinkingLevel, compat Compat) {
+	if compat.ThinkingTokenBudgetField == "" ||
+		level == core.ThinkingUnset || level == core.ThinkingOff {
+		return
+	}
+	n, ok := thinkingBudgetFor(m, level)
+	if !ok {
+		return
+	}
+	out.thinkingBudgetField, out.thinkingBudget = compat.ThinkingTokenBudgetField, &n
+}
+
+// DefaultThinkingBudgets is the fallback token-budget table, used ONLY for a
+// model with no ThinkingLevelMap at all — a hand-built descriptor with nothing
+// to clamp against. The catalog row is authoritative (REQ-CAT-06); this table
+// exists so a self-hosted endpoint configured without a row still gets a
+// budget rather than the answerless turn REQ-PROV-15 describes. It mirrors the
+// Google adapter's table, which faces the same problem.
+func DefaultThinkingBudgets() map[core.ThinkingLevel]int {
+	return map[core.ThinkingLevel]int{
+		core.ThinkingMinimal: 512,
+		core.ThinkingLow:     2048,
+		core.ThinkingMedium:  8192,
+		core.ThinkingHigh:    16384,
+		core.ThinkingXHigh:   24576,
+		core.ThinkingMax:     32768,
+	}
+}
+
+func thinkingBudgetFor(m *core.Model, level core.ThinkingLevel) (int, bool) {
+	if m != nil && len(m.ThinkingLevelMap) > 0 {
+		_, wire, ok := catalog.ClampThinkingLevel(m, level)
+		if !ok {
+			return 0, false
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(wire))
+		if err != nil {
+			// An effort string, not a budget. A row that prices no level in
+			// tokens gets no budget key rather than a 400 on "high".
+			return 0, false
+		}
+		return n, true
+	}
+	if n, ok := DefaultThinkingBudgets()[level]; ok {
+		return n, true
+	}
+	return 0, false
+}
+
+// encodeSchemas serializes every tool's parameters THROUGH the session's
+// schema prefix (REQ-CACHE-06, NFR-PERF-03) and returns the per-tool strict
+// flag alongside.
+//
+// The strict-subset rewrite is decided here rather than inside the marshaller
+// because it is a property of the TOOL — its ConstrainedSampling — and the
+// Marshaller signature is schema in, bytes out. The decision is carried into
+// the marshaller by schema pointer, which is the identity the prefix itself
+// uses. A schema VALUE shared by two tools that disagree about constrained
+// sampling would need two encodings under one identity; that request falls
+// back to the uncached path rather than serving one tool the other's bytes.
+func encodeSchemas(tools []core.ToolWire, supportsStrict bool,
+	prefix *provider.ToolPrefix) ([]json.RawMessage, []bool, provider.SyncReport, error) {
+	var sync provider.SyncReport
+	strict := make([]bool, len(tools))
+	plan := make(map[*schema.Schema]*schema.Schema, len(tools))
+	mode := make(map[*schema.Schema]bool, len(tools))
+	conflict := false
+
+	for i, tw := range tools {
+		target, err := strictTarget(tw, supportsStrict)
+		if err != nil {
+			return nil, nil, sync, err
+		}
+		if target != nil {
+			strict[i] = true
+		} else {
+			target = tw.InputSchema
+		}
+		if prev, ok := mode[tw.InputSchema]; ok && prev != strict[i] {
+			conflict = true
+		}
+		mode[tw.InputSchema] = strict[i]
+		plan[tw.InputSchema] = target
+	}
+
+	p := prefix
+	if conflict {
+		p = nil
+	}
+	raws, rep, err := p.SyncWith(tools, func(s *schema.Schema) (json.RawMessage, error) {
+		if t, ok := plan[s]; ok {
+			s = t
+		}
+		return json.Marshal(s)
+	})
+	return raws, strict, rep, err
+}
+
+// strictTarget is REQ-TOOL-03 for this wire: the schema is PROBED through the
 // strict-subset rewrite before anything is sent, and strict:true is emitted
-// only on the rewritten schema.
+// only on the rewritten schema, which is what this returns (nil means no
+// strict).
 //
 // A bare strict:true on the raw schema is rejected the moment a tool has an
 // optional property or a $ref, and the 400 kills the whole request — every
@@ -417,34 +640,25 @@ func buildRequest(m *core.Model, req core.Request, retention core.CacheRetention
 // error stream (REQ-PROV-04). Emission is additionally gated on the compat
 // profile's SupportsStrictTools (REQ-PROV-12): a profile that cannot emit
 // strict cannot satisfy `require` either.
-func encodeSchema(tw core.ToolWire, supportsStrict bool) (json.RawMessage, bool, error) {
+func strictTarget(tw core.ToolWire, supportsStrict bool) (*schema.Schema, error) {
 	cs := tw.ConstrainedSampling
-	wantStrict := cs != nil && cs.Type == core.ConstrainJSONSchema
-	if wantStrict {
-		var rewritten *schema.Schema
-		var err error
-		if !supportsStrict {
-			err = fmt.Errorf("agentkit: this endpoint's compat profile does not support strict tool schemas")
-		} else {
-			rewritten, err = schema.StrictSubset(tw.InputSchema)
-		}
-		switch {
-		case err == nil:
-			raw, merr := json.Marshal(rewritten)
-			if merr != nil {
-				return nil, false, merr
-			}
-			return raw, true, nil
-		case cs.Strict == core.StrictRequire:
-			return nil, false, fmt.Errorf("tool %q requires constrained sampling: %w", tw.Name, err)
-		}
-		// prefer: fall through to the unconstrained schema.
+	if cs == nil || cs.Type != core.ConstrainJSONSchema {
+		return nil, nil
 	}
-	raw, err := json.Marshal(tw.InputSchema)
-	if err != nil {
-		return nil, false, err
+	var rewritten *schema.Schema
+	var err error
+	if !supportsStrict {
+		err = fmt.Errorf("agentkit: this endpoint's compat profile does not support strict tool schemas")
+	} else {
+		rewritten, err = schema.StrictSubset(tw.InputSchema)
 	}
-	return raw, false, nil
+	switch {
+	case err == nil:
+		return rewritten, nil
+	case cs.Strict == core.StrictRequire:
+		return nil, fmt.Errorf("tool %q requires constrained sampling: %w", tw.Name, err)
+	}
+	return nil, nil
 }
 
 // stampCacheControl places §6.2a Level 1 breakpoints on the Chat Completions
@@ -483,6 +697,9 @@ func stampCacheControl(ms []message, retention core.CacheRetention, compat Compa
 	for i := range ms {
 		switch ms[i].Role {
 		case "system", "developer":
+			if ms[i].deferred {
+				continue
+			}
 			stamp(&ms[i])
 		case "user":
 			lastUser = i
@@ -510,8 +727,12 @@ func clampCacheKey(s string) string {
 // not produce this wire form at all — which is exactly why the canonical
 // transcript keeps one ToolResultMessage per call and lets each provider pack
 // them its own way.
-func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat) []message {
+func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat, decl *deferredDecl) []message {
 	var out []message
+	// insertAt is where decl's system message goes: after the LAST run of tool
+	// results that announced a deferred tool (REQ-CACHE-10). -1 means no
+	// marker was seen in the repaired view, and the declaration is appended.
+	insertAt, inRun := -1, false
 
 	if len(system) > 0 {
 		role := "system"
@@ -530,20 +751,43 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat)
 	for _, m := range ms {
 		switch v := m.(type) {
 		case core.UserMessage:
+			inRun = false
 			out = append(out, message{Role: "user", Content: encodeContent(v.Content)})
 
 		case core.AssistantMessage:
+			inRun = false
 			msg := message{Role: "assistant"}
-			var text strings.Builder
+			var text, reasoning strings.Builder
 			for _, b := range v.Content {
 				switch bv := b.(type) {
 				case core.TextBlock:
 					text.WriteString(bv.Text)
 				case core.ThinkingBlock:
-					// Reasoning replay is profile-dependent; the neutral
-					// behaviour is to drop it rather than invent a field the
-					// vendor does not read.
-					_ = bv
+					// REQ-PROV-12 ThinkingFormat: the wire shape for reasoning
+					// REPLAY. Only DeepSeek documents a round trip, so only
+					// that arm emits one; the rest degrade the block to text,
+					// which is REQ-PROV-11 rule 3/4's own answer to a block
+					// this target cannot replay.
+					//
+					//	deepseek       reasoning_content on the assistant message
+					//	openai         no replay field on this wire at all
+					//	openrouter     wants reasoning_details, which this
+					//	               decoder does not receive, so there is
+					//	               nothing faithful to send back
+					//	together       no documented replay shape
+					//	chat-template  the server re-renders the template from
+					//	               content alone; a reasoning field is
+					//	               dropped, not read
+					//
+					// Inventing a field for the others would either 400 or be
+					// silently ignored, and being silently ignored is worse:
+					// the chain looks replayed and is not.
+					switch compat.ThinkingFormat {
+					case "deepseek":
+						reasoning.WriteString(bv.Thinking)
+					default:
+						text.WriteString(bv.Thinking)
+					}
 				case core.ToolUseBlock:
 					msg.ToolCalls = append(msg.ToolCalls, toolCall{
 						ID: bv.ID, Type: "function",
@@ -563,6 +807,7 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat)
 			} else {
 				msg.Content = ""
 			}
+			msg.ReasoningContent = reasoning.String()
 			out = append(out, msg)
 
 		case core.ToolResultMessage:
@@ -572,9 +817,108 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat)
 				tm.Name = v.ToolName
 			}
 			out = append(out, tm)
+			if decl != nil {
+				if !inRun {
+					for _, n := range v.AddedToolNames {
+						if decl.names[n] {
+							inRun = true
+							break
+						}
+					}
+				}
+				if inRun {
+					insertAt = len(out)
+				}
+			}
 		}
 	}
+	if decl != nil {
+		if insertAt < 0 {
+			insertAt = len(out)
+		}
+		out = append(out[:insertAt], append([]message{decl.msg}, out[insertAt:]...)...)
+	}
+	return bridgeUserAfterToolResult(out, compat)
+}
+
+// bridgeUserAfterToolResult is REQ-PROV-12's AllowsUserAfterToolResult: where
+// the profile says false, a user message directly after a tool result gets a
+// synthetic assistant turn between them. See InferCompat for the gateways —
+// OpenRouter's anthropic/* routes, where a tool message becomes a user turn
+// upstream and two user turns in a row are a 400, and Mistral, which rejects
+// the adjacency by name.
+//
+// The bridge runs over the ENCODED messages rather than the canonical ones so
+// it also covers a message this encoder inserted itself, and so the canonical
+// transcript keeps saying what actually happened.
+func bridgeUserAfterToolResult(ms []message, compat Compat) []message {
+	if compat.AllowsUserAfterToolResult {
+		return ms
+	}
+	out := make([]message, 0, len(ms))
+	for i, m := range ms {
+		if i > 0 && m.Role == "user" && ms[i-1].Role == "tool" {
+			bridge := message{Role: "assistant", Content: SyntheticAssistantText}
+			out = append(out, bridge)
+		}
+		out = append(out, m)
+	}
 	return out
+}
+
+// SyntheticAssistantText is the content of the turn bridgeUserAfterToolResult
+// invents. It is MODEL-VISIBLE, so it is pinned here rather than formatted at
+// the call site (compare provider.SyntheticResultText), and it is non-empty
+// because the gateways that need the bridge reject an empty assistant turn for
+// the same reason they reject the adjacency.
+const SyntheticAssistantText = "Understood."
+
+// deferredDecl is the REQ-CACHE-10 third-arm declaration: the tools withheld
+// from the tools array, and the system message that re-declares them.
+type deferredDecl struct {
+	names map[string]bool
+	msg   message
+}
+
+// deferredDeclaration renders the withheld tools as prose. The schemas are the
+// ones the REQ-CACHE-06 prefix already serialized, so declaring a tool this
+// way costs no extra marshalling.
+//
+// Prose is the only declaration this wire has: `tools` is a prefix-position
+// array, so a tool added mid-session cannot be declared at its transcript
+// position any other way. It is weaker than Anthropic's defer_loading and the
+// Responses API's additional_tools — the model may call a tool that is not in
+// the array, which some servers reject — and it is still cheaper than
+// rewriting the cached prefix.
+func deferredDeclaration(deferred []core.ToolWire, schemas []json.RawMessage, all []core.ToolWire,
+	compat Compat) *deferredDecl {
+	if len(deferred) == 0 {
+		return nil
+	}
+	index := make(map[string]int, len(all))
+	for i, tw := range all {
+		index[tw.Name] = i
+	}
+	d := &deferredDecl{names: make(map[string]bool, len(deferred))}
+	var b strings.Builder
+	b.WriteString("Additional tools became available at this point in the conversation " +
+		"and may be called from here on:\n")
+	for _, tw := range deferred {
+		d.names[tw.Name] = true
+		b.WriteString("\n- " + tw.Name)
+		if tw.Description != "" {
+			b.WriteString(": " + tw.Description)
+		}
+		if i, ok := index[tw.Name]; ok && len(schemas[i]) > 0 {
+			b.WriteString("\n  parameters: " + string(schemas[i]))
+		}
+	}
+	role := "system"
+	if compat.SupportsDeveloperRole {
+		role = "developer"
+	}
+	d.msg = message{Role: role, Content: b.String(), deferred: true}
+	return d
 }
 
 // encodeContent returns a plain string when the content is text-only, and a
