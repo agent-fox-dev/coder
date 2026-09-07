@@ -140,18 +140,18 @@ func goldenRequestCases(t *testing.T) []goldenCase {
 	return []goldenCase{
 		{"anthropic", capture(t,
 			anthropic.Provider(anthropic.Options{BaseURL: "https://example.invalid"}),
-			goldenModel("claude-test", core.API("anthropic-messages"), "anthropic"), req)},
+			goldenModel("claude-test", anthropic.API, "anthropic"), req)},
 		{"openai", capture(t,
 			openai.Provider(openai.Options{BaseURL: "https://example.invalid"}),
-			goldenModel("gpt-test", core.API("openai-completions"), "openai"), req)},
+			goldenModel("gpt-test", openai.API, "openai"), req)},
 		{"google", capture(t,
 			google.Provider(google.Options{BaseURL: "https://example.invalid"}),
-			goldenModel("gemini-test", core.API("google-generative-ai"), "google"), req)},
+			goldenModel("gemini-test", google.API, "google"), req)},
 		{"openai_responses", capture(t,
 			openairesponses.Provider(openairesponses.Options{BaseURL: "https://example.invalid"}),
-			goldenModel("gpt-resp-test", core.API("openai-responses"), "openai"), req)},
+			goldenModel("gpt-resp-test", openairesponses.API, "openai"), req)},
 		{"ollama", capture(t,
 			ollama.Provider(ollama.Options{BaseURL: "https://example.invalid"}),
-			goldenModel("llama-test", core.API("ollama"), "ollama"), req)},
+			goldenModel("llama-test", ollama.API, "ollama"), req)},
 	}
 }

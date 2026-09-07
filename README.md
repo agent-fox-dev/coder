@@ -672,12 +672,18 @@ requirement ledger, fixed and deferred alike, is [`docs/GAPS.md`](docs/GAPS.md).
   resource subscriptions and the Tasks extension are defined by the revision
   and not implemented here; `subscriptions/listen` ships on both transports,
   but only the list-changed filters have producers.
-- **Four compat flags.** `ThinkingFormat` (DeepSeek's `reasoning_content`
-  echo), `ThinkingTokenBudgetField`, `AllowsUserAfterToolResult` and
-  `CacheControlFormat` (prompt caching over Chat Completions for OpenRouter's
-  `anthropic/*` models) are declared in the PRD's table and not wired. The
-  requirement's own rule is that a flag is added only with a named vendor and
-  a reproducing case, and none has been captured yet.
+- **Three compat flags are resolved but not acted on.** The
+  `openai-completions` profile carries every flag in REQ-PROV-12's table, and
+  the host inference sets them, but three change nothing yet:
+  `ThinkingTokenBudgetField` (no adapter reads it, so a vLLM or Qwen server
+  that shares `max_tokens` between reasoning and the answer still gets no
+  explicit budget), `AllowsUserAfterToolResult` (no synthetic assistant turn
+  is injected where a gateway rejects the sequence), and `ThinkingFormat`
+  (inferred as `deepseek`/`openrouter`/`together`, but nothing branches on
+  it — `reasoning_content` is decoded and echoed back unconditionally, which
+  is right for DeepSeek and untested anywhere else). `CacheControlFormat` and
+  `SupportsLongCacheRetention` *are* wired: OpenRouter's `anthropic/*` routes
+  get `cache_control` breakpoints and the 1h TTL where the gateway takes it.
 - **The schema cache and deferred tool loading on four of five wires.** Both
   are attached to Anthropic only; the other adapters re-marshal every schema
   each turn, and neither Responses `additional_tools` nor the "withhold and
