@@ -611,3 +611,34 @@ func TestNormalizeToolCallIDIsInjectiveOverTheCasesRepairSees(t *testing.T) {
 		t.Errorf("an empty id must stay empty, got %q", got)
 	}
 }
+
+// TestAnUnpricedLevelIsClampedNotDefaulted is REQ-PROV-15 on this wire: a row
+// that prices some levels but not the requested one is clamped to one it
+// prices — upward first, then downward — never handed the default table's
+// number. The default for max is 32768, which on a family whose row tops out
+// at 4096 is a 400, and on one that accepts it is money the row said not to
+// spend.
+func TestAnUnpricedLevelIsClampedNotDefaulted(t *testing.T) {
+	m := model()
+	low, medium := "1024", "4096"
+	m.Reasoning = true
+	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingLow: &low, core.ThinkingMedium: &medium}
+
+	_, w := build(t, m, core.Request{
+		Messages:      core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+		ThinkingLevel: core.ThinkingMax,
+	})
+	b := w.GenerationConfig.ThinkingConfig.ThinkingBudget
+	if b == nil || *b != 4096 {
+		t.Fatalf("thinkingBudget = %v for max on a row that tops out at medium, want 4096 (clamped down)", b)
+	}
+
+	_, w = build(t, m, core.Request{
+		Messages:      core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+		ThinkingLevel: core.ThinkingMinimal,
+	})
+	b = w.GenerationConfig.ThinkingConfig.ThinkingBudget
+	if b == nil || *b != 1024 {
+		t.Fatalf("thinkingBudget = %v for minimal on a row that starts at low, want 1024 (clamped up)", b)
+	}
+}

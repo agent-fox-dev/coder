@@ -12,7 +12,12 @@ import (
 // screenshot and would get silence, with nothing in the transcript to say why.
 // The oversized image may still be refused by the provider, but that is a
 // visible error the caller can act on, where a silent deletion is not.
-func (a *Agent) normalizeImages(msg *core.ToolResultMessage) {
+//
+// It takes a reporter rather than the Agent because it runs inside the batch
+// executor's critical section, where the agent lock must never be acquired
+// (NFR-REL-02.1); a method that reached a.fireError would take a.mu under
+// the batch mutex on every tool result that carried an image.
+func normalizeImages(msg *core.ToolResultMessage, report func(error)) {
 	for i, blk := range msg.Content {
 		img, ok := blk.(core.ImageBlock)
 		if !ok {
@@ -20,8 +25,10 @@ func (a *Agent) normalizeImages(msg *core.ToolResultMessage) {
 		}
 		normalized, err := normalizeImageBlock(img)
 		if err != nil {
-			a.fireError(&ImageNormalizationError{
-				ToolName: msg.ToolName, ToolUseID: msg.ToolUseID, Err: err})
+			if report != nil {
+				report(&ImageNormalizationError{
+					ToolName: msg.ToolName, ToolUseID: msg.ToolUseID, Err: err})
+			}
 			continue
 		}
 		msg.Content[i] = normalized

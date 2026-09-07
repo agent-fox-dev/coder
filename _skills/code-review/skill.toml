@@ -1,0 +1,8 @@
+# Built-in skill: code-review. The worked example of the prompt authoring
+# contract (REQ-SKILL-13); see skills/doc.go for the six parts and prompt.md
+# for how each is filled in.
+name = "code-review"
+version = "1.0.0"
+description = "Reviews a diff for correctness bugs and reports each finding as file:line with the evidence, before the change is committed."
+author = "agentkit"
+sdk_min_version = "0.1.0"

@@ -349,6 +349,62 @@ func TestSearchToolBoundsContextLines(t *testing.T) {
 	}
 }
 
+// TestSearchAppliesTheByteCap is REQ-TOOL-09's second limit for search_files
+// and REQ-TOOL-15.3. 100 matches with 20 lines of context either side at 500
+// chars a line is two megabytes; the 50 KB cap must fire first and say so.
+func TestSearchAppliesTheByteCap(t *testing.T) {
+	root := t.TempDir()
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&b, "needle %03d %s\n", i, strings.Repeat("x", 480))
+	}
+	if err := os.WriteFile(filepath.Join(root, "wide.txt"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, backend := range bothBackends(t) {
+		t.Run(string(backend.name), func(t *testing.T) {
+			res, err := backend.run(t, root, tools.SearchParams{Pattern: "needle", ContextLines: 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !res.Truncated || res.TruncatedBy != tools.TruncatedByBytes {
+				t.Fatalf("want truncated_by=bytes, got truncated=%v by=%q with %d matches",
+					res.Truncated, res.TruncatedBy, len(res.Matches))
+			}
+			if len(res.Matches) >= tools.SearchMatchCap {
+				t.Fatal("the byte cap must fire BEFORE the match cap here")
+			}
+			payload, _ := json.Marshal(res.Matches)
+			if len(payload) > tools.DefaultByteLimit+1024 {
+				t.Fatalf("payload is %d bytes, over the 50 KB budget", len(payload))
+			}
+		})
+	}
+
+	// The envelope names the limit that fired and a call that narrows.
+	res := searchTool(t, root).Execute(context.Background(),
+		json.RawMessage(`{"pattern":"needle","context_lines":20}`))
+	if !res.OK || res.Metadata == nil || res.Metadata.TruncatedBy != "bytes" {
+		t.Fatalf("metadata.truncated_by must be \"bytes\": %+v", res.Metadata)
+	}
+	note, _ := res.Data["note"].(string)
+	if !strings.Contains(note, "50.0KB") || strings.Contains(note, "limit=") {
+		t.Fatalf("the marker must name the byte limit, not find_files' limit=: %q", note)
+	}
+}
+
+// TestSearchMarkerNamesMaxMatches is REQ-TOOL-09b for search_files: the
+// marker used to say `limit=`, a parameter the tool does not have.
+func TestSearchMarkerNamesMaxMatches(t *testing.T) {
+	root := searchTree(t)
+	res := searchTool(t, root).Execute(context.Background(),
+		json.RawMessage(`{"pattern":"needle","max_matches":2}`))
+	note, _ := res.Data["note"].(string)
+	if !strings.Contains(note, "max_matches=4") || strings.Contains(note, "limit=") {
+		t.Fatalf("marker = %q, want it to name max_matches", note)
+	}
+}
+
 // ---- helpers
 
 type backend struct {
@@ -385,7 +441,9 @@ func runNative(t *testing.T, root string, p tools.SearchParams) (tools.SearchRes
 	t.Helper()
 	restore := tools.SetRipgrepLookup(func() (string, bool) { return "", false })
 	defer restore()
-	res, backendUsed, err := tools.Search(context.Background(), root, p)
+	// The global excludes layer is pinned EMPTY (NFR-TEST-04): a developer's
+	// own ~/.config/git/ignore must not decide whether this test passes.
+	res, backendUsed, err := tools.SearchIn(context.Background(), root, p, tools.NoGlobalExcludes())
 	if err == nil && backendUsed != tools.BackendNative {
 		t.Fatalf("expected the native backend, got %q", backendUsed)
 	}
@@ -396,7 +454,7 @@ func runRipgrep(t *testing.T, path, root string, p tools.SearchParams) (tools.Se
 	t.Helper()
 	restore := tools.SetRipgrepLookup(func() (string, bool) { return path, true })
 	defer restore()
-	res, backendUsed, err := tools.Search(context.Background(), root, p)
+	res, backendUsed, err := tools.SearchIn(context.Background(), root, p, tools.NoGlobalExcludes())
 	if err == nil && backendUsed != tools.BackendRipgrep {
 		t.Fatalf("expected the ripgrep backend, got %q", backendUsed)
 	}
@@ -430,7 +488,7 @@ func searchTool(t *testing.T, root string) coreTool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	all, err := tools.All(tools.Options{Workspace: ws})
+	all, err := tools.All(tools.Options{Workspace: ws, Ignore: tools.NoGlobalExcludes()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +509,7 @@ func readTool(t *testing.T, root string) coreTool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	all, err := tools.All(tools.Options{Workspace: ws})
+	all, err := tools.All(tools.Options{Workspace: ws, Ignore: tools.NoGlobalExcludes()})
 	if err != nil {
 		t.Fatal(err)
 	}

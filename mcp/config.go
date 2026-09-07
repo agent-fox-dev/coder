@@ -119,8 +119,18 @@ func parseServer(path string, i int, t *toml.Table) (ServerConfig, []Diagnostic)
 	if v, ok := t.Get("per_session_call_limit"); ok && v.Kind == toml.KindInt {
 		sc.PerSessionCallLimit = int(v.Int)
 	}
-	if v, ok := t.Get("timeout_s"); ok && v.Kind == toml.KindInt {
-		sc.Timeout = time.Duration(v.Int) * time.Second
+	if v, ok := t.Get("per_session_reconnect_limit"); ok && v.Kind == toml.KindInt {
+		sc.PerSessionReconnectLimit = int(v.Int)
+	}
+	// Int or float: REQ-MCP-CLIENT-07 writes the default as `30.0`, and a
+	// parser that accepted only `30` rejected the requirement's own example.
+	if v, ok := t.Get("timeout_s"); ok {
+		switch v.Kind {
+		case toml.KindInt:
+			sc.Timeout = time.Duration(v.Int) * time.Second
+		case toml.KindFloat:
+			sc.Timeout = time.Duration(v.Float * float64(time.Second))
+		}
 	}
 	if hdrTbl, ok := t.Sub("headers"); ok {
 		sc.Headers = map[string]string{}

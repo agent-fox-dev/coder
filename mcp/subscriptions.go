@@ -27,8 +27,12 @@ func (c *ServerConnection) Subscribe(ctx context.Context, filter SubscriptionFil
 		c.mu.Unlock()
 	}()
 
+	// callNoReconnect: a subscription is opened on whatever link exists and
+	// must not re-spawn a dead server itself. Reconnection is spent by tool
+	// calls (NFR-REL-03), and the keeper Connect starts re-subscribes once
+	// one has produced a fresh link.
 	var res SubscriptionsListenResult
-	err := c.call(ctx, MethodSubscriptionsListen,
+	err := c.callNoReconnect(ctx, MethodSubscriptionsListen,
 		SubscriptionsListenParams{Notifications: filter}, &res)
 	if err != nil {
 		return fmt.Errorf("mcp: %s: subscriptions/listen: %w", c.cfg.Name, err)

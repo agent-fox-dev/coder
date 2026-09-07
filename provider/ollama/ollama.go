@@ -38,6 +38,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
 )
@@ -222,11 +223,11 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 		KeepAlive: compat.KeepAlive,
 	}
 
-	opts := &options{Temperature: req.Temperature, TopP: req.TopP, Stop: req.StopSequences}
-	if req.MaxTokens != nil {
-		v := *req.MaxTokens
-		opts.NumPredict = &v
-	}
+	// REQ-CAT-04: the caller's max_tokens is an UPPER BOUND, clamped against
+	// what the loop's anchored context estimate leaves of the window. Absent
+	// stays absent; num_predict is optional on this wire.
+	opts := &options{Temperature: req.Temperature, TopP: req.TopP, Stop: req.StopSequences,
+		NumPredict: catalog.ClampRequestMaxTokens(m, req)}
 	if !opts.empty() {
 		out.Options = opts
 	}
@@ -234,9 +235,20 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 	// Thinking is a boolean toggle here, not a budget and not an effort
 	// string. An unset level emits nothing at all: absent, false and true are
 	// three different requests (REQ-PROV-16.1).
+	//
+	// REQ-PROV-15 still applies: a level is clamped against the model's own
+	// map when it has one, and think:true is sent only when some level is
+	// reachable. A row that maps no level above off is a model whose server
+	// rejects think:true outright. With no map there is nothing to clamp
+	// against and the toggle is sent as asked.
 	if compat.supportsThink() && req.ThinkingLevel != core.ThinkingUnset {
 		v := req.ThinkingLevel != core.ThinkingOff
-		out.Think = &v
+		if v && len(m.ThinkingLevelMap) > 0 {
+			_, _, v = catalog.ClampThinkingLevel(m, req.ThinkingLevel)
+		}
+		if v || req.ThinkingLevel == core.ThinkingOff {
+			out.Think = &v
+		}
 	}
 
 	for _, tw := range req.Tools {

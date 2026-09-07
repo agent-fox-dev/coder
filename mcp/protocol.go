@@ -101,10 +101,39 @@ type RequestMeta struct {
 	ProgressToken      any                `json:"progressToken,omitzero"`
 }
 
-// ResultMeta is the per-result `_meta`.
+// ResultMeta is the typed VIEW of a result's `_meta`: the reserved keys this
+// implementation reads or writes.
+//
+// Results carry `_meta` as json.RawMessage rather than as this struct. The
+// member is an OPEN namespace by spec — a server may put its own keys in it —
+// and binding it strictly (REQ-SEC-12.1) would reject a conforming server for
+// the crime of adding one. The raw bytes have already passed REQ-SEC-11's
+// bounds and duplicate-key check as part of the frame, so reading the known
+// keys out of them leniently is safe; ParseResultMeta does that.
 type ResultMeta struct {
 	ServerInfo     *Implementation `json:"io.modelcontextprotocol/serverInfo,omitzero"`
 	SubscriptionID *ID             `json:"io.modelcontextprotocol/subscriptionId,omitzero"`
+}
+
+// ParseResultMeta reads the reserved keys out of a result's `_meta`. Keys it
+// does not know are ignored, which is what an open namespace requires; an
+// undecodable payload yields the zero value rather than an error, because the
+// result it came with has already been accepted.
+func ParseResultMeta(raw json.RawMessage) ResultMeta {
+	var m ResultMeta
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &m)
+	}
+	return m
+}
+
+// JSON renders the view for the wire.
+func (m ResultMeta) JSON() json.RawMessage {
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 // CacheHints are 2026-07-28's ttlMs/cacheScope, required on every list result
@@ -134,9 +163,11 @@ const DefaultListTTLMs = 0
 // ---------------------------------------------------------------- discovery
 
 type Implementation struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	Title   string `json:"title,omitzero"`
+	Name       string          `json:"name"`
+	Version    string          `json:"version"`
+	Title      string          `json:"title,omitzero"`
+	WebsiteURL string          `json:"websiteUrl,omitzero"`
+	Icons      json.RawMessage `json:"icons,omitzero"`
 }
 
 // ClientCapabilities is what we tell a server we can do, on EVERY request.
@@ -154,11 +185,17 @@ type ClientCapabilities struct {
 	Roots    *struct {
 		ListChanged bool `json:"listChanged,omitzero"`
 	} `json:"roots,omitzero"`
-	Elicitation  *struct{}      `json:"elicitation,omitzero"`
-	Extensions   map[string]any `json:"extensions,omitzero"`
-	Experimental map[string]any `json:"experimental,omitzero"`
+	Elicitation  json.RawMessage `json:"elicitation,omitzero"`
+	Tasks        json.RawMessage `json:"tasks,omitzero"`
+	Extensions   map[string]any  `json:"extensions,omitzero"`
+	Experimental map[string]any  `json:"experimental,omitzero"`
 }
 
+// ServerCapabilities models every capability key the revision defines, not
+// only the ones this client acts on. The struct is bound strictly
+// (REQ-SEC-12.1), so a key missing here is not "ignored" but a rejection of
+// the whole server/discover result — and a server advertising `logging` would
+// have been unusable for advertising something we merely do not use.
 type ServerCapabilities struct {
 	Tools *struct {
 		ListChanged bool `json:"listChanged,omitzero"`
@@ -170,9 +207,11 @@ type ServerCapabilities struct {
 	Prompts *struct {
 		ListChanged bool `json:"listChanged,omitzero"`
 	} `json:"prompts,omitzero"`
-	Completions  *struct{}      `json:"completions,omitzero"`
-	Extensions   map[string]any `json:"extensions,omitzero"`
-	Experimental map[string]any `json:"experimental,omitzero"`
+	Completions  json.RawMessage `json:"completions,omitzero"`
+	Logging      json.RawMessage `json:"logging,omitzero"`
+	Tasks        json.RawMessage `json:"tasks,omitzero"`
+	Extensions   map[string]any  `json:"extensions,omitzero"`
+	Experimental map[string]any  `json:"experimental,omitzero"`
 }
 
 // RequestParams is the `_meta` every request carries, embedded by each params
@@ -181,9 +220,11 @@ type ServerCapabilities struct {
 // It is declared on the structs rather than tolerated by the decoder because
 // REQ-SEC-12.1 rejects unknown properties on a protocol payload: a field the
 // struct does not name is a field that reached us without being modelled, and
-// `_meta` is now on every single request.
+// `_meta` is now on every single request. Its CONTENTS are raw, for the same
+// reason as ResultMeta: the namespace is open, and the server reads the one
+// key it needs (the protocol version) with its own bounded probe.
 type RequestParams struct {
-	Meta *RequestMeta `json:"_meta,omitzero"`
+	Meta json.RawMessage `json:"_meta,omitzero"`
 }
 
 // DiscoverParams is server/discover's request. It carries only `_meta`.
@@ -202,7 +243,10 @@ type DiscoverResult struct {
 	SupportedVersions []string           `json:"supportedVersions"`
 	Capabilities      ServerCapabilities `json:"capabilities"`
 	Instructions      string             `json:"instructions,omitzero"`
-	Meta              *ResultMeta        `json:"_meta,omitzero"`
+	// ServerInfo is the identity a server MAY carry at the top level as well
+	// as under _meta; both are accepted so neither form is a rejection.
+	ServerInfo *Implementation `json:"serverInfo,omitzero"`
+	Meta       json.RawMessage `json:"_meta,omitzero"`
 	CacheHints
 }
 
@@ -238,8 +282,8 @@ type InputRequiredResult struct {
 	InputRequests map[string]json.RawMessage `json:"inputRequests,omitzero"`
 	// RequestState is OPAQUE. A client that parses it is reading a server's
 	// private state and will break when the server changes it.
-	RequestState string      `json:"requestState,omitzero"`
-	Meta         *ResultMeta `json:"_meta,omitzero"`
+	RequestState string          `json:"requestState,omitzero"`
+	Meta         json.RawMessage `json:"_meta,omitzero"`
 }
 
 // InputRequest is one entry of inputRequests: a JSON-RPC request object the
@@ -251,14 +295,23 @@ type InputRequest struct {
 
 // ---------------------------------------------------------------- tools
 
-// ---------------------------------------------------------------- tools
+// The structs below name EVERY optional member 2026-07-28 defines on them,
+// including the ones this build never reads (outputSchema, icons, ...). That
+// is not completeness for its own sake: the binder is strict (REQ-SEC-12.1),
+// so a member absent here is not ignored, it fails the whole message — and a
+// conforming server sending outputSchema on one tool would have made every
+// tool on that server unusable. Open-namespace members (`_meta`, annotations,
+// icons) are carried as json.RawMessage for the reason ResultMeta gives.
 
 type ToolDefinition struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitzero"`
-	InputSchema json.RawMessage `json:"inputSchema,omitzero"`
-	Annotations json.RawMessage `json:"annotations,omitzero"`
-	Title       string          `json:"title,omitzero"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description,omitzero"`
+	InputSchema  json.RawMessage `json:"inputSchema,omitzero"`
+	OutputSchema json.RawMessage `json:"outputSchema,omitzero"`
+	Annotations  json.RawMessage `json:"annotations,omitzero"`
+	Title        string          `json:"title,omitzero"`
+	Icons        json.RawMessage `json:"icons,omitzero"`
+	Meta         json.RawMessage `json:"_meta,omitzero"`
 }
 
 func (t ToolDefinition) Validate() error {
@@ -277,7 +330,7 @@ type ToolsListResult struct {
 	ResultType ResultType       `json:"resultType"`
 	Tools      []ToolDefinition `json:"tools"`
 	NextCursor string           `json:"nextCursor,omitzero"`
-	Meta       *ResultMeta      `json:"_meta,omitzero"`
+	Meta       json.RawMessage  `json:"_meta,omitzero"`
 	CacheHints
 }
 
@@ -294,17 +347,27 @@ type ToolsCallParams struct {
 
 // Content is one item of a tool result.
 //
-// Text, image and resource are modelled; anything else is retained as Raw. A
-// content type this build does not know is a capability we lack, not a message
-// to reject — the same argument REQ-SESS-05.2 makes about unknown entry types.
+// Type is NOT validated: a content type this build does not know (audio, say)
+// is a capability we lack, not a message to reject — the same argument
+// REQ-SESS-05.2 makes about unknown entry types — and it is carried through
+// with whatever modelled members it uses. Only an unknown MEMBER is rejected
+// (REQ-SEC-12.1), which is why the union of every content type's members is
+// declared here: text, image and audio (data, mimeType), embedded resource,
+// and resource_link, whose members are those of Resource.
 type Content struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text,omitzero"`
-	Data     string          `json:"data,omitzero"`
-	MimeType string          `json:"mimeType,omitzero"`
-	Resource json.RawMessage `json:"resource,omitzero"`
-	URI      string          `json:"uri,omitzero"`
-	Raw      json.RawMessage `json:"-"`
+	Type        string          `json:"type"`
+	Text        string          `json:"text,omitzero"`
+	Data        string          `json:"data,omitzero"`
+	MimeType    string          `json:"mimeType,omitzero"`
+	Resource    json.RawMessage `json:"resource,omitzero"`
+	URI         string          `json:"uri,omitzero"`
+	Name        string          `json:"name,omitzero"`
+	Title       string          `json:"title,omitzero"`
+	Description string          `json:"description,omitzero"`
+	Size        *int64          `json:"size,omitzero"`
+	Icons       json.RawMessage `json:"icons,omitzero"`
+	Annotations json.RawMessage `json:"annotations,omitzero"`
+	Meta        json.RawMessage `json:"_meta,omitzero"`
 }
 
 type ToolsCallResult struct {
@@ -315,16 +378,21 @@ type ToolsCallResult struct {
 	// react to, where a JSON-RPC error is a call that never happened.
 	IsError           bool            `json:"isError,omitzero"`
 	StructuredContent json.RawMessage `json:"structuredContent,omitzero"`
+	Meta              json.RawMessage `json:"_meta,omitzero"`
 }
 
 // ---------------------------------------------------------------- resources
 
 type Resource struct {
-	URI         string `json:"uri"`
-	Name        string `json:"name"`
-	Title       string `json:"title,omitzero"`
-	Description string `json:"description,omitzero"`
-	MimeType    string `json:"mimeType,omitzero"`
+	URI         string          `json:"uri"`
+	Name        string          `json:"name"`
+	Title       string          `json:"title,omitzero"`
+	Description string          `json:"description,omitzero"`
+	MimeType    string          `json:"mimeType,omitzero"`
+	Size        *int64          `json:"size,omitzero"`
+	Icons       json.RawMessage `json:"icons,omitzero"`
+	Annotations json.RawMessage `json:"annotations,omitzero"`
+	Meta        json.RawMessage `json:"_meta,omitzero"`
 }
 
 func (r Resource) Validate() error {
@@ -341,10 +409,10 @@ type ResourcesListParams struct {
 }
 
 type ResourcesListResult struct {
-	ResultType ResultType  `json:"resultType"`
-	Resources  []Resource  `json:"resources"`
-	NextCursor string      `json:"nextCursor,omitzero"`
-	Meta       *ResultMeta `json:"_meta,omitzero"`
+	ResultType ResultType      `json:"resultType"`
+	Resources  []Resource      `json:"resources"`
+	NextCursor string          `json:"nextCursor,omitzero"`
+	Meta       json.RawMessage `json:"_meta,omitzero"`
 	CacheHints
 }
 
@@ -354,16 +422,17 @@ type ResourcesReadParams struct {
 }
 
 type ResourceContents struct {
-	URI      string `json:"uri"`
-	MimeType string `json:"mimeType,omitzero"`
-	Text     string `json:"text,omitzero"`
-	Blob     string `json:"blob,omitzero"`
+	URI      string          `json:"uri"`
+	MimeType string          `json:"mimeType,omitzero"`
+	Text     string          `json:"text,omitzero"`
+	Blob     string          `json:"blob,omitzero"`
+	Meta     json.RawMessage `json:"_meta,omitzero"`
 }
 
 type ResourcesReadResult struct {
 	ResultType ResultType         `json:"resultType"`
 	Contents   []ResourceContents `json:"contents"`
-	Meta       *ResultMeta        `json:"_meta,omitzero"`
+	Meta       json.RawMessage    `json:"_meta,omitzero"`
 	CacheHints
 }
 
@@ -383,13 +452,15 @@ type SamplingParams struct {
 	StopSequences    []string          `json:"stopSequences,omitzero"`
 	ModelPreferences json.RawMessage   `json:"modelPreferences,omitzero"`
 	Metadata         json.RawMessage   `json:"metadata,omitzero"`
+	Meta             json.RawMessage   `json:"_meta,omitzero"`
 }
 
 type SamplingResult struct {
-	Role       string  `json:"role"`
-	Content    Content `json:"content"`
-	Model      string  `json:"model"`
-	StopReason string  `json:"stopReason,omitzero"`
+	Role       string          `json:"role"`
+	Content    Content         `json:"content"`
+	Model      string          `json:"model"`
+	StopReason string          `json:"stopReason,omitzero"`
+	Meta       json.RawMessage `json:"_meta,omitzero"`
 }
 
 // ---------------------------------------------------------------- subscriptions
@@ -423,8 +494,8 @@ type SubscriptionsListenParams struct {
 // subscription down gracefully. An abrupt transport close carries no result,
 // which is why a client cannot treat its absence as an error.
 type SubscriptionsListenResult struct {
-	ResultType ResultType  `json:"resultType"`
-	Meta       *ResultMeta `json:"_meta,omitzero"`
+	ResultType ResultType      `json:"resultType"`
+	Meta       json.RawMessage `json:"_meta,omitzero"`
 }
 
 // ---------------------------------------------------------------- decoding

@@ -94,24 +94,70 @@ func (w *Workspace) Resolve(p string) (string, error) {
 // THAT through symlinks, and rejoins the missing tail. This is what makes
 // containment correct for a file that does not exist yet, including one whose
 // parent directory is a symlink out of the workspace.
+//
+// A DANGLING symlink is the case the naive walk gets wrong (REQ-SEC-01,
+// NFR-SEC-02): EvalSymlinks fails on `ws/link -> /outside/newfile` exactly as
+// it fails on a missing file, and resolving the parent and rejoining the base
+// yields `ws/link` — inside the root — while os.WriteFile then follows the link
+// and creates /outside/newfile. So when EvalSymlinks fails, the component is
+// Lstat'ed; if it is a link its target is substituted and containment
+// continues on the TARGET, which is the path the write would actually reach.
 func resolveExistingPrefix(abs string) (string, error) {
 	tail := ""
 	cur := abs
-	for {
+	// Bounded so a link cycle (a -> b -> a, both dangling through the cycle)
+	// terminates. The number is what the platform resolvers use.
+	for hops := 0; hops < maxSymlinkHops; hops++ {
 		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
-			if tail == "" {
-				return resolved, nil
-			}
 			return filepath.Join(resolved, tail), nil
+		}
+		if fi, err := os.Lstat(cur); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(cur)
+			if err != nil {
+				return "", fmt.Errorf("%w: %s: %v", ErrPathMalformed, cur, err)
+			}
+			if !filepath.IsAbs(target) {
+				// A relative target is relative to the directory holding the
+				// link, not to the process working directory.
+				target = filepath.Join(filepath.Dir(cur), target)
+			}
+			cur = filepath.Clean(target)
+			continue
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
-			// Reached the root without finding anything that exists.
-			return abs, nil
+			// Reached the filesystem root without finding anything that exists.
+			return filepath.Join(cur, tail), nil
 		}
 		tail = filepath.Join(filepath.Base(cur), tail)
 		cur = parent
 	}
+	return "", fmt.Errorf("%w: too many levels of symbolic links in %s", ErrPathMalformed, abs)
+}
+
+// maxSymlinkHops bounds resolveExistingPrefix's link following.
+const maxSymlinkHops = 40
+
+// CheckWriteTarget re-checks abs IMMEDIATELY before a write opens it
+// (REQ-SEC-01). Resolve already returned a contained path, but a link created
+// at that path between the check and the open — by a concurrent command, or
+// by a hostile repository's own build step — would be followed by the open.
+// An open that follows a link whose target lies outside the root is refused
+// here, where the window is as small as the platform allows.
+func (w *Workspace) CheckWriteTarget(abs string) error {
+	fi, err := os.Lstat(abs)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return nil // absent (about to be created) or a plain file
+	}
+	resolved, err := resolveExistingPrefix(abs)
+	if err != nil {
+		return err
+	}
+	if !within(w.Root, resolved) {
+		return fmt.Errorf("%w: %s is a symlink whose target %s lies outside the workspace root %s",
+			ErrPathNotAllowed, w.Rel(abs), resolved, w.Root)
+	}
+	return nil
 }
 
 // within reports whether target is root or is inside it. It compares path

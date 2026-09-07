@@ -73,7 +73,7 @@ func ApplyEdits(content string, edits []Edit) (string, int, error) {
 
 	// ---- Phase 3: not unique. The pinned wording.
 	for i, e := range edits {
-		if n := strings.Count(content, e.OldString); n > 1 {
+		if n := countOverlapping(content, e.OldString); n > 1 {
 			return "", 0, &EditError{Phase: "not_unique", Index: i,
 				Text: fmt.Sprintf("Found %d occurrences of the string to replace. "+
 					"The text must be unique. Please provide more context to make it unique.", n)}
@@ -123,6 +123,22 @@ func ApplyEdits(content string, edits []Edit) (string, int, error) {
 			Text: "The edits would leave the file unchanged."}
 	}
 	return out, len(edits), nil
+}
+
+// countOverlapping counts every occurrence of sub in s, INCLUDING overlapping
+// ones. strings.Count counts non-overlapping occurrences, so it reports "aa"
+// as unique in "aaa" — and there are two sites the model could have meant,
+// which is exactly the ambiguity REQ-TOOL-04c's uniqueness rule exists to
+// reject.
+func countOverlapping(s, sub string) int {
+	n := 0
+	for i := 0; ; n++ {
+		j := strings.Index(s[i:], sub)
+		if j < 0 {
+			return n
+		}
+		i += j + 1
+	}
 }
 
 // LineEnding describes the convention a file uses.

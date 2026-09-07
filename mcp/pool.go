@@ -13,6 +13,37 @@ import (
 	"github.com/agentfox/agentkit-go/wire"
 )
 
+// UnresolvedVariableError is NFR-SEC-03's configuration error: a server's env
+// or headers referenced a ${VAR} that resolved to nothing.
+//
+// It is an ERROR, not a warning with a blank substituted, because the two
+// outcomes of substituting a blank are both worse than refusing. The child
+// starts with an empty credential and fails authentication with a message
+// about a bad token, which sends the reader looking at the token; or the
+// header is dropped and the 401 explains nothing at all. Neither names the
+// variable. This does, and it names every one at once so the operator fixes
+// them in one pass rather than one per restart.
+//
+// A variable set to the EMPTY STRING is not unresolved: that is a value the
+// operator chose. Only an absent one is.
+type UnresolvedVariableError struct {
+	Server    string
+	Variables []string
+}
+
+func (e *UnresolvedVariableError) Error() string {
+	return fmt.Sprintf("mcp: server %q references unset variable(s) %s; unexpanded "+
+		"references are a configuration error (NFR-SEC-03)", e.Server, e.namesList())
+}
+
+func (e *UnresolvedVariableError) namesList() string {
+	names := make([]string, len(e.Variables))
+	for i, v := range e.Variables {
+		names[i] = "${" + v + "}"
+	}
+	return strings.Join(names, ", ")
+}
+
 // Pool is REQ-MCP-CLIENT-04: server_name -> connection, built during session
 // initialization and torn down when the session ends.
 type Pool struct {
@@ -41,11 +72,18 @@ func (p *Pool) Add(c *ServerConnection) error {
 // Connect opens a server and initializes it (REQ-MCP-CLIENT-02).
 //
 // A `command` server is spawned as a subprocess over stdio; a `url` server is
-// opened over one of the two HTTP transports. env is the reduced environment
-// for a child (REQ-MCP-CLIENT-10), and secrets resolves ${VAR} references at
-// CONNECT time — so a credential lives in the child's environment or in a
-// request header, and never in the config file, the process table, or a log of
-// the command line.
+// opened over Streamable HTTP. env is the reduced environment for a child
+// (REQ-MCP-CLIENT-10), and secrets resolves ${VAR} references at CONNECT time
+// — so a credential lives in the child's environment or in a request header,
+// and never in the config file, the process table, or a log of the command
+// line. A reference that resolves to nothing is an *UnresolvedVariableError
+// and nothing is spawned (NFR-SEC-03).
+//
+// The connection it returns reconnects on its own (NFR-REL-03): a stdio server
+// that exits is re-spawned and an HTTP transport that died is re-opened, at
+// the next call and at most PerSessionReconnectLimit times. A stdio server is
+// also subscribed to tools/list_changed for the life of the connection
+// (REQ-CACHE-07); an HTTP server is not — see ServerConfig.URL.
 func (p *Pool) Connect(ctx context.Context, cfg ServerConfig, env []string, secrets func(string) string) (*ServerConnection, error) {
 	switch {
 	case cfg.Command != "":
@@ -55,14 +93,11 @@ func (p *Pool) Connect(ctx context.Context, cfg ServerConfig, env []string, secr
 		return nil, fmt.Errorf("mcp: server %q has neither a command nor a url", cfg.Name)
 	}
 	childEnv, missing := resolveEnv(cfg.Env, env, secrets)
-	for _, name := range missing {
-		if p.opts.Warnf != nil {
-			p.opts.Warnf("server %q: ${%s} is unset and expanded to empty; the child will "+
-				"start with a blank value rather than the literal reference", cfg.Name, name)
-		}
+	if len(missing) > 0 {
+		return nil, &UnresolvedVariableError{Server: cfg.Name, Variables: missing}
 	}
 
-	tr, err := StartStdio(ctx, StdioOptions{
+	stdioOpts := StdioOptions{
 		Command: cfg.Command, Args: cfg.Args, Dir: cfg.Dir, Env: childEnv,
 		Limits: p.opts.Limits,
 		Stderr: func(line string) {
@@ -70,7 +105,8 @@ func (p *Pool) Connect(ctx context.Context, cfg ServerConfig, env []string, secr
 				p.opts.Warnf("server %q: %s", cfg.Name, line)
 			}
 		},
-	})
+	}
+	tr, err := StartStdio(ctx, stdioOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -80,6 +116,11 @@ func (p *Pool) Connect(ctx context.Context, cfg ServerConfig, env []string, secr
 		_ = c.Close()
 		return nil, err
 	}
+	// Reconnection is armed only AFTER discovery succeeded. A server that
+	// dies while being discovered is misconfigured, and re-spawning it three
+	// more times would report the same failure three times later.
+	c.setDial(func(ctx context.Context) (Transport, error) { return StartStdio(ctx, stdioOpts) })
+	c.keepToolsSubscribed()
 	if err := p.Add(c); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -93,23 +134,26 @@ func (p *Pool) Connect(ctx context.Context, cfg ServerConfig, env []string, secr
 // environment, so `Authorization = "Bearer ${GH_TOKEN}"` in a config file
 // carries a reference and not a token.
 func (p *Pool) connectHTTP(ctx context.Context, cfg ServerConfig, env []string, secrets func(string) string) (*ServerConnection, error) {
-	headers, missing := resolveHeaders(cfg.Headers, env, secrets)
-	for _, name := range missing {
+	headers, missing, dropped := resolveHeaders(cfg.Headers, env, secrets)
+	if len(missing) > 0 {
+		return nil, &UnresolvedVariableError{Server: cfg.Name, Variables: missing}
+	}
+	for _, name := range dropped {
 		if p.opts.Warnf != nil {
-			p.opts.Warnf("server %q: ${%s} is unset and expanded to empty; the request "+
-				"header will carry a blank value rather than the literal reference",
-				cfg.Name, name)
+			p.opts.Warnf("server %q: header %q resolved to a blank or unsafe value and was "+
+				"not sent", cfg.Name, name)
 		}
 	}
 
-	tr, err := StartStreamableHTTP(ctx, HTTPTransportOptions{
+	httpOpts := HTTPTransportOptions{
 		URL: cfg.URL, Headers: headers,
 		Limits: p.opts.Limits, Warnf: func(format string, args ...any) {
 			if p.opts.Warnf != nil {
 				p.opts.Warnf("server %q: "+format, append([]any{cfg.Name}, args...)...)
 			}
 		},
-	})
+	}
+	tr, err := StartStreamableHTTP(ctx, httpOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +163,7 @@ func (p *Pool) connectHTTP(ctx context.Context, cfg ServerConfig, env []string, 
 		_ = c.Close()
 		return nil, err
 	}
+	c.setDial(func(ctx context.Context) (Transport, error) { return StartStreamableHTTP(ctx, httpOpts) })
 	if err := p.Add(c); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -374,39 +419,43 @@ func resolveEnv(declared map[string]string, base []string, secrets func(string) 
 // envLookup is the one resolution order for ${VAR}: the secrets store first,
 // then the reduced environment. Sharing it is what keeps a header and a child
 // environment from resolving the same reference differently.
-func envLookup(base []string, secrets func(string) string) func(string) string {
-	return func(name string) string {
+//
+// It reports presence separately from value, because NFR-SEC-03 makes an
+// unresolved reference an error and a variable set to "" is not unresolved.
+// The secrets function cannot express absence, so a store answering "" falls
+// through to the environment, where an explicitly empty variable counts as
+// set.
+func envLookup(base []string, secrets func(string) string) func(string) (string, bool) {
+	return func(name string) (string, bool) {
 		if secrets != nil {
 			if v := secrets(name); v != "" {
-				return v
+				return v, true
 			}
 		}
 		for _, kv := range base {
 			if k, v, ok := strings.Cut(kv, "="); ok && k == name {
-				return v
+				return v, true
 			}
 		}
-		return ""
+		return "", false
 	}
 }
 
-// resolveHeaders expands ${VAR} in header values, reporting the names that
-// resolved to nothing.
+// resolveHeaders expands ${VAR} in header values.
 //
-// A header referencing a variable that did not resolve is DROPPED ENTIRELY,
-// not sent with the gap filled in. `Bearer ${TOKEN}` with no TOKEN is
-// `Bearer ` — literal scaffolding around a missing secret, which is not a
-// weaker credential but a malformed request, and the 401 it earns tells an
-// operator far less than the warning this returns. Checking the resolved
-// string for emptiness would miss exactly this case, so the test is whether
-// any REFERENCE went unresolved.
-func resolveHeaders(declared map[string]string, base []string, secrets func(string) string) (map[string]string, []string) {
+// missing names the references that resolved to nothing; the caller makes
+// that a configuration error (NFR-SEC-03). dropped names the headers whose
+// RESOLVED value could not be sent: blank, or carrying a control byte. A
+// control byte in a header is a request-splitting attempt, and it can arrive
+// through an interpolated secret rather than through the config file — so
+// the header is withheld and reported rather than handed to net/http to
+// reject with an opaque error.
+func resolveHeaders(declared map[string]string, base []string, secrets func(string) string) (headers map[string]string, missing, dropped []string) {
 	if len(declared) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	lookup := envLookup(base, secrets)
 	out := make(map[string]string, len(declared))
-	var missing []string
 	seen := map[string]bool{}
 	keys := make([]string, 0, len(declared))
 	for k := range declared {
@@ -420,22 +469,17 @@ func resolveHeaders(declared map[string]string, base []string, secrets func(stri
 				seen[n], missing = true, append(missing, n)
 			}
 		}
-		if len(names) > 0 || strings.TrimSpace(expanded) == "" {
+		if len(names) > 0 {
 			continue
 		}
-		if !isHeaderSafe(k) || !isHeaderSafe(expanded) {
-			// A control byte in a header is a request-splitting attempt, and
-			// it can arrive through an interpolated secret rather than through
-			// the config file.
-			if !seen[k] {
-				seen[k], missing = true, append(missing, k)
-			}
+		if strings.TrimSpace(expanded) == "" || !isHeaderSafe(k) || !isHeaderSafe(expanded) {
+			dropped = append(dropped, k)
 			continue
 		}
 		out[k] = expanded
 	}
 	if len(out) == 0 {
-		return nil, missing
+		return nil, missing, dropped
 	}
-	return out, missing
+	return out, missing, dropped
 }

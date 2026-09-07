@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
 	"github.com/agentfox/agentkit-go/schema"
@@ -236,10 +237,14 @@ func DefaultThinkingBudgets() map[core.ThinkingLevel]int {
 //
 //	unset  -> no thinkingConfig at all (absent is not the same as zero)
 //	off    -> budget 0, or the family's FLOOR when it cannot disable thinking
-//	level  -> the model's own budget for that level
+//	level  -> the model's own budget for that level, CLAMPED to a level the
+//	          row prices (upward first, then downward); nothing at all when
+//	          the row prices no reachable level
 //
-// The level is assumed already clamped by the caller (REQ-PROV-15's
-// ClampThinkingLevel); this function only prices it.
+// `off` bypasses the clamp: disabling is a per-family capability handled by
+// the compat profile below, not a catalog level, and clamping a request for
+// no thinking upward to the model's lowest level would spend the caller's
+// money against their stated wish.
 func resolveThinking(m *core.Model, level core.ThinkingLevel, c Compat) *thinkingConfig {
 	if level == core.ThinkingUnset {
 		return nil
@@ -260,7 +265,10 @@ func resolveThinking(m *core.Model, level core.ThinkingLevel, c Compat) *thinkin
 		return &thinkingConfig{ThinkingBudget: &budget}
 	}
 
-	budget := budgetFor(m, level)
+	budget, ok := budgetFor(m, level)
+	if !ok {
+		return nil
+	}
 	if budget >= 0 && budget < floor {
 		budget = floor
 	}
@@ -275,21 +283,34 @@ func resolveThinking(m *core.Model, level core.ThinkingLevel, c Compat) *thinkin
 	return tc
 }
 
-// budgetFor reads the model's own wire value for a level, falling back to the
-// default table. A wire value of "-1" is Gemini's "dynamic" budget and is
-// passed through as such.
-func budgetFor(m *core.Model, level core.ThinkingLevel) int {
-	if m != nil && m.ThinkingLevelMap != nil {
-		if w, ok := m.ThinkingLevelMap[level]; ok && w != nil {
-			if n, err := strconv.Atoi(strings.TrimSpace(*w)); err == nil {
-				return n
-			}
+// budgetFor prices a level against the model's own ThinkingLevelMap, CLAMPING
+// the request to a level the map prices (REQ-PROV-15: upward first, then
+// downward) and using the RETURNED wire value. A wire value of "-1" is
+// Gemini's "dynamic" budget and is passed through as such.
+//
+// The default table is consulted only for a model with NO map at all — a
+// hand-built descriptor with nothing to clamp against. A row that prices
+// some levels but not the requested one is clamped, never defaulted: the
+// default for `max` is 32768, which on a family whose row tops out at 8192 is
+// a 400, and on one that accepts it is money the row said not to spend.
+// ok == false means the row prices no reachable level and the thinking
+// config is omitted rather than guessed.
+func budgetFor(m *core.Model, level core.ThinkingLevel) (int, bool) {
+	if m != nil && len(m.ThinkingLevelMap) > 0 {
+		_, wire, ok := catalog.ClampThinkingLevel(m, level)
+		if !ok {
+			return 0, false
 		}
+		n, err := strconv.Atoi(strings.TrimSpace(wire))
+		if err != nil {
+			return 0, false
+		}
+		return n, true
 	}
 	if n, ok := DefaultThinkingBudgets()[level]; ok {
-		return n
+		return n, true
 	}
-	return DefaultThinkingBudgets()[core.ThinkingMedium]
+	return 0, false
 }
 
 // ------------------------------------------------------------ id normalization
@@ -365,10 +386,10 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 		TopP:          req.TopP,
 		StopSequences: req.StopSequences,
 	}
-	if req.MaxTokens != nil {
-		v := *req.MaxTokens
-		gc.MaxOutputTokens = &v
-	}
+	// REQ-CAT-04: the caller's max_tokens is an UPPER BOUND, clamped against
+	// what the loop's anchored context estimate leaves of the window. Absent
+	// stays absent; this wire does not require the field.
+	gc.MaxOutputTokens = catalog.ClampRequestMaxTokens(m, req)
 	gc.ThinkingConfig = resolveThinking(m, req.ThinkingLevel, compat)
 	if !gc.empty() {
 		out.GenerationConfig = gc

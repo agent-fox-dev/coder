@@ -564,11 +564,149 @@ func TestThinkingIsATriState(t *testing.T) {
 		t.Fatalf("thinking = %v, want the catalog row's own budget", on)
 	}
 
-	// An unmapped level is OMITTED, never guessed: sending a level the model
-	// does not know is a 400, and inventing a budget is worse than not
-	// thinking (REQ-PROV-15).
-	if got := capture(core.ThinkingMax)["thinking"]; got != nil {
-		t.Fatalf("thinking = %v for an unmapped level, want the key omitted", got)
+	// A level the row does not price is CLAMPED, never passed through and
+	// never guessed: max on a row that tops out at high clamps DOWN to high,
+	// REQ-PROV-15's own worked example.
+	clamped := capture(core.ThinkingMax)["thinking"].(map[string]any)
+	if clamped["type"] != "enabled" || clamped["budget_tokens"] != float64(2048) {
+		t.Fatalf("thinking = %v for max on a row that tops out at high, want high's budget", clamped)
+	}
+	// A model with NO map has no reachable level, and the key is omitted:
+	// sending a level the model does not know is a 400, and inventing a
+	// budget is worse than not thinking.
+	m.ThinkingLevelMap = nil
+	if got := capture(core.ThinkingHigh)["thinking"]; got != nil {
+		t.Fatalf("thinking = %v for a model with no map, want the key omitted", got)
+	}
+}
+
+// TestAnEffortStyleRowIsPricedIntoABudget pins the one shape the Messages API
+// rejects outright: {"type":"enabled"} with no budget_tokens. A catalog row
+// whose wire values are effort tokens ("high") rather than numbers used to
+// produce exactly that. An effort token is priced onto the same budget ladder
+// the budget-style rows use; a token the adapter does not know omits thinking
+// rather than sending a budgetless enable.
+func TestAnEffortStyleRowIsPricedIntoABudget(t *testing.T) {
+	capture := func(m *core.Model, level core.ThinkingLevel) map[string]any {
+		var got map[string]any
+		req := core.Request{ThinkingLevel: level, Options: core.RequestOptions{
+			OnPayload: func(p any, _ *core.Model) (any, error) {
+				b, _ := json.Marshal(p)
+				_ = json.Unmarshal(b, &got)
+				return nil, nil
+			},
+		}}
+		run(t, m, req, anthropic.Options{}, 200, streamFixture())
+		return got
+	}
+	assertNeverBudgetless := func(body map[string]any) {
+		t.Helper()
+		th, ok := body["thinking"].(map[string]any)
+		if !ok {
+			return
+		}
+		if th["type"] == "enabled" && th["budget_tokens"] == nil {
+			t.Fatalf("thinking = %v: type enabled with no budget_tokens is rejected by the Messages API", th)
+		}
+	}
+
+	m := testModel()
+	m.MaxTokens = 64000
+	high := "high"
+	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingHigh: &high}
+	body := capture(m, core.ThinkingHigh)
+	assertNeverBudgetless(body)
+	th, _ := body["thinking"].(map[string]any)
+	if th == nil || th["type"] != "enabled" || th["budget_tokens"] != float64(32768) {
+		t.Fatalf("thinking = %v for an effort-style row, want enabled with high's budget 32768", th)
+	}
+
+	unknown := "turbo"
+	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingHigh: &unknown}
+	body = capture(m, core.ThinkingHigh)
+	assertNeverBudgetless(body)
+	if body["thinking"] != nil {
+		t.Fatalf("thinking = %v for a wire token that is neither a budget nor an effort, want omitted", body["thinking"])
+	}
+}
+
+// TestAnEmptyToolResultOmitsContent is REQ-LOOP-02 on this wire's one
+// optional field. An empty result used to serialize as a placeholder
+// {"type":"text"} — Text is omitzero — and a text block with no text key is a
+// 400 on every successful command that prints nothing.
+func TestAnEmptyToolResultOmitsContent(t *testing.T) {
+	call, _ := core.NewToolUse("toolu_1", "rm", json.RawMessage(`{"path":"x"}`))
+	req := core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "delete x"}}},
+		core.AssistantMessage{Content: core.Content{call}, StopReason: core.StopReasonToolUse,
+			Provider: "anthropic", API: anthropic.API, Model: "claude-test"},
+		core.ToolResultMessage{ToolUseID: "toolu_1", ToolName: "rm"},
+	}}
+	body, _, err := anthropic.BuildRequest(testModel(), req, core.CacheRetentionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(body)
+	if strings.Contains(string(raw), `{"type":"text"}`) {
+		t.Fatalf("body carries a text block with no text: %s", raw)
+	}
+	var got struct {
+		Messages []struct {
+			Content []map[string]any `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	tr := got.Messages[len(got.Messages)-1].Content[0]
+	if tr["type"] != "tool_result" {
+		t.Fatalf("last block = %v, want the tool_result", tr)
+	}
+	if _, present := tr["content"]; present {
+		t.Fatalf("tool_result = %v; content must be OMITTED when the result is empty", tr)
+	}
+}
+
+// TestMaxTokensIsNeverZeroAndMessagesNeverNull: both are hard 400s on this
+// wire, and both used to be reachable — max_tokens from a Model with no cap
+// and no window, messages from a request with no history.
+func TestMaxTokensIsNeverZeroAndMessagesNeverNull(t *testing.T) {
+	m := testModel()
+	m.MaxTokens, m.ContextWindow = 0, 0
+	body, _, err := anthropic.BuildRequest(m, core.Request{}, core.CacheRetentionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(body)
+	var got map[string]any
+	_ = json.Unmarshal(raw, &got)
+	if mt, _ := got["max_tokens"].(float64); mt <= 0 {
+		t.Fatalf("max_tokens = %v, want a positive number: the field is required and 0 is rejected", got["max_tokens"])
+	}
+	if !strings.Contains(string(raw), `"messages":[]`) {
+		t.Fatalf("body = %s, want \"messages\":[] rather than null", raw)
+	}
+}
+
+// TestAMalformedContentBlockStartFailsTheStream: a content_block that does
+// not decode used to be silently dropped, leaving every later delta for that
+// index with nothing to accumulate into and a turn that ended short with no
+// error saying why (REQ-PROV-04).
+func TestAMalformedContentBlockStartFailsTheStream(t *testing.T) {
+	body := sseBody(
+		[2]string{"message_start", `{"message":{"id":"m","model":"claude-test","usage":{"input_tokens":5}}}`},
+		[2]string{"content_block_start", `{"index":0,"content_block":"not an object"}`},
+		[2]string{"content_block_delta", `{"index":0,"delta":{"type":"text_delta","text":"lost"}}`},
+		[2]string{"content_block_stop", `{"index":0}`},
+		[2]string{"message_delta", `{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`},
+		[2]string{"message_stop", `{}`},
+	)
+	msg, _, _ := run(t, testModel(), core.Request{}, anthropic.Options{}, 200, body)
+	if msg.StopReason != core.StopReasonError {
+		t.Fatalf("stop reason = %q, want error: a block that does not decode is a stream failure, not a block to drop", msg.StopReason)
+	}
+	if !strings.Contains(msg.ErrorMessage, "content_block") {
+		t.Fatalf("error = %q, want it to name the content_block", msg.ErrorMessage)
 	}
 }
 

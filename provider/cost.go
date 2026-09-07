@@ -1,6 +1,10 @@
 package provider
 
-import "github.com/agentfox/agentkit-go/core"
+import (
+	"strings"
+
+	"github.com/agentfox/agentkit-go/core"
+)
 
 // This file is REQ-PROV-05's arithmetic, shared by every wire API.
 //
@@ -80,6 +84,26 @@ func ComputeCost(m *core.Model, u core.Usage) float64 {
 		r.Input*2*float64(u.CacheWrite1hTokens)
 
 	return cost / perM
+}
+
+// KnownServiceTier resolves a tier NAME a response reported to its
+// REQ-PROV-05.6 multiplier: flex 0.5x, priority 2x, and the standard tier 1x.
+//
+// It exists for the served-tier case: a flex request can be served at
+// standard, and the response says so in service_tier. Pricing with the
+// CONFIGURED tier then halves a bill the vendor charged in full, silently.
+// The lookup is by name because the configured ServiceTier carries only the
+// name the caller asked for and the multiplier for that one name.
+func KnownServiceTier(name string) (ServiceTier, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "default", "standard", "auto":
+		return ServiceTier{Name: name, Multiplier: 1}, true
+	case "flex":
+		return ServiceTier{Name: name, Multiplier: 0.5}, true
+	case "priority":
+		return ServiceTier{Name: name, Multiplier: 2}, true
+	}
+	return ServiceTier{}, false
 }
 
 // ApplyServiceTier is REQ-PROV-05.6. It is a separate call rather than a

@@ -1,12 +1,15 @@
 package mcp_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -228,7 +231,7 @@ func TestServerDiscoverAdvertisesVersionsAndCapabilities(t *testing.T) {
 	if res.Capabilities.Tools == nil {
 		t.Fatal("a server with tools must advertise the tools capability")
 	}
-	if res.Meta == nil || res.Meta.ServerInfo == nil {
+	if mcp.ParseResultMeta(res.Meta).ServerInfo == nil {
 		t.Fatal("a server SHOULD identify itself in each result's _meta")
 	}
 }
@@ -339,20 +342,21 @@ func TestUnregisteringAToolNotifiesConnectedClients(t *testing.T) {
 	}
 }
 
-// TestNoNotificationBeforeTheHandshakeCompletes. The spec forbids traffic
-// other than ping before the handshake, and a list_changed arriving mid-
-// handshake announces a list the client has not been told exists.
-func TestNoNotificationBeforeTheHandshakeCompletes(t *testing.T) {
+// TestNoNotificationWithoutASubscription. 2026-07-28 makes notifications
+// opt-in: a server MUST NOT send a type the client did not name on a
+// subscriptions/listen stream, and a session that never opened one gets
+// nothing at all.
+func TestNoNotificationWithoutASubscription(t *testing.T) {
 	s := mcp.NewServer(mcp.ServerOptions{})
 	raw := rawPeer(t, s)
 
-	// Round-trip a ping FIRST. Serve registers the session before it starts
-	// reading, so an answered ping proves the session is registered — without
-	// it this test races the goroutine and would pass whether or not the
-	// handshake is checked.
+	// Round-trip a request FIRST. Serve registers the session before it
+	// starts reading, so an answered request proves the session is registered
+	// — without it this test races the goroutine and would pass whether or
+	// not the subscription is checked.
 	raw.write(t, req("1", mcp.MethodToolsList))
 	if m := raw.read(t); m.Error != nil {
-		t.Fatalf("ping: %v", m.Error)
+		t.Fatalf("tools/list: %v", m.Error)
 	}
 
 	must(t, s.RegisterTool(mcp.ToolDefinition{Name: "a"},
@@ -365,10 +369,186 @@ func TestNoNotificationBeforeTheHandshakeCompletes(t *testing.T) {
 	raw.write(t, req("2", mcp.MethodToolsList))
 	m := raw.read(t)
 	if m.Method != "" {
-		t.Fatalf("a notification reached an un-initialized session: %s", m.Method)
+		t.Fatalf("a notification reached a session that never subscribed: %s", m.Method)
 	}
 	if m.ID.Key() != mcp.NumberID(2).Key() {
-		t.Fatalf("expected the second ping response, got a reply for %s", m.ID)
+		t.Fatalf("expected the second response, got a reply for %s", m.ID)
+	}
+}
+
+// ---- REQ-SEC-12.1 / REQ-SEC-11.3: the envelope is bound strictly
+
+// TestTheServerRejectsANonStrictEnvelope is the server half of the same
+// hole: `{"id":1,"ID":2}` used to be answered as id 2, and an unknown member
+// was silently accepted.
+func TestTheServerRejectsANonStrictEnvelope(t *testing.T) {
+	for _, tc := range []struct{ name, frame string }{
+		{"case-variant duplicate id",
+			fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"ID":2,"method":%q,"params":{%s}}`, mcp.MethodToolsList, meta())},
+		{"unknown member",
+			fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":{%s},"bogus":true}`, mcp.MethodToolsList, meta())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := rawPeer(t, echoServer(t))
+			raw.write(t, tc.frame)
+			m := raw.read(t)
+			if m.Error == nil || m.Error.Code != mcp.CodeParseError {
+				t.Fatalf("got %+v; the frame must be rejected as malformed and the "+
+					"connection torn down (REQ-SEC-11.4)", m)
+			}
+		})
+	}
+}
+
+// TestAParseErrorReplyCarriesANullID. JSON-RPC 2.0 §5: when the id could not
+// be read, the reply's id MUST be null. Message omits an unset id, so the
+// parse-error reply used to omit it too.
+func TestAParseErrorReplyCarriesANullID(t *testing.T) {
+	t.Run("stdio", func(t *testing.T) {
+		c2sR, c2sW := io.Pipe()
+		s2cR, s2cW := io.Pipe()
+		serverSide := mcp.NewPipeTransport(c2sR, s2cW, wire.Limits{})
+		done := make(chan struct{})
+		go func() { defer close(done); _ = echoServer(t).Serve(context.Background(), serverSide) }()
+		t.Cleanup(func() { _ = c2sW.Close(); _ = serverSide.Close(); <-done })
+
+		_, _ = c2sW.Write([]byte("not json\n"))
+		line, err := bufio.NewReader(s2cR).ReadString('\n')
+		must(t, err)
+		if !strings.Contains(line, `"id":null`) {
+			t.Fatalf("parse-error reply = %s; want an explicit null id", line)
+		}
+	})
+	t.Run("http", func(t *testing.T) {
+		h, err := echoServer(t).HTTPHandler(mcp.HTTPOptions{APIKey: "k"})
+		must(t, err)
+		srv := httptest.NewServer(h)
+		t.Cleanup(srv.Close)
+		req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader("not json"))
+		req.Header.Set("X-API-Key", "k")
+		resp, err := srv.Client().Do(req)
+		must(t, err)
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(body), `"id":null`) {
+			t.Fatalf("parse-error reply = %s; want an explicit null id", body)
+		}
+	})
+}
+
+// TestANotificationWithMismatchedHeadersIsRejectedNot202. The routing headers
+// are checked so a gateway and the server act on the same message; a
+// notification routed on a wrong header used to be accepted before the check
+// ran.
+func TestANotificationWithMismatchedHeadersIsRejectedNot202(t *testing.T) {
+	h, err := echoServer(t).HTTPHandler(mcp.HTTPOptions{APIKey: "k"})
+	must(t, err)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","method":%q,"params":{%s,"requestId":1}}`, mcp.MethodCancelled, meta())
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(body))
+	req.Header.Set("X-API-Key", "k")
+	req.Header.Set(mcp.HeaderProtocolVersion, mcp.ProtocolVersion)
+	req.Header.Set(mcp.HeaderMethod, mcp.MethodToolsList) // disagrees with the body
+	resp, err := srv.Client().Do(req)
+	must(t, err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d; a notification whose headers disagree with its body must "+
+			"be refused with -32020, not accepted with 202", resp.StatusCode)
+	}
+}
+
+// TestStdioServeBoundsConcurrentHandlers. Without a cap the client decides
+// how many goroutines this process runs; past MaxConcurrentHandlers the read
+// loop applies back-pressure instead of dispatching.
+func TestStdioServeBoundsConcurrentHandlers(t *testing.T) {
+	s := mcp.NewServer(mcp.ServerOptions{})
+	var running, started atomic.Int32
+	release := make(chan struct{})
+	must(t, s.RegisterTool(mcp.ToolDefinition{Name: "block"},
+		func(ctx context.Context, _ map[string]any) (mcp.ToolsCallResult, error) {
+			started.Add(1)
+			running.Add(1)
+			defer running.Add(-1)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return mcp.ToolsCallResult{}, nil
+		}))
+	raw := rawPeer(t, s)
+
+	const n = mcp.MaxConcurrentHandlers + 6
+	go func() {
+		// On a goroutine: past the cap the server stops reading, and the
+		// pipe's writes block with it. That is the back-pressure under test.
+		for i := 1; i <= n; i++ {
+			raw.write(t, req(fmt.Sprint(i), mcp.MethodToolsCall, `"name":"block"`))
+		}
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for running.Load() < mcp.MaxConcurrentHandlers {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d handlers running", running.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // long enough for a 65th to have started if it were going to
+	if got := started.Load(); got != mcp.MaxConcurrentHandlers {
+		t.Fatalf("%d handlers were started; the cap is %d", got, mcp.MaxConcurrentHandlers)
+	}
+
+	close(release)
+	for i := 0; i < n; i++ {
+		if m := raw.read(t); m.Error != nil {
+			t.Fatalf("request failed: %v", m.Error)
+		}
+	}
+}
+
+// ---- REQ-MCP-SERVER-06.5 over HTTP
+
+// TestSubscriptionsListenWorksOverHTTP. HTTP mode used to answer the method
+// with InvalidRequest; now the response is an event stream that stays open,
+// carries each subscribed notification, and ends when the client goes away.
+// The client here is the shipped one: its own SubscribeToolChanges over the
+// shipped Streamable HTTP transport.
+func TestSubscriptionsListenWorksOverHTTP(t *testing.T) {
+	s := echoServer(t)
+	h, err := s.HTTPHandler(mcp.HTTPOptions{APIKey: "k"})
+	must(t, err)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close) // LIFO: after the client below has disconnected
+
+	tr, err := mcp.StartStreamableHTTP(context.Background(), mcp.HTTPTransportOptions{
+		URL: srv.URL, Headers: map[string]string{"X-API-Key": "k"}})
+	must(t, err)
+	conn := mcp.NewConnection(mcp.ServerConfig{Name: "remote"}, tr, mcp.ConnectionOptions{
+		Warnf: func(f string, a ...any) { t.Logf("client: "+f, a...) }})
+	t.Cleanup(func() { _ = conn.Close() })
+	subscribe(t, conn)
+
+	before, err := conn.ListTools(context.Background())
+	must(t, err)
+	must(t, s.RegisterTool(mcp.ToolDefinition{Name: "late"},
+		func(context.Context, map[string]any) (mcp.ToolsCallResult, error) {
+			return mcp.ToolsCallResult{}, nil
+		}))
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		after, err := conn.ListTools(context.Background())
+		must(t, err)
+		if len(after) == len(before)+1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("list_changed never arrived on the HTTP listen stream: %d tools, want %d",
+				len(after), len(before)+1)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

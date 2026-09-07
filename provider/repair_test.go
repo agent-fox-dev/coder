@@ -406,3 +406,51 @@ func FuzzRepairAlwaysSendable(f *testing.F) {
 		}
 	})
 }
+
+// TestSameModelToolCallIDsAreNotRewritten is REQ-PROV-11 rule 5 as written:
+// "when not same_model". An id the target itself issued is already in its
+// own format; rewriting it renames a call the model remembers making, for a
+// prompt-cache miss and a confused replay.
+func TestSameModelToolCallIDsAreNotRewritten(t *testing.T) {
+	tgt := target()
+	tgt.NormalizeToolCallID = func(s string) string { return strings.ReplaceAll(s, ":", "_") }
+	in := core.Messages{
+		sameModelAssistant(tu(t, "call:1", "read")),
+		core.ToolResultMessage{ToolUseID: "call:1", ToolName: "read"},
+	}
+	out, rep := RepairTranscript(in, tgt)
+	if rep.RewrittenIDs != 0 {
+		t.Fatalf("RewrittenIDs = %d, want 0 for a same-model transcript", rep.RewrittenIDs)
+	}
+	if id := out[0].(core.AssistantMessage).Content[0].(core.ToolUseBlock).ID; id != "call:1" {
+		t.Fatalf("id = %q, want the target's own id left alone", id)
+	}
+	if id := out[1].(core.ToolResultMessage).ToolUseID; id != "call:1" {
+		t.Fatalf("result id = %q, want untouched", id)
+	}
+
+	// The same transcript from ANOTHER model is rewritten, and its rewrite
+	// cannot collide with an id the target issued itself.
+	foreign := core.AssistantMessage{
+		Content: core.Content{tu(t, "call:1", "read")}, StopReason: core.StopReasonToolUse,
+		Provider: "other", API: targetAPI, Model: "m1",
+	}
+	mixed := core.Messages{
+		sameModelAssistant(tu(t, "call_1", "read")),
+		core.ToolResultMessage{ToolUseID: "call_1", ToolName: "read"},
+		foreign,
+		core.ToolResultMessage{ToolUseID: "call:1", ToolName: "read"},
+	}
+	out, rep = RepairTranscript(mixed, tgt)
+	if rep.RewrittenIDs != 1 {
+		t.Fatalf("RewrittenIDs = %d, want 1 (the foreign id only)", rep.RewrittenIDs)
+	}
+	native := out[0].(core.AssistantMessage).Content[0].(core.ToolUseBlock).ID
+	rewritten := out[2].(core.AssistantMessage).Content[0].(core.ToolUseBlock).ID
+	if native != "call_1" || rewritten == native || rewritten == "call:1" {
+		t.Fatalf("ids = %q / %q: the foreign id must be rewritten to something other than the native one", native, rewritten)
+	}
+	if out[3].(core.ToolResultMessage).ToolUseID != rewritten {
+		t.Fatal("the foreign result did not follow its call's rewrite")
+	}
+}

@@ -16,6 +16,35 @@
 // N lines regardless of how large they are, and the model pays for a skill's
 // body only when it decides the skill applies and reads the file itself.
 //
+// # The prompt authoring contract (REQ-SKILL-13)
+//
+// §6.5 specifies the container — skill.toml, prompt.md, the directory. What
+// goes INSIDE prompt.md is a contract of its own, and the built-in skills
+// under `_skills/` (see BuiltinDir) are its worked examples. A conforming
+// prompt has six parts, in this order, each under its own heading:
+//
+//  1. Charter. What the skill is responsible for and, explicitly, what it is
+//     NOT. Without a stated non-goal, two skills loaded into one session both
+//     do the easy half of a job and neither does the hard half.
+//  2. Hard prohibitions, each recorded WITH THE INCIDENT that produced it. A
+//     rule with no stated cause reads as boilerplate and is reasoned away by
+//     the next model that encounters it.
+//  3. Mechanical gates: commands whose exit status is a binary result
+//     independent of model judgement, wherever the domain admits any.
+//  4. A fixed output contract: the exact shape the skill's output takes, so a
+//     caller can parse it.
+//  5. Anti-false-positive carve-outs: the patterns that look like violations
+//     and are deliberate, named explicitly.
+//  6. Pointers, not copies. The prompt references the authoritative source
+//     rather than restating it; a duplicated table drifts and then
+//     contradicts its original silently.
+//
+// The contract is prose, not a schema: this package validates the container
+// (manifest, prompt file, symlink rules) and never parses the prompt body,
+// because the body's consumer is the model and a lint over it would be a
+// second, weaker reader of the same text. Conformance is reviewed, and the
+// built-in skill is the review's reference.
+//
 // What this package does NOT do, stated so nobody reports it as done:
 //
 //   - It does not load Go plugin code, so REQ-SKILL-09's import lint and the

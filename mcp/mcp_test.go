@@ -1,6 +1,7 @@
 package mcp_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,8 +93,8 @@ func TestTheClientAndServerDiscoverAndCall(t *testing.T) {
 	if len(info.SupportedVersions) == 0 || info.SupportedVersions[0] != mcp.ProtocolVersion {
 		t.Fatalf("supportedVersions = %v, want %s", info.SupportedVersions, mcp.ProtocolVersion)
 	}
-	if info.Meta == nil || info.Meta.ServerInfo == nil || info.Meta.ServerInfo.Name != "test-server" {
-		t.Fatalf("server identity = %+v", info.Meta)
+	if id := mcp.ParseResultMeta(info.Meta).ServerInfo; id == nil || id.Name != "test-server" {
+		t.Fatalf("server identity = %s", info.Meta)
 	}
 
 	tools, err := conn.ListTools(ctx)
@@ -562,37 +564,67 @@ func TestAMalformedFrameTearsTheConnectionDown(t *testing.T) {
 
 // ---- interpolation
 
-func TestEnvInterpolationReportsUnsetVariables(t *testing.T) {
+// TestAnUnresolvedVariableIsAConfigurationError is NFR-SEC-03: "unexpanded
+// variable references are a configuration error, not silently passed to the
+// subprocess". A warning plus a blank value was the thing it forbids — the
+// child started with an empty credential and failed authentication with a
+// message about a bad token, which sends the reader to the wrong place.
+func TestAnUnresolvedVariableIsAConfigurationError(t *testing.T) {
 	cfg := mcp.ServerConfig{
 		Name: "gh", Command: "true",
-		Env: map[string]string{"TOKEN": "${GH_TOKEN}", "MODE": "${MISSING}-suffix"},
+		Env: map[string]string{"TOKEN": "${GH_TOKEN}", "MODE": "${MISSING}-suffix", "OTHER": "$ALSO_MISSING"},
 	}
-	var warnings []string
-	p := mcp.NewPool(mcp.ConnectionOptions{
-		Warnf: func(f string, a ...any) { warnings = append(warnings, fmt.Sprintf(f, a...)) },
-	})
-	_, _ = p.Connect(context.Background(), cfg, []string{"PATH=/usr/bin"},
+	p := mcp.NewPool(mcp.ConnectionOptions{})
+	defer p.Close()
+	_, err := p.Connect(context.Background(), cfg, []string{"PATH=/usr/bin"},
 		func(name string) string {
 			if name == "GH_TOKEN" {
 				return "ghp_secret"
 			}
 			return ""
 		})
+
+	var unresolved *mcp.UnresolvedVariableError
+	if !errors.As(err, &unresolved) {
+		t.Fatalf("err = %v; an unset ${VAR} must be a typed configuration error", err)
+	}
+	if got := strings.Join(unresolved.Variables, ","); got != "MISSING,ALSO_MISSING" {
+		t.Fatalf("variables = %v; the error must name every unresolved reference so they "+
+			"are fixed in one pass", unresolved.Variables)
+	}
+	if !strings.Contains(err.Error(), "${MISSING}") || strings.Contains(err.Error(), "ghp_secret") {
+		t.Fatalf("the message must name the variable and never the resolved secret: %v", err)
+	}
+	if len(p.Names()) != 0 {
+		t.Fatal("nothing may be spawned on a configuration error")
+	}
+}
+
+// TestAnExplicitlyEmptyVariableIsNotUnresolved. `FOO=` in the environment is a
+// value the operator chose; only an ABSENT variable is unresolved. A lookup
+// that returned "" for both could not tell them apart.
+func TestAnExplicitlyEmptyVariableIsNotUnresolved(t *testing.T) {
+	if os.Getenv("AGENTKIT_MCP_CHILD") != "" {
+		t.Skip("child process")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skip("no executable path")
+	}
+	p := mcp.NewPool(mcp.ConnectionOptions{})
 	defer p.Close()
 
-	var sawMissing bool
-	for _, w := range warnings {
-		if strings.Contains(w, "MISSING") {
-			sawMissing = true
-		}
-		if strings.Contains(w, "ghp_secret") {
-			t.Fatalf("a warning leaked the resolved credential: %s", w)
-		}
+	cfg := mcp.ServerConfig{Name: "child", Command: exe,
+		Env: map[string]string{"SUPPLIED": "[${EMPTY}]"}}
+	conn, err := p.Connect(context.Background(), cfg,
+		[]string{"AGENTKIT_MCP_CHILD=env", "EMPTY=", "PATH=" + os.Getenv("PATH")}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v; a variable set to the empty string is set", err)
 	}
-	if !sawMissing {
-		t.Fatalf("an unset ${VAR} must be reported; otherwise the child gets an empty "+
-			"credential and fails authentication with a message about a bad token, "+
-			"which sends the reader to the wrong place. warnings = %v", warnings)
+	res, err := conn.Call(context.Background(), "env", nil)
+	must(t, err)
+	if !strings.Contains(res.Content[0].Text, "SUPPLIED=[]") {
+		t.Fatalf("child env = %q; the empty value must be substituted", res.Content[0].Text)
 	}
 }
 
@@ -864,10 +896,6 @@ command = "b"
 // The server here is this test binary re-executed, so there is no fixture to
 // keep in sync and no dependency on anything being installed.
 func TestAStdioServerRunsAsASubprocessWithAReducedEnvironment(t *testing.T) {
-	if os.Getenv("AGENTKIT_MCP_CHILD") == "1" {
-		runChildServer()
-		return
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		t.Skip("no executable path")
@@ -878,11 +906,10 @@ func TestAStdioServerRunsAsASubprocessWithAReducedEnvironment(t *testing.T) {
 
 	cfg := mcp.ServerConfig{
 		Name: "child", Command: exe,
-		Args: []string{"-test.run=TestAStdioServerRunsAsASubprocessWithAReducedEnvironment"},
-		Env:  map[string]string{"SUPPLIED": "${A_SECRET}"},
+		Env: map[string]string{"SUPPLIED": "${A_SECRET}"},
 	}
 	conn, err := p.Connect(context.Background(), cfg,
-		[]string{"AGENTKIT_MCP_CHILD=1", "PATH=" + os.Getenv("PATH")},
+		[]string{"AGENTKIT_MCP_CHILD=env", "PATH=" + os.Getenv("PATH")},
 		func(name string) string {
 			if name == "A_SECRET" {
 				return "resolved-at-spawn"
@@ -908,7 +935,26 @@ func TestAStdioServerRunsAsASubprocessWithAReducedEnvironment(t *testing.T) {
 	}
 }
 
-// runChildServer is the subprocess half of the test above.
+// TestMain is where this test binary becomes an MCP SERVER when re-executed
+// as a subprocess. The children below are the fixtures for every test that
+// needs a real process: there is no script to keep in sync and no dependency
+// on anything being installed.
+func TestMain(m *testing.M) {
+	switch os.Getenv("AGENTKIT_MCP_CHILD") {
+	case "env":
+		runChildServer()
+		return
+	case "one-shot":
+		runOneShotChild()
+		return
+	case "mortal":
+		runMortalChild()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// runChildServer reports its environment.
 func runChildServer() {
 	s := mcp.NewServer(mcp.ServerOptions{Info: mcp.Implementation{Name: "child", Version: "1"}})
 	_ = s.RegisterTool(mcp.ToolDefinition{Name: "env"},
@@ -918,4 +964,334 @@ func runChildServer() {
 		})
 	tr := mcp.NewPipeTransport(os.Stdin, os.Stdout, wire.Limits{})
 	_ = s.Serve(context.Background(), tr)
+}
+
+// runOneShotChild answers the first request with a fixed response for id 1
+// and exits IMMEDIATELY: the shape of a server whose last frame the old stdio
+// transport could lose.
+func runOneShotChild() {
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Scan()
+	_, _ = os.Stdout.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","ok":true}}` + "\n"))
+	os.Exit(0)
+}
+
+// runMortalChild is a server that can be told to die: `die` answers and then
+// exits as soon as that answer is written, `crash` exits without answering,
+// `add_tool` registers a tool after the fact (a list_changed source), and
+// `hello` just works.
+func runMortalChild() {
+	s := mcp.NewServer(mcp.ServerOptions{Info: mcp.Implementation{Name: "mortal", Version: "1"}})
+	out := &exitAfterWrite{w: os.Stdout}
+	ok := func(text string) (mcp.ToolsCallResult, error) {
+		return mcp.ToolsCallResult{Content: []mcp.Content{{Type: "text", Text: text}}}, nil
+	}
+	_ = s.RegisterTool(mcp.ToolDefinition{Name: "hello"},
+		func(context.Context, map[string]any) (mcp.ToolsCallResult, error) { return ok("hi") })
+	_ = s.RegisterTool(mcp.ToolDefinition{Name: "die"},
+		func(context.Context, map[string]any) (mcp.ToolsCallResult, error) {
+			out.armed.Store(true)
+			return ok("bye")
+		})
+	_ = s.RegisterTool(mcp.ToolDefinition{Name: "crash"},
+		func(context.Context, map[string]any) (mcp.ToolsCallResult, error) {
+			os.Exit(1)
+			return ok("unreachable")
+		})
+	_ = s.RegisterTool(mcp.ToolDefinition{Name: "add_tool"},
+		func(context.Context, map[string]any) (mcp.ToolsCallResult, error) {
+			_ = s.RegisterTool(mcp.ToolDefinition{Name: "late"},
+				func(context.Context, map[string]any) (mcp.ToolsCallResult, error) { return ok("late") })
+			return ok("added")
+		})
+	tr := mcp.NewPipeTransport(os.Stdin, out, wire.Limits{})
+	_ = s.Serve(context.Background(), tr)
+}
+
+// exitAfterWrite exits the process right after the write that follows arming,
+// so a response is fully written before the server is gone — deterministic
+// where a timer would be a race.
+type exitAfterWrite struct {
+	w     io.Writer
+	armed atomic.Bool
+}
+
+func (e *exitAfterWrite) Write(p []byte) (int, error) {
+	n, err := e.w.Write(p)
+	if e.armed.Load() {
+		os.Exit(0)
+	}
+	return n, err
+}
+
+// childPool connects one re-executed child of the given mode through a Pool.
+func childPool(t *testing.T, mode string, cfg mcp.ServerConfig) (*mcp.Pool, *mcp.ServerConnection) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skip("no executable path")
+	}
+	cfg.Command = exe
+	p := mcp.NewPool(mcp.ConnectionOptions{
+		Warnf: func(f string, a ...any) { t.Logf("client: "+f, a...) },
+	})
+	t.Cleanup(func() { _ = p.Close() })
+	conn, err := p.Connect(context.Background(), cfg,
+		[]string{"AGENTKIT_MCP_CHILD=" + mode, "PATH=" + os.Getenv("PATH")}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	return p, conn
+}
+
+// waitFor polls a condition, failing rather than hanging.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ---- stdio: the last frame before exit (item: cmd.Wait raced the reader)
+
+// TestAResponseWrittenJustBeforeExitIsDelivered. os/exec's Wait closes the
+// pipes it created, and the reaper called Wait the instant the process exited
+// — so a server that answered and exited could have its answer discarded
+// before the reader got to it. The Receive is delayed so the frame is sitting
+// in the pipe when the process is reaped, which is the losing order.
+func TestAResponseWrittenJustBeforeExitIsDelivered(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skip("no executable path")
+	}
+	tr, err := mcp.StartStdio(context.Background(), mcp.StdioOptions{
+		Command: exe, Env: []string{"AGENTKIT_MCP_CHILD=one-shot", "PATH=" + os.Getenv("PATH")},
+	})
+	must(t, err)
+	t.Cleanup(func() { _ = tr.Close() })
+
+	must(t, tr.Send([]byte(`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}`)))
+	time.Sleep(300 * time.Millisecond) // let the child answer, exit and be reaped
+
+	frame, err := tr.Receive()
+	if err != nil {
+		t.Fatalf("the response written just before exit was lost: %v", err)
+	}
+	var m mcp.Message
+	must(t, json.Unmarshal(frame, &m))
+	if m.ID.Key() != mcp.NumberID(1).Key() || m.Error != nil {
+		t.Fatalf("got %s", frame)
+	}
+}
+
+// ---- NFR-REL-03: reconnection
+
+// TestADeadStdioServerIsRespawnedWithinTheReconnectLimit is NFR-REL-03 end to
+// end against a real process: a disconnect mid-call is an is_error tool
+// result and the loop's next call re-spawns the server; the budget is
+// honoured; and past it the connection is dead and every call is is_error —
+// never a Go error the agent loop would have to handle.
+func TestADeadStdioServerIsRespawnedWithinTheReconnectLimit(t *testing.T) {
+	p, conn := childPool(t, "mortal", mcp.ServerConfig{Name: "mortal", PerSessionReconnectLimit: 1})
+	ctx := context.Background()
+	tools, err := p.Tools(ctx, nil)
+	must(t, err)
+	tool := func(name string) core.Tool {
+		for _, tl := range tools {
+			if tl.Name == "mortal__"+name {
+				return tl
+			}
+		}
+		t.Fatalf("no tool %q in %v", name, tools)
+		return core.Tool{}
+	}
+
+	// 1. The server dies DURING a call: an is_error result, not a Go error.
+	if r := tool("crash").Execute(ctx, nil); r.OK {
+		t.Fatal("a call cut off by the server's exit must be an error result")
+	}
+	waitFor(t, "the client to notice the exit", func() bool { return !conn.Alive() })
+
+	// 2. The next call re-spawns the server and succeeds.
+	if r := tool("hello").Execute(ctx, nil); !r.OK {
+		t.Fatalf("the call after a death must re-spawn the server: %+v", r)
+	}
+	if conn.Reconnects() != 1 || !conn.Alive() {
+		t.Fatalf("reconnects = %d, alive = %v; want 1 and alive", conn.Reconnects(), conn.Alive())
+	}
+
+	// 3. It dies again, this time AFTER answering, and the budget is spent.
+	if r := tool("die").Execute(ctx, nil); !r.OK {
+		t.Fatalf("die must answer before exiting: %+v", r)
+	}
+	waitFor(t, "the client to notice the second exit", func() bool { return !conn.Alive() })
+
+	r := tool("hello").Execute(ctx, nil)
+	if r.OK {
+		t.Fatal("past the reconnect limit the call must fail")
+	}
+	if !strings.Contains(r.Detail, "reconnect limit") {
+		t.Fatalf("the result must say why: %+v", r)
+	}
+	if !conn.Dead() || conn.Reconnects() != 1 {
+		t.Fatalf("dead = %v, reconnects = %d; the limit must not be exceeded", conn.Dead(), conn.Reconnects())
+	}
+	// And it stays dead: no further spawn is attempted.
+	if r := tool("hello").Execute(ctx, nil); r.OK || conn.Reconnects() != 1 {
+		t.Fatalf("a dead connection must fail fast without re-spawning: %+v, reconnects = %d",
+			r, conn.Reconnects())
+	}
+}
+
+// ---- REQ-CACHE-07: the pool subscribes stdio servers to list_changed
+
+// TestAStdioServerConnectedByThePoolIsSubscribedToToolChanges. The server
+// sends list_changed ONLY on a stream the client opened, and nobody was
+// opening one — so the cache lived by the ttlMs hint alone, and a server
+// sending none (this one) kept a stale list for the whole session.
+func TestAStdioServerConnectedByThePoolIsSubscribedToToolChanges(t *testing.T) {
+	_, conn := childPool(t, "mortal", mcp.ServerConfig{Name: "mortal"})
+	ctx := context.Background()
+	waitFor(t, "the subscription to be acknowledged", conn.Subscribed)
+
+	before, err := conn.ListTools(ctx)
+	must(t, err)
+	res, err := conn.Call(ctx, "add_tool", nil)
+	must(t, err)
+	if res.IsError {
+		t.Fatalf("add_tool: %+v", res)
+	}
+	waitFor(t, "the tool cache to be invalidated", func() bool {
+		after, err := conn.ListTools(ctx)
+		must(t, err)
+		return len(after) == len(before)+1
+	})
+}
+
+// ---- REQ-SEC-12.1 vs the protocol model
+
+// TestAToolWithOutputSchemaAndMetaListsAndCallsFine. Strict binding rejects
+// unknown members, so every spec-standard optional member has to be modelled
+// — a conforming server sending outputSchema on ONE tool made tools/list fail
+// and the whole server unusable.
+func TestAToolWithOutputSchemaAndMetaListsAndCallsFine(t *testing.T) {
+	s := mcp.NewServer(mcp.ServerOptions{})
+	must(t, s.RegisterTool(mcp.ToolDefinition{
+		Name: "typed", Title: "Typed", Description: "returns structured content",
+		InputSchema:  json.RawMessage(`{"type":"object"}`),
+		OutputSchema: json.RawMessage(`{"type":"object","properties":{"n":{"type":"integer"}}}`),
+		Annotations:  json.RawMessage(`{"readOnlyHint":true,"vendor/x":1}`),
+		Icons:        json.RawMessage(`[{"src":"https://example/i.png"}]`),
+		Meta:         json.RawMessage(`{"vendor/tag":"v"}`),
+	}, func(context.Context, map[string]any) (mcp.ToolsCallResult, error) {
+		return mcp.ToolsCallResult{
+			Content: []mcp.Content{
+				{Type: "text", Text: "n=1", Annotations: json.RawMessage(`{"audience":["user"]}`),
+					Meta: json.RawMessage(`{"k":"v"}`)},
+				{Type: "resource_link", URI: "x://doc", Name: "doc", Size: new(int64)},
+			},
+			StructuredContent: json.RawMessage(`{"n":1}`),
+			Meta:              json.RawMessage(`{"vendor/trace":"abc"}`),
+		}, nil
+	}))
+	size := int64(12)
+	must(t, s.RegisterResource(mcp.Resource{URI: "x://doc", Name: "doc", Size: &size,
+		Annotations: json.RawMessage(`{"priority":0.5}`), Meta: json.RawMessage(`{}`)},
+		func(context.Context, string) (mcp.ResourcesReadResult, error) {
+			return mcp.ResourcesReadResult{Contents: []mcp.ResourceContents{
+				{URI: "x://doc", Text: "hi", Meta: json.RawMessage(`{"etag":"1"}`)}}}, nil
+		}))
+	conn := pair(t, s, mcp.ServerConfig{Name: "s"}, mcp.ConnectionOptions{})
+	ctx := context.Background()
+
+	tools, err := conn.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	if len(tools) != 1 || len(tools[0].OutputSchema) == 0 || len(tools[0].Meta) == 0 {
+		t.Fatalf("tools = %+v", tools)
+	}
+	res, err := conn.Call(ctx, "typed", nil)
+	if err != nil {
+		t.Fatalf("tools/call: %v", err)
+	}
+	if string(res.StructuredContent) != `{"n":1}` || len(res.Meta) == 0 ||
+		len(res.Content) != 2 || len(res.Content[0].Annotations) == 0 || res.Content[1].Size == nil {
+		t.Fatalf("result = %+v", res)
+	}
+	resources, err := conn.ListResources(ctx)
+	if err != nil || len(resources) != 1 || resources[0].Size == nil || *resources[0].Size != 12 {
+		t.Fatalf("resources = %+v, %v", resources, err)
+	}
+	read, err := conn.ReadResource(ctx, "x://doc")
+	if err != nil || len(read.Contents) != 1 || len(read.Contents[0].Meta) == 0 {
+		t.Fatalf("read = %+v, %v", read, err)
+	}
+}
+
+// ---- REQ-SEC-12.1 / REQ-SEC-11.3 on the envelope itself
+
+// TestTheClientRejectsANonStrictEnvelope. encoding/json matched envelope keys
+// case-insensitively and ignored unknown ones, so `{"id":1,"ID":2}` passed the
+// duplicate-key check and correlated to 2, and `"bogus":true` was accepted.
+func TestTheClientRejectsANonStrictEnvelope(t *testing.T) {
+	for _, tc := range []struct{ name, frame string }{
+		{"case-variant duplicate id", `{"jsonrpc":"2.0","id":1,"ID":2,"result":{"resultType":"complete","supportedVersions":["x"],"capabilities":{},"ttlMs":0}}`},
+		{"unknown member", `{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["x"],"capabilities":{},"ttlMs":0},"bogus":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c2sR, c2sW := io.Pipe()
+			s2cR, s2cW := io.Pipe()
+			conn := mcp.NewConnection(mcp.ServerConfig{Name: "s"},
+				mcp.NewPipeTransport(s2cR, c2sW, wire.Limits{}), mcp.ConnectionOptions{})
+			t.Cleanup(func() { _ = conn.Close(); _ = c2sR.Close(); _ = s2cW.Close() })
+
+			go func() {
+				// Read the request (its id is 1: the first the client issues) and
+				// answer it with the crafted frame.
+				_, _ = bufio.NewReader(c2sR).ReadString('\n')
+				_, _ = s2cW.Write([]byte(tc.frame + "\n"))
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := conn.Discover(ctx); err == nil {
+				t.Fatal("a frame with a case-variant duplicate or an unknown member must be rejected")
+			}
+			waitFor(t, "the connection to be torn down", func() bool { return !conn.Alive() })
+		})
+	}
+}
+
+// ---- config
+
+// TestTimeoutSAcceptsAFloat is REQ-MCP-CLIENT-07, whose own default is written
+// `30.0`; a TOML reader that rejected floats dropped the requirement's example.
+func TestTimeoutSAcceptsAFloatAndTheReconnectLimitParses(t *testing.T) {
+	src := `
+[[mcp.servers]]
+name = "a"
+command = "a"
+timeout_s = 30.0
+per_session_reconnect_limit = 5
+
+[[mcp.servers]]
+name = "b"
+command = "b"
+timeout_s = 2.5
+`
+	cfg, diags, err := mcp.ParseConfig("c.toml", []byte(src))
+	must(t, err)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %v", diags)
+	}
+	if cfg.Servers[0].Timeout != 30*time.Second || cfg.Servers[0].PerSessionReconnectLimit != 5 {
+		t.Fatalf("a = %+v", cfg.Servers[0])
+	}
+	if cfg.Servers[1].Timeout != 2500*time.Millisecond {
+		t.Fatalf("b.timeout = %v, want 2.5s", cfg.Servers[1].Timeout)
+	}
 }

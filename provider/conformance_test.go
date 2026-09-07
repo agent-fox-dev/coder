@@ -3,6 +3,7 @@ package provider_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -704,6 +705,137 @@ func TestAStopSequenceEitherTakesEffectOrIsReported(t *testing.T) {
 			}
 			t.Fatalf("the stop sequence neither reached the wire nor was reported.\n"+
 				"body = %s\nwarnings = %v", body, warnings)
+		})
+	}
+}
+
+// ---- fixes pinned by the REQ audit, asserted once about "a provider"
+
+// captureBody drives one provider through OnPayload and returns the encoded
+// request body; the error return aborts before any I/O (NFR-TEST-06.2).
+func captureBody(t *testing.T, c wireCase, req core.Request) map[string]any {
+	t.Helper()
+	var got map[string]any
+	req.Options.OnPayload = func(p any, _ *core.Model) (any, error) {
+		b, err := json.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatal(err)
+		}
+		return nil, fmt.Errorf("captured")
+	}
+	c.provider.Stream(context.Background(), c.model, req, core.ProviderStreamOptions{}).Result()
+	if got == nil {
+		t.Fatal("no payload was captured")
+	}
+	return got
+}
+
+// TestMaxTokensIsClampedDeepIntoATranscriptOnEveryWire is REQ-CAT-04. The
+// caller's max_tokens is an UPPER BOUND: with the loop's context estimate
+// leaving 100 tokens of the window (after the 4096 safety margin), the value
+// sent is 100, not the 1024 asked for. This was the failure that first
+// appears deep into a long session, exactly when losing it costs most.
+func TestMaxTokensIsClampedDeepIntoATranscriptOnEveryWire(t *testing.T) {
+	field := map[string]func(map[string]any) any{
+		"anthropic-messages":   func(b map[string]any) any { return b["max_tokens"] },
+		"openai-completions":   func(b map[string]any) any { return b["max_completion_tokens"] },
+		"openai-responses":     func(b map[string]any) any { return b["max_output_tokens"] },
+		"google-generative-ai": func(b map[string]any) any { return b["generationConfig"].(map[string]any)["maxOutputTokens"] },
+		"ollama-chat":          func(b map[string]any) any { return b["options"].(map[string]any)["num_predict"] },
+	}
+	for _, c := range cases() {
+		t.Run(c.name, func(t *testing.T) {
+			requested := 1024
+			req := core.Request{
+				Messages:         core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+				MaxTokens:        &requested,
+				EstContextTokens: c.model.ContextWindow - 4096 - 100,
+			}
+			got := field[c.name](captureBody(t, c, req))
+			if got != float64(100) {
+				t.Fatalf("max tokens sent = %v, want 100 = window - estimate - safety margin; "+
+					"the caller's 1024 is an upper bound, not the value sent", got)
+			}
+		})
+	}
+}
+
+// blockingAfter is a transport that streams prefix and then holds the body
+// open until the request context is done — a server that went quiet
+// mid-turn — closing the pipe with the context's error when it fires.
+func blockingAfter(prefix string) roundTripFunc {
+	return func(r *http.Request) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write([]byte(prefix))
+			<-r.Context().Done()
+			_ = pw.CloseWithError(r.Context().Err())
+		}()
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: pr}, nil
+	}
+}
+
+// TestMidStreamCancellationIsAnAbortNotAnErrorOnEveryWire is REQ-LOOP-09:
+// cancelling the caller's ctx while bytes are still arriving yields
+// stop_reason aborted with the partial content kept and error_message set —
+// terminal, never retried (REQ-PROV-14). Every wire used to report it as an
+// ordinary error, which the semantic retry layer then retried.
+func TestMidStreamCancellationIsAnAbortNotAnErrorOnEveryWire(t *testing.T) {
+	for _, c := range cases() {
+		t.Run(c.name, func(t *testing.T) {
+			prefix := c.stream[:strings.Index(c.stream, c.truncateAt)]
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req := core.Request{Options: core.RequestOptions{Transport: blockingAfter(prefix)}}
+			s := c.provider.Stream(ctx, c.model, req, core.ProviderStreamOptions{})
+			for e := range s.Events() {
+				if _, ok := e.(core.TextDeltaEvent); ok {
+					cancel() // the caller stops the turn while the server is mid-stream
+				}
+			}
+			msg := s.Result()
+			if msg.StopReason != core.StopReasonAborted {
+				t.Fatalf("stop reason = %q (%q), want aborted", msg.StopReason, msg.ErrorMessage)
+			}
+			if msg.ErrorMessage != provider.AbortText {
+				t.Fatalf("error_message = %q, want %q", msg.ErrorMessage, provider.AbortText)
+			}
+			if msg.Content.Text() != "Hello" {
+				t.Fatalf("content = %q, want the partial text kept on the aborted message", msg.Content.Text())
+			}
+			if !errors.Is(s.Err(), core.ErrAborted) {
+				t.Fatalf("stream err = %v, want ErrAborted", s.Err())
+			}
+		})
+	}
+}
+
+// TestAPerRequestTimeoutMidStreamIsARetryableErrorOnEveryWire keeps
+// REQ-PROV-18 distinct from REQ-LOOP-09: TimeoutMs expiring while the caller's
+// ctx is still alive is a transient failure — an ERROR whose text the
+// semantic layer classifies as retryable — not an abort, which is terminal.
+func TestAPerRequestTimeoutMidStreamIsARetryableErrorOnEveryWire(t *testing.T) {
+	for _, c := range cases() {
+		t.Run(c.name, func(t *testing.T) {
+			prefix := c.stream[:strings.Index(c.stream, c.truncateAt)]
+			timeout := 100
+			req := core.Request{Options: core.RequestOptions{
+				Transport: blockingAfter(prefix), TimeoutMs: &timeout}}
+			msg := c.provider.Stream(context.Background(), c.model, req, core.ProviderStreamOptions{}).Result()
+			if msg.StopReason != core.StopReasonError {
+				t.Fatalf("stop reason = %q (%q), want error: a timeout is retryable, an abort is not",
+					msg.StopReason, msg.ErrorMessage)
+			}
+			if !strings.Contains(strings.ToLower(msg.ErrorMessage), "timeout") {
+				t.Fatalf("error_message = %q, want text the REQ-PROV-14 allowlist matches (\"timeout\")",
+					msg.ErrorMessage)
+			}
+			if msg.Content.Text() != "Hello" {
+				t.Fatalf("content = %q, want the partial text kept", msg.Content.Text())
+			}
 		})
 	}
 }

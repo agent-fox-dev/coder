@@ -21,10 +21,12 @@ import (
 // languages that need the room most.
 const ResultCharCap = 50_000
 
-// DefaultCallLimit and DefaultTimeout are REQ-MCP-CLIENT-07's defaults.
+// DefaultCallLimit and DefaultTimeout are REQ-MCP-CLIENT-07's defaults;
+// DefaultReconnectLimit is NFR-REL-03's.
 const (
-	DefaultCallLimit = 1000
-	DefaultTimeout   = 30 * time.Second
+	DefaultCallLimit      = 1000
+	DefaultTimeout        = 30 * time.Second
+	DefaultReconnectLimit = 3
 )
 
 // Errors a connection can raise.
@@ -41,6 +43,10 @@ var (
 	ErrNotInitialized     = errors.New("mcp: connection is not initialized")
 	// ErrTooManyInputRounds is REQ-MCP-CLIENT-08.2's bound.
 	ErrTooManyInputRounds = errors.New("mcp: too many multi-round-trip input requests")
+	// ErrReconnectLimit is NFR-REL-03's bound: the transport died more times
+	// than per_session_reconnect_limit allows, and the connection is dead for
+	// the rest of the session. Every later call fails with it immediately.
+	ErrReconnectLimit = errors.New("mcp: per-session reconnect limit reached; the connection is dead")
 )
 
 // ServerConfig is one `[[mcp.servers]]` entry (REQ-MCP-CLIENT-07).
@@ -48,8 +54,16 @@ type ServerConfig struct {
 	Name    string
 	Command string
 	Args    []string
-	URL     string
-	Dir     string
+	// URL selects Streamable HTTP. A url server's tool cache is kept honest by
+	// the server's ttlMs hint ONLY: Pool.Connect does not hold a
+	// subscriptions/listen stream open over HTTP, because that is a request
+	// held open for the life of the session against a remote — a connection
+	// slot and a keep-alive burden the stdio case does not have. An embedder
+	// that wants live invalidation for a remote server calls
+	// SubscribeToolChanges itself. A command server IS subscribed by Connect
+	// (REQ-CACHE-07).
+	URL string
+	Dir string
 	// Headers are sent on every request to a URL server. Values may carry
 	// ${VAR} references, resolved from the secrets store exactly like Env — a
 	// remote server's bearer token has the same reason not to sit in a config
@@ -67,7 +81,12 @@ type ServerConfig struct {
 	// PerSessionCallLimit is 0 for the default. A NEGATIVE value disables the
 	// limit, so "unlimited" is something a caller has to write down.
 	PerSessionCallLimit int
-	Timeout             time.Duration
+	// PerSessionReconnectLimit is NFR-REL-03's bound on re-spawning (stdio) or
+	// re-opening (HTTP) a transport that died, per session. 0 means
+	// DefaultReconnectLimit; a NEGATIVE value means never reconnect, by the
+	// same rule as PerSessionCallLimit.
+	PerSessionReconnectLimit int
+	Timeout                  time.Duration
 }
 
 func (c ServerConfig) prefix() string {
@@ -88,6 +107,16 @@ func (c ServerConfig) callLimit() int {
 		return DefaultCallLimit
 	}
 	return c.PerSessionCallLimit
+}
+
+func (c ServerConfig) reconnectLimit() int {
+	switch {
+	case c.PerSessionReconnectLimit < 0:
+		return 0 // explicitly never
+	case c.PerSessionReconnectLimit == 0:
+		return DefaultReconnectLimit
+	}
+	return c.PerSessionReconnectLimit
 }
 
 func (c ServerConfig) timeout() time.Duration {
@@ -114,16 +143,48 @@ type ConnectionOptions struct {
 	// ClientInfo identifies us in the handshake.
 	ClientInfo Implementation
 	Now        func() time.Time
+	// Dial re-establishes the transport after it dies (NFR-REL-03). Nil means
+	// a dead transport stays dead. Pool.Connect sets it to re-spawn the
+	// subprocess or re-open the endpoint exactly as the first connection did.
+	Dial func(ctx context.Context) (Transport, error)
+}
+
+// link is one incarnation of the transport: the transport, the correlator
+// that owns its in-flight ids, and the read loop draining it.
+//
+// A reconnect (NFR-REL-03) replaces the whole link rather than swapping the
+// transport underneath the old correlator. An id issued on a dead transport
+// must never be answered by a live one — the peer that answers it is a
+// different process, and a match would be a coincidence of counters.
+type link struct {
+	tr   Transport
+	corr *correlator
+	done chan struct{} // closed when the read loop exits
 }
 
 // ServerConnection is REQ-MCP-CLIENT-03.
 type ServerConnection struct {
 	cfg  ServerConfig
 	opts ConnectionOptions
-	tr   Transport
-	corr *correlator
 
-	mu         sync.Mutex
+	mu  sync.Mutex
+	cur *link
+	// reconnects counts successful AND failed re-dials against
+	// PerSessionReconnectLimit. dead is set when the budget is spent.
+	reconnects int
+	dead       bool
+	deadErr    error
+	// reconnected is closed and replaced on every successful reconnect, so
+	// a goroutine waiting for a fresh link (the subscription keeper) can be
+	// woken without polling.
+	reconnected chan struct{}
+	// reconnectMu serialises reconnect attempts WITHOUT holding mu across the
+	// close and the dial: the old link's read loop takes mu to invalidate
+	// the tool cache, and waiting for it to exit under mu would deadlock.
+	reconnectMu sync.Mutex
+	// subCancel ends the tools/list_changed subscription Connect started.
+	subCancel context.CancelFunc
+
 	info       DiscoverResult
 	discovered bool
 	tools      []ToolDefinition
@@ -137,9 +198,6 @@ type ServerConnection struct {
 	// subscribed is set when the server acknowledges a subscriptions/listen.
 	subscribed bool
 	closed     bool
-
-	readerDone chan struct{}
-	readErr    error
 }
 
 // NewConnection wraps an established transport.
@@ -150,25 +208,67 @@ func NewConnection(cfg ServerConfig, tr Transport, opts ConnectionOptions) *Serv
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	c := &ServerConnection{
-		cfg: cfg, opts: opts, tr: tr, corr: newCorrelator(),
-		readerDone: make(chan struct{}),
-	}
-	go c.readLoop()
+	c := &ServerConnection{cfg: cfg, opts: opts, reconnected: make(chan struct{})}
+	c.cur = c.newLink(tr)
 	return c
+}
+
+func (c *ServerConnection) newLink(tr Transport) *link {
+	l := &link{tr: tr, corr: newCorrelator(), done: make(chan struct{})}
+	go c.readLoop(l)
+	return l
+}
+
+// setDial arms reconnection after construction, for a pool that wants
+// discovery to have succeeded once before it will ever re-spawn a server.
+func (c *ServerConnection) setDial(dial func(ctx context.Context) (Transport, error)) {
+	c.mu.Lock()
+	c.opts.Dial = dial
+	c.mu.Unlock()
 }
 
 // Name is the configured server name.
 func (c *ServerConnection) Name() string { return c.cfg.Name }
 
-// Info returns the handshake result.
+// Info returns the server/discover result: the zero value until Discover has
+// run, because nothing else populates it.
 func (c *ServerConnection) Info() DiscoverResult {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.info
 }
 
-// Initialize performs the handshake and capability negotiation.
+// Alive reports whether the current transport is still delivering frames. It
+// turns false when the read loop has exited — the server exited, the stream
+// broke, or Close ran — and true again after a successful reconnect.
+func (c *ServerConnection) Alive() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.dead {
+		return false
+	}
+	select {
+	case <-c.cur.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// Reconnects is how many reconnect attempts this session has spent.
+func (c *ServerConnection) Reconnects() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reconnects
+}
+
+// Dead reports whether the reconnect budget is exhausted (NFR-REL-03).
+func (c *ServerConnection) Dead() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dead
+}
+
 // Discover is 2026-07-28's OPTIONAL up-front probe (REQ-MCP-CLIENT-03,
 // amended in 0.4.0).
 //
@@ -437,18 +537,29 @@ func (c *ServerConnection) Close() error {
 		return nil
 	}
 	c.closed = true
+	l := c.cur
+	stop := c.subCancel
 	c.mu.Unlock()
 
-	err := c.tr.Close()
-	// Wake every in-flight call rather than leaving each to its own timeout.
-	c.corr.fail(ErrTransportClosed)
+	if stop != nil {
+		stop()
+	}
+	return c.closeLink(l)
+}
 
-	// Bounded. Closing the transport is what unblocks the read loop, and a
-	// transport whose Close does not do that would otherwise make Close itself
-	// the thing that hangs — a shutdown path that can deadlock is worse than
-	// one that reports a leak.
+// closeLink shuts one link down and waits, bounded, for its read loop.
+//
+// Closing the transport is what unblocks the read loop, and a transport whose
+// Close does not do that would otherwise make Close itself the thing that
+// hangs — a shutdown path that can deadlock is worse than one that reports a
+// leak. Callers must NOT hold c.mu: the read loop takes it.
+func (c *ServerConnection) closeLink(l *link) error {
+	err := l.tr.Close()
+	// Wake every in-flight call rather than leaving each to its own timeout.
+	l.corr.fail(ErrTransportClosed)
+
 	select {
-	case <-c.readerDone:
+	case <-l.done:
 	case <-time.After(2 * time.Second):
 		c.warnf("server %q: the read loop did not stop after the transport was closed",
 			c.cfg.Name)
@@ -458,45 +569,190 @@ func (c *ServerConnection) Close() error {
 
 // ---------------------------------------------------------------- plumbing
 
+// linkDeadError marks a failure that happened BEFORE the request reached the
+// peer, on a transport that is gone. Only those are safe to retry on a fresh
+// link: a request that was sent may have executed, and a tool call executed
+// twice is the failure NFR-REL-03's "surface as is_error" exists to prevent.
+type linkDeadError struct {
+	cause error
+}
+
+func (e *linkDeadError) Error() string { return e.cause.Error() }
+func (e *linkDeadError) Unwrap() error { return e.cause }
+
+// call issues one request, reconnecting once per spent reconnect budget if
+// the transport turns out to be dead before the request went out.
 func (c *ServerConnection) call(ctx context.Context, method string, params, out any) error {
+	return c.callOpts(ctx, method, params, out, true)
+}
+
+// callNoReconnect is call for the paths that must not spend the reconnect
+// budget on their own initiative: the background subscription keeper, which
+// would otherwise re-spawn a server while the session is idle.
+func (c *ServerConnection) callNoReconnect(ctx context.Context, method string, params, out any) error {
+	return c.callOpts(ctx, method, params, out, false)
+}
+
+func (c *ServerConnection) callOpts(ctx context.Context, method string, params, out any, reconnect bool) error {
 	raw, err := c.withMeta(params)
 	if err != nil {
 		return err
 	}
-	id, ch, err := c.corr.next()
+	l, err := c.currentLink()
 	if err != nil {
 		return err
 	}
-	msg, err := json.Marshal(Message{JSONRPC: Version, ID: id, Method: method, Params: raw})
-	if err != nil {
-		c.corr.forget(id)
-		return err
+	// Bounded by the reconnect budget: every iteration either returns or
+	// spends one reconnect, and reconnect fails once the budget is gone.
+	for {
+		err := c.callOn(ctx, l, method, raw, out)
+		var dead *linkDeadError
+		if !errors.As(err, &dead) || !reconnect {
+			return err
+		}
+		if l, err = c.reconnect(ctx, l, dead.cause); err != nil {
+			return err
+		}
 	}
-	if err := c.tr.Send(msg); err != nil {
-		c.corr.forget(id)
-		return err
-	}
+}
 
-	select {
-	case resp := <-ch:
-		if resp.Error != nil {
-			return resp.Error
-		}
-		if out == nil {
-			return nil
-		}
-		return decodeParams(resp.Result, out, c.opts.Limits)
-	case <-ctx.Done():
-		// Forget the waiter so a timed-out call does not leak an entry for the
-		// life of the connection.
-		c.corr.forget(id)
-		// Tell the server to stop. Without this a cancelled call leaves the
-		// handler running to completion on the other side — for a tool that
-		// spends money or holds a lock, "the client gave up" and "the work
-		// stopped" have to be the same event.
-		c.cancelRemote(id, ctx.Err())
-		return ctx.Err()
+func (c *ServerConnection) currentLink() (*link, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, ErrTransportClosed
 	}
+	if c.dead {
+		return nil, c.deadErr
+	}
+	return c.cur, nil
+}
+
+// callOn sends one request on a specific link and waits for its response.
+//
+// A response stream that ends before the response arrived (Streamable HTTP,
+// REQ-MCP-CLIENT-02.3) is re-issued ONCE, with a NEW id: 2026-07-28 has no
+// resumability, so a fresh request is the only way to get the answer, and
+// once is the bound because a server that drops every stream is not going
+// to answer the third time either.
+func (c *ServerConnection) callOn(ctx context.Context, l *link, method string, raw json.RawMessage, out any) error {
+	for reissued := false; ; {
+		id, ch, err := l.corr.next()
+		if err != nil {
+			// The correlator closes when the read loop exits: the transport
+			// is gone and nothing was sent.
+			return &linkDeadError{cause: err}
+		}
+		msg, err := json.Marshal(Message{JSONRPC: Version, ID: id, Method: method, Params: raw})
+		if err != nil {
+			l.corr.forget(id)
+			return err
+		}
+		if err := sendContext(ctx, l.tr, msg); err != nil {
+			l.corr.forget(id)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(err, ErrTransportClosed) {
+				return &linkDeadError{cause: err}
+			}
+			return err
+		}
+
+		select {
+		case resp := <-ch:
+			if resp.Error != nil {
+				if resp.Error.Code == CodeResponseStreamBroken && !reissued {
+					c.warnf("server %q: the response stream for %s ended without a response; "+
+						"re-issuing the request with a new id", c.cfg.Name, method)
+					reissued = true
+					continue
+				}
+				return resp.Error
+			}
+			if out == nil {
+				return nil
+			}
+			return decodeParams(resp.Result, out, c.opts.Limits)
+		case <-ctx.Done():
+			// Forget the waiter so a timed-out call does not leak an entry for
+			// the life of the connection.
+			l.corr.forget(id)
+			// Tell the server to stop. Without this a cancelled call leaves
+			// the handler running to completion on the other side — for a
+			// tool that spends money or holds a lock, "the client gave up"
+			// and "the work stopped" have to be the same event.
+			c.cancelRemote(l, id, ctx.Err())
+			return ctx.Err()
+		}
+	}
+}
+
+// reconnect replaces a dead link (NFR-REL-03), or reports why it cannot.
+//
+// The budget counts ATTEMPTS, failed dials included: a server that cannot be
+// re-spawned would otherwise be re-spawned on every call for the rest of the
+// session. Once it is spent the connection is dead and stays dead — the
+// session's remaining calls fail fast with ErrReconnectLimit, which the pool
+// turns into an is_error tool result the loop carries on from.
+func (c *ServerConnection) reconnect(ctx context.Context, stale *link, cause error) (*link, error) {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
+	c.mu.Lock()
+	switch {
+	case c.closed:
+		c.mu.Unlock()
+		return nil, ErrTransportClosed
+	case c.cur != stale:
+		// Another call already replaced it.
+		l := c.cur
+		c.mu.Unlock()
+		return l, nil
+	case c.dead:
+		err := c.deadErr
+		c.mu.Unlock()
+		return nil, err
+	case c.opts.Dial == nil:
+		c.mu.Unlock()
+		return nil, cause
+	}
+	limit := c.cfg.reconnectLimit()
+	if c.reconnects >= limit {
+		c.dead = true
+		c.deadErr = fmt.Errorf("%w: %s died again after %d reconnect(s): %v",
+			ErrReconnectLimit, c.cfg.Name, c.reconnects, cause)
+		c.mu.Unlock()
+		c.warnf("server %q: transport died (%v) and the reconnect limit (%d) is spent; "+
+			"the connection is dead for the rest of the session", c.cfg.Name, cause, limit)
+		return nil, c.deadErr
+	}
+	c.reconnects++
+	attempt := c.reconnects
+	dial := c.opts.Dial
+	c.mu.Unlock()
+
+	c.warnf("server %q: transport died (%v); reconnecting (%d/%d)", c.cfg.Name, cause, attempt, limit)
+	_ = c.closeLink(stale)
+	// WithoutCancel: the new transport must outlive the call that happened to
+	// find the old one dead.
+	tr, err := dial(context.WithoutCancel(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("mcp: %s: reconnect %d/%d: %w", c.cfg.Name, attempt, limit, err)
+	}
+	l := c.newLink(tr)
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		_ = c.closeLink(l)
+		return nil, ErrTransportClosed
+	}
+	c.cur = l
+	close(c.reconnected)
+	c.reconnected = make(chan struct{})
+	c.mu.Unlock()
+	return l, nil
 }
 
 // withMeta injects the per-request `_meta` that replaced the handshake.
@@ -549,7 +805,7 @@ func (c *ServerConnection) requestMeta() RequestMeta {
 // failure is deliberately ignored: the call has already failed, and the
 // cancellation is a courtesy to a peer that may itself be the reason the send
 // cannot complete.
-func (c *ServerConnection) cancelRemote(id ID, cause error) {
+func (c *ServerConnection) cancelRemote(l *link, id ID, cause error) {
 	rawID, err := id.MarshalJSON()
 	if err != nil {
 		return
@@ -558,10 +814,10 @@ func (c *ServerConnection) cancelRemote(id ID, cause error) {
 	if cause != nil {
 		reason = cause.Error()
 	}
-	_ = c.notify(MethodCancelled, map[string]any{"requestId": json.RawMessage(rawID), "reason": reason})
+	_ = c.notify(l, MethodCancelled, map[string]any{"requestId": json.RawMessage(rawID), "reason": reason})
 }
 
-func (c *ServerConnection) notify(method string, params any) error {
+func (c *ServerConnection) notify(l *link, method string, params any) error {
 	raw, err := c.withMeta(params)
 	if err != nil {
 		return err
@@ -570,18 +826,15 @@ func (c *ServerConnection) notify(method string, params any) error {
 	if err != nil {
 		return err
 	}
-	return c.tr.Send(msg)
+	return l.tr.Send(msg)
 }
 
-func (c *ServerConnection) readLoop() {
-	defer close(c.readerDone)
+func (c *ServerConnection) readLoop(l *link) {
+	defer close(l.done)
 	for {
-		frame, err := c.tr.Receive()
+		frame, err := l.tr.Receive()
 		if err != nil {
-			c.mu.Lock()
-			c.readErr = err
-			c.mu.Unlock()
-			c.corr.fail(err)
+			l.corr.fail(err)
 			return
 		}
 
@@ -591,17 +844,14 @@ func (c *ServerConnection) readLoop() {
 			// message. The framing is already untrustworthy, so there is no
 			// safe place to resume from.
 			c.warnf("server %q sent an undecodable frame; tearing down: %v", c.cfg.Name, derr)
-			c.mu.Lock()
-			c.readErr = derr
-			c.mu.Unlock()
-			c.corr.fail(derr)
-			_ = c.tr.Close()
+			l.corr.fail(derr)
+			_ = l.tr.Close()
 			return
 		}
 
 		switch {
 		case m.IsResponse():
-			if !c.corr.deliver(&m) {
+			if !l.corr.deliver(&m) {
 				c.warnf("server %q sent a response for unknown id %s", c.cfg.Name, m.ID)
 			}
 		case m.IsNotification():
@@ -627,6 +877,53 @@ func (c *ServerConnection) handleNotification(m *Message) {
 	case MethodToolsChanged:
 		c.RefreshTools()
 	}
+}
+
+// keepToolsSubscribed holds a tools/list_changed subscription open for the
+// life of the connection (REQ-CACHE-07).
+//
+// The tool cache is the one piece of client state that goes stale silently,
+// and a server that advertises listChanged sends the notification ONLY on a
+// stream the client opened. Nobody else was opening one: an embedder had to
+// know to call SubscribeToolChanges, and one that did not had a cache bounded
+// by nothing but the server's ttlMs hint.
+//
+// The loop is bounded by the reconnect budget: a subscription that ends is
+// re-opened only after a successful reconnect has produced a fresh link, and
+// never on the loop's own initiative — a server refusing to be subscribed
+// would otherwise be asked again forever.
+func (c *ServerConnection) keepToolsSubscribed() {
+	ctx, cancel := context.WithCancel(context.Background())
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		cancel()
+		return
+	}
+	c.subCancel = cancel
+	c.mu.Unlock()
+
+	go func() {
+		for {
+			c.mu.Lock()
+			fresh := c.reconnected
+			c.mu.Unlock()
+
+			err := c.SubscribeToolChanges(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				c.warnf("server %q: tools/list_changed subscription ended: %v; the tool "+
+					"cache is bounded by ttlMs until the next reconnect", c.cfg.Name, err)
+			}
+			select {
+			case <-fresh:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // resolveInputRequests answers an InputRequiredResult (REQ-MCP-CLIENT-08,
@@ -671,25 +968,6 @@ func (c *ServerConnection) resolveInputRequests(ctx context.Context, reqs map[st
 	return out, nil
 }
 
-func (c *ServerConnection) respond(id ID, result any, rpcErr *Error) {
-	out := Message{JSONRPC: Version, ID: id, Error: rpcErr}
-	if rpcErr == nil {
-		raw, err := json.Marshal(result)
-		if err != nil {
-			out.Error = Errorf(CodeInternalError, "%v", err)
-		} else {
-			out.Result = raw
-		}
-	}
-	msg, err := json.Marshal(out)
-	if err != nil {
-		return
-	}
-	if err := c.tr.Send(msg); err != nil {
-		c.warnf("server %q: sending response: %v", c.cfg.Name, err)
-	}
-}
-
 func (c *ServerConnection) warnf(format string, args ...any) {
 	if c.opts.Warnf != nil {
 		c.opts.Warnf(format, args...)
@@ -724,12 +1002,15 @@ func (c *ServerConnection) auditSampling(allowed bool, why string) {
 	c.opts.Audit(e)
 }
 
-// decodeFrame decodes one JSON-RPC frame with the REQ-SEC-11 bounds.
+// decodeFrame decodes one JSON-RPC frame with the REQ-SEC-11 bounds and the
+// REQ-SEC-12.1 strictness: one bounded parse, then the closed-set envelope
+// binder. See bindEnvelope for why encoding/json is not used here.
 func decodeFrame(frame []byte, m *Message, limits wire.Limits) error {
-	if err := wire.Guard(frame, limits); err != nil {
+	v, err := wire.Parse(frame, limits)
+	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(frame, m); err != nil {
+	if err := bindEnvelope(v, m); err != nil {
 		return err
 	}
 	if m.JSONRPC != Version {

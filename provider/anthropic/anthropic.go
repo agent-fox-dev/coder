@@ -8,12 +8,20 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
 )
 
 // API is the wire API id.
 const API core.API = "anthropic-messages"
+
+// DefaultMaxTokens is sent when neither the request nor the model bounds the
+// output. max_tokens is REQUIRED on this wire and 0 is rejected, so a
+// hand-built Model with no cap and no window still needs a positive number;
+// this is the floor REQ-CAT-04 leaves for an unknown window, sized so a
+// normal answer fits rather than the literal 1 the formula's max(1, ·) yields.
+const DefaultMaxTokens = 4096
 
 // ---------------------------------------------------------------- wire types
 //
@@ -197,9 +205,26 @@ func BuildRequestCached(m *core.Model, req core.Request, retention core.CacheRet
 		Stream:        true,
 	}
 
-	out.MaxTokens = m.MaxTokens
+	// A nil messages array is not an empty one on the wire: `"messages":null`
+	// is a 400 where `[]` is merely an empty (also rejected, but by a message
+	// that says so) transcript.
+	if out.Messages == nil {
+		out.Messages = []message{}
+	}
+
+	// REQ-CAT-04: the caller's max_tokens is an UPPER BOUND, not the value
+	// sent. Input and output share one window here, so a request whose
+	// max_tokens no longer fits is rejected — first seen deep into a long
+	// session. The context estimate is the loop's anchored one (P-30). This
+	// wire requires the field, so an absent request value falls back to the
+	// model's own cap (clamped the same way) and never to 0.
+	requested := 0
 	if req.MaxTokens != nil {
-		out.MaxTokens = *req.MaxTokens
+		requested = *req.MaxTokens
+	}
+	out.MaxTokens = catalog.ClampMaxTokens(m, requested, req.EstContextTokens)
+	if out.MaxTokens <= 0 {
+		out.MaxTokens = DefaultMaxTokens
 	}
 
 	for _, b := range req.System {
@@ -399,10 +424,11 @@ func splitResultContent(c core.Content) (inner []block, displaced []block) {
 			displaced = append(displaced, encodeBlock(b))
 		}
 	}
-	if inner == nil {
-		// Anthropic requires non-empty content on a tool_result.
-		inner = []block{{Type: "text", Text: ""}}
-	}
+	// An empty result stays EMPTY: content is optional on a tool_result, and
+	// the block's own omitzero drops the key. The previous placeholder,
+	// {Type:"text", Text:""}, serialized as {"type":"text"} — Text is omitzero
+	// too — and a text block with no text key is a 400 on every empty tool
+	// output, which is what a successful `rm` produces (REQ-LOOP-02).
 	return inner, displaced
 }
 

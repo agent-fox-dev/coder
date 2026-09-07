@@ -114,7 +114,13 @@ func (a *Accumulator) writeSpill(p []byte) {
 	}
 	if a.spill == nil {
 		// Lazily created on FIRST write, so a command producing nothing leaves
-		// no file behind.
+		// no file behind. The directory is created here for the same reason:
+		// the default per-workspace directory (REQ-TOOL-09d) should not
+		// exist until something spills into it.
+		if err := os.MkdirAll(a.SpillDir, 0o700); err != nil {
+			a.spillErr = err
+			return
+		}
 		f, err := os.CreateTemp(a.SpillDir, a.SpillPrefix+"-*.log")
 		if err != nil {
 			a.spillErr = err

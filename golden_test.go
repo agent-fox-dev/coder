@@ -234,6 +234,9 @@ func TestGoldenModelVisibleWrappers(t *testing.T) {
 	b.WriteString(session.RenderBranchSummary("Tried the wrong glob; switched to **/*.go."))
 	b.WriteString("\n### compaction\n")
 	b.WriteString(CompactionSummaryPrefix + "The user asked for the Go files and got them.")
+	b.WriteString("\n### compaction, split turn (REQ-GO-14)\n")
+	b.WriteString(CompactionSummaryPrefix + "The user asked for the Go files and got them." +
+		CompactionSplitSeparator + "The user then asked for the tests; the assistant had listed the directory.")
 	b.WriteString("\n")
 	checkGolden(t, "model_visible_wrappers.txt", b.String())
 }

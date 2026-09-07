@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
-	"time"
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
@@ -30,6 +29,7 @@ import (
 // reason `execute` does not take one: the model chooses a tool by name, and a
 // dialect selected by an argument is a dialect the model gets wrong silently.
 func PowerShell(opts Options) core.Tool {
+	opts = opts.withDefaults()
 	return core.Tool{
 		Name:    "powershell",
 		Builtin: true,
@@ -47,7 +47,7 @@ func PowerShell(opts Options) core.Tool {
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
 				Command  string `json:"command"`
-				TimeoutS int    `json:"timeout_s"`
+				TimeoutS *int   `json:"timeout_s"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
 				return core.ErrResult("invalid_arguments", err.Error())
@@ -57,8 +57,9 @@ func PowerShell(opts Options) core.Tool {
 			}
 			// REQ-TOOL-06: timeout_s is optional with NO default, and when
 			// supplied must be positive.
-			if a.TimeoutS < 0 {
-				return core.ErrResult("invalid_arguments", "timeout_s must be positive")
+			timeout, err := timeoutArg(a.TimeoutS)
+			if err != nil {
+				return core.ErrResult("invalid_arguments", err.Error())
 			}
 
 			// THE DEFERRED CHECK. It happens here, on the call, and not at
@@ -71,7 +72,7 @@ func PowerShell(opts Options) core.Tool {
 			argv := []string{bin, "-NoProfile", "-NonInteractive", "-Command", a.Command}
 			res, err := RunArgv(ctx, argv, ExecOptions{
 				Dir:      workspaceRoot(opts),
-				Timeout:  time.Duration(a.TimeoutS) * time.Second,
+				Timeout:  timeout,
 				MaxBytes: DefaultByteLimit,
 				SpillDir: opts.SpillDir,
 				Env:      opts.Env,

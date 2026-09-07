@@ -1,6 +1,7 @@
 package wire_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -624,6 +625,22 @@ func FuzzGuardNeverPanics(f *testing.F) {
 		if err := wire.Guard(out, l); err != nil {
 			t.Fatalf("re-encoded %q -> %q which no longer parses: %v", b, out, err)
 		}
+		// NFR-TEST-09.3: re-encoding is a FIXED POINT, compared as bytes.
+		// encode(decode(b)) must equal encode(decode(encode(decode(b)))).
+		// Property 2 above only proves the output parses; this is what sees
+		// key-order and numeric-formatting drift, which a DeepEqual over
+		// decoded values cannot.
+		v2, err := wire.Parse(out, l)
+		if err != nil {
+			t.Fatalf("re-parsing %q failed: %v", out, err)
+		}
+		out2, err := v2.JSON()
+		if err != nil {
+			t.Fatalf("re-encoding %q a second time failed: %v", out, err)
+		}
+		if !bytes.Equal(out, out2) {
+			t.Fatalf("re-encoding is not a fixed point (NFR-TEST-09.3):\n once: %s\ntwice: %s", out, out2)
+		}
 		if _, err := v.Any(); err != nil {
 			t.Fatalf("Any() on a parsed tree failed: %v", err)
 		}
@@ -686,5 +703,19 @@ func BenchmarkUnmarshalSamePayload(b *testing.B) {
 		if err := json.Unmarshal(payload, &v); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TestInvalidUTF8InAStringIsRejected: RFC 8259 JSON text is UTF-8, and the
+// NFR-TEST-09.3 fixed point found that an accepted invalid byte re-encodes
+// differently on the second pass. A rejection is the only stable answer.
+func TestInvalidUTF8InAStringIsRejected(t *testing.T) {
+	for _, in := range []string{"{\"\":\"\xff\"}", "{\"\xff\":1}", "\"a\\n\xff\"", "[\"\xc3\"]"} {
+		if err := wire.Guard([]byte(in), wire.Limits{MaxDepth: 64}); err == nil {
+			t.Errorf("%q was accepted", in)
+		}
+	}
+	if err := wire.Guard([]byte(`{"a":"é😀é"}`), wire.Limits{MaxDepth: 64}); err != nil {
+		t.Fatalf("valid UTF-8 rejected: %v", err)
 	}
 }

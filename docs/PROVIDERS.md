@@ -16,13 +16,54 @@ implementation is what ships and the gap is the work.
 
 ## Wire APIs
 
-| Surface | Pinned version | Endpoint | Goldens captured against | Capture date | Reviewed |
-|---|---|---|---|---|---|
-| `anthropic-messages` | `anthropic-version: 2023-06-01` | `POST https://api.anthropic.com/v1/messages` | none — hand-authored fixtures | — | 2026-09-06 |
-| `openai-completions` | unversioned (`/v1`) | `POST https://api.openai.com/v1/chat/completions` | none — hand-authored fixtures | — | 2026-09-06 |
-| `openai-responses` | unversioned (`/v1`) | `POST https://api.openai.com/v1/responses` | none — hand-authored fixtures | — | 2026-09-06 |
-| `google-generative-ai` | `v1beta` | `POST https://generativelanguage.googleapis.com/v1beta/models/{id}:streamGenerateContent?alt=sse` | none — hand-authored fixtures | — | 2026-09-06 |
-| `ollama-chat` | unversioned | `POST http://localhost:11434/api/chat` | none — hand-authored fixtures | — | 2026-09-06 |
+`Reviewed` is the last date a human compared the implementation against the
+upstream surface. `Implemented` is what the code does today against that
+surface, as a delta: `full` means every reviewed change landed; anything else
+names what is reviewed-not-implemented, and the next drift computation is the
+version delta **plus** every such row (NFR-COMPAT-07.2).
+
+| Surface | Pinned version | Endpoint | Goldens captured against | Capture date | Reviewed | Implemented |
+|---|---|---|---|---|---|---|
+| `anthropic-messages` | `anthropic-version: 2023-06-01` | `POST https://api.anthropic.com/v1/messages` | none — hand-authored fixtures | — | 2026-09-06 | full, except server-side compaction (REQ-PROV-07) which is opt-in by beta header only |
+| `openai-completions` | unversioned (`/v1`) | `POST https://api.openai.com/v1/chat/completions` | none — hand-authored fixtures | — | 2026-09-06 | compat profile partial: no `reasoning_content` echo (DeepSeek), no reasoning-budget field, no `cache_control` over Chat Completions (OpenRouter `anthropic/*`) — see `docs/GAPS.md` |
+| `openai-responses` | unversioned (`/v1`) | `POST https://api.openai.com/v1/responses` | none — hand-authored fixtures | — | 2026-09-06 | full, except `additional_tools` for deferred tool loading (REQ-CACHE-10) |
+| `google-generative-ai` | `v1beta` | `POST https://generativelanguage.googleapis.com/v1beta/models/{id}:streamGenerateContent?alt=sse` | none — hand-authored fixtures | — | 2026-09-06 | API-key path only; the Vertex AI path shape (`/v1/projects/…/publishers/google/models/{id}`) is not built (NFR-COMPAT-05); no `CachedContent` (§6.2a) |
+| `ollama-chat` | unversioned | `POST http://localhost:11434/api/chat` | none — hand-authored fixtures | — | 2026-09-06 | full |
+
+## Attribution headers (REQ-SEC-13)
+
+Every header AgentKit sends that identifies AgentKit, the consuming
+application, or the session is attribution and is listed here; changing this
+set is a documented, released change even when no other code changes
+(REQ-SEC-13.1).
+
+| Header | Value | Sent to |
+|---|---|---|
+| `x-agentkit-version` | the SDK version constant | every wire API |
+| `user-agent` | `agentkit-go/<version>` | every wire API |
+
+Neither carries a session identifier, workspace path, user identity, prompt
+text, or any other request content (REQ-SEC-13.3). The single kill switch is
+`AgentConfig.Attribution = false` or the environment variable
+`AGENTKIT_TELEMETRY=0`; either disables both. Precedence, lowest to highest:
+attribution defaults < provider/auth headers < `model.headers` < caller
+`RequestOptions.Headers`, and a caller may suppress any default with the
+REQ-AUTH-02 deletion marker (a present-nil value).
+
+## Rulings
+
+Decisions about a surface are recorded here once and are not re-litigated
+(NFR-COMPAT-07.3). A ruling states the decision and the reason; the narrative
+that produced it belongs in the commit that made it.
+
+| # | Surface | Ruling |
+|---|---|---|
+| L-1 | MCP | **Modern-only.** AgentKit speaks `2026-07-28` alone — no handshake era, no sessions, no `ping`, no GET stream. Cost: a server that has not migrated is unreachable, and at the time of the ruling most have not. Reversal means implementing the legacy era, not a flag. (PRD 0.4.0.) |
+| L-2 | MCP | **Standard library, not `mcp-go`.** A third-party JSON-RPC library owns the wire on the three surfaces REQ-SEC-11 names and none rejects duplicate keys; the two requirements cannot both hold with the dependency. (PRD 0.3.5.) |
+| L-3 | all wire APIs | **Goldens are regression pins, not truth.** `testdata/golden/request_*.json` were produced by AgentKit; only a vendor capture or the `difftest` harness pins the wire against the vendor, and until one exists the ledger's capture column stays empty rather than pretending. |
+| L-4 | `anthropic-messages` | **Server-side compaction is opt-in.** The `compact-2026-01-12` beta is sent only when named in `Options.Betas`; in-process summarization is the uniform default for every provider (OQ-4). |
+| L-5 | `openai-completions` / `openai-responses` | **Two implementations, no flag.** They differ in the message model, tool-call identity, reasoning replay, caching parameters and billing; a flag would branch on itself in every one of those places (REQ-PROV-02). |
+| L-6 | `google-generative-ai` | **`v1beta` until the streaming tool-call shape is on `v1`.** The path is a constant in the provider package and this row is its copy. |
 
 ### Dated beta headers
 

@@ -93,6 +93,10 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 		ThinkingLevel: req.ThinkingLevel, Timestamp: now(),
 	}, textIdx: -1, thinkIdx: -1}
 
+	// caller is the ctx handed to Stream; ctx may become its TimeoutMs child.
+	// The caller's expiry is an abort (REQ-LOOP-09), the child's a retryable
+	// timeout (REQ-PROV-18) — see provider.TransportErrorText.
+	caller := ctx
 	if to := req.Options.TimeoutMs; to != nil && *to > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(*to)*time.Millisecond)
@@ -102,7 +106,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	env := provider.Env{Override: req.Options.Env, Getenv: c.opts.Getenv}
 	auth, err := provider.ResolveAuthWith(ctx, m.Provider, c.opts.Credentials, VendorAuth, env)
 	if err != nil {
-		d.fail(provider.TransportErrorText("ollama", ctx, err), err)
+		d.fail(provider.TransportErrorText("ollama", caller, ctx, err), err)
 		return
 	}
 
@@ -126,7 +130,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 			d.fail(err.Error(), err)
 			return
 		}
-		d.fail(provider.TransportErrorText("ollama", ctx, err), err)
+		d.fail(provider.TransportErrorText("ollama", caller, ctx, err), err)
 		return
 	}
 	defer resp.Body.Close()
@@ -145,7 +149,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 
 	d.s.Push(core.MessageStartEvent{Message: d.partial})
 	if err := d.consume(provider.NewNDJSONReader(resp.Body, c.opts.MaxLineBytes)); err != nil {
-		d.fail(err.Error(), err)
+		d.fail(provider.StreamErrorText("ollama", caller, ctx, err), err)
 		return
 	}
 	d.finish(m, c.opts.BillingLookup)

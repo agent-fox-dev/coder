@@ -108,7 +108,14 @@ func Provider(opts Options) core.APIProvider {
 type client struct{ opts Options }
 
 func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o core.ProviderStreamOptions) *core.EventStream {
-	body, rep, err := BuildRequest(m, req)
+	retention := core.CacheRetentionShort
+	if o.CacheRetention != "" {
+		retention = o.CacheRetention
+	}
+	if r := req.Options.CacheRetention; r != nil {
+		retention = *r
+	}
+	body, rep, compat, err := buildRequest(m, req, retention)
 	if err != nil {
 		return core.ErrorStream(nil, fmt.Errorf("openai: building request: %w", err))
 	}
@@ -132,20 +139,24 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 	}
 
 	s := core.NewEventStream(core.StreamOptions{})
-	go c.run(ctx, s, m, req, raw)
+	go c.run(ctx, s, m, req, raw, compat)
 	return s
 }
 
-func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, req core.Request, raw []byte) {
+func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, req core.Request, raw []byte, compat Compat) {
 	now := time.Now
 	if c.opts.Now != nil {
 		now = c.opts.Now
 	}
-	d := &decoder{s: s, partial: core.AssistantMessage{
+	d := &decoder{s: s, compat: compat, partial: core.AssistantMessage{
 		Provider: m.Provider, API: m.API, Model: m.ID,
 		ThinkingLevel: req.ThinkingLevel, Timestamp: now(),
 	}}
 
+	// caller is the ctx handed to Stream; ctx may become its TimeoutMs child.
+	// The caller's expiry is an abort (REQ-LOOP-09), the child's a retryable
+	// timeout (REQ-PROV-18) — see provider.TransportErrorText.
+	caller := ctx
 	if to := req.Options.TimeoutMs; to != nil && *to > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(*to)*time.Millisecond)
@@ -159,7 +170,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	}
 	auth, err := provider.ResolveAuthWith(ctx, m.Provider, c.opts.Credentials, table, env)
 	if err != nil {
-		d.fail(provider.TransportErrorText("openai", ctx, err), err)
+		d.fail(provider.TransportErrorText("openai", caller, ctx, err), err)
 		return
 	}
 
@@ -186,7 +197,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 			d.fail(err.Error(), err)
 			return
 		}
-		d.fail(provider.TransportErrorText("openai", ctx, err), err)
+		d.fail(provider.TransportErrorText("openai", caller, ctx, err), err)
 		return
 	}
 	defer resp.Body.Close()
@@ -205,7 +216,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 
 	d.s.Push(core.MessageStartEvent{Message: d.partial})
 	if err := d.consume(provider.NewSSEReader(resp.Body, c.opts.MaxSSEEventBytes)); err != nil {
-		d.fail(err.Error(), err)
+		d.fail(provider.StreamErrorText("openai", caller, ctx, err), err)
 		return
 	}
 	d.finish(m, c.opts.BillingLookup)
@@ -341,6 +352,7 @@ type slot struct {
 type decoder struct {
 	s       *core.EventStream
 	partial core.AssistantMessage
+	compat  Compat
 
 	slots    map[string]*slot
 	order    []string
@@ -563,7 +575,7 @@ func (d *decoder) finish(m *core.Model, lookup func(string) *core.Model) {
 	final.ResponseID = d.respID
 	final.ResponseModel = d.respMod
 	hasTools := len(core.ExtractToolUse(&final)) > 0
-	final.StopReason = MapFinishReason(d.finishRs, hasTools)
+	final.StopReason = mapFinishReason(d.finishRs, hasTools, d.compat)
 	final.RawStopReason = d.finishRs
 	final.Usage = d.usage
 
@@ -603,7 +615,11 @@ func DecodeResponse(m *core.Model, data []byte, lookup func(string) *core.Model)
 	if err := json.Unmarshal(data, &ch); err != nil {
 		return nil, fmt.Errorf("openai: decoding response: %w", err)
 	}
-	d := &decoder{s: core.NewEventStream(core.StreamOptions{}), partial: core.AssistantMessage{
+	compat, err := CompatFor(m)
+	if err != nil {
+		return nil, err
+	}
+	d := &decoder{s: core.NewEventStream(core.StreamOptions{}), compat: compat, partial: core.AssistantMessage{
 		Provider: m.Provider, API: m.API, Model: m.ID,
 	}}
 	if err := d.chunk(data); err != nil {
@@ -615,7 +631,7 @@ func DecodeResponse(m *core.Model, data []byte, lookup func(string) *core.Model)
 	msg.ResponseID = d.respID
 	msg.ResponseModel = d.respMod
 	hasTools := len(core.ExtractToolUse(&msg)) > 0
-	msg.StopReason = MapFinishReason(d.finishRs, hasTools)
+	msg.StopReason = mapFinishReason(d.finishRs, hasTools, d.compat)
 	msg.RawStopReason = d.finishRs
 	msg.Usage = d.usage
 	billModel, billed := provider.BillingModel(m, d.respMod, lookup)

@@ -222,13 +222,23 @@ func (h *ConversationHistory) Messages() Messages {
 
 // CloneBranch returns a deep copy, for snapshots that must not alias history.
 func (h *ConversationHistory) CloneBranch() Messages {
+	msgs, _ := h.SnapshotBranch()
+	return msgs
+}
+
+// SnapshotBranch returns a deep copy of the branch TOGETHER WITH the revision
+// it was taken at, under one lock. Reading the two separately lets an append
+// land between them, so a SessionSnapshot's Revision could lag its Messages —
+// and a consumer comparing revisions (REQ-LIFE-02) would then discard a newer
+// snapshot as stale.
+func (h *ConversationHistory) SnapshotBranch() (Messages, uint64) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	out := make(Messages, len(h.items))
 	for i, it := range h.items {
 		out[i] = it.Msg.Clone()
 	}
-	return out
+	return out, h.revision
 }
 
 func (h *ConversationHistory) Len() int {

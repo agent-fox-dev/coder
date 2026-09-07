@@ -122,6 +122,142 @@ func SubagentTool(parent *Agent, factory AgentFactory, opts SubagentOptions) cor
 	}
 }
 
+// ---------------------------------------------------------------- REQ-MULTI-05
+
+// AgentDefinition is a named specialist (REQ-MULTI-05): everything needed to
+// construct a child agent, registered by name so the parent model can invoke
+// it as a tool call. The "tool allowlist" is the REQ-TOOL-10 ToolPolicy,
+// applied uniformly to built-in and caller-supplied tools, so a specialist can
+// be scoped to read-and-search-only per delegation without rebuilding the tool
+// set by hand.
+type AgentDefinition struct {
+	Name         string
+	Description  string
+	SystemPrompt string
+	// Model may differ from the parent's (REQ-PROV-08). Nil inherits it.
+	Model      *core.Model
+	ToolPolicy core.ToolPolicy
+	StopPolicy core.StopPolicy
+	// Tools are registered on every child built from this definition, before
+	// ToolPolicy resolves them.
+	Tools []core.Tool
+	// BudgetFraction is SubagentOptions.BudgetFraction for this specialist.
+	BudgetFraction float64
+}
+
+// AgentRegistry holds specialists by name. It is a value the embedder owns —
+// never a package-level global (NFR-SEC-05) — and a name is registered once;
+// a duplicate is an error rather than a silent replacement, because the tool
+// the parent model sees is the name.
+type AgentRegistry struct {
+	mu   sync.Mutex
+	defs map[string]AgentDefinition
+	list []string
+}
+
+func NewAgentRegistry() *AgentRegistry { return &AgentRegistry{defs: map[string]AgentDefinition{}} }
+
+func (r *AgentRegistry) Register(def AgentDefinition) error {
+	if def.Name == "" {
+		return fmt.Errorf("agentkit: AgentDefinition has no name")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, dup := r.defs[def.Name]; dup {
+		return fmt.Errorf("agentkit: specialist %q is already registered", def.Name)
+	}
+	r.defs[def.Name] = def
+	r.list = append(r.list, def.Name)
+	return nil
+}
+
+// Lookup returns a definition by name.
+func (r *AgentRegistry) Lookup(name string) (AgentDefinition, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	d, ok := r.defs[name]
+	return d, ok
+}
+
+// Names lists registered specialists in registration order.
+func (r *AgentRegistry) Names() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.list...)
+}
+
+// Tools builds one delegation tool per registered specialist, each backed by
+// a factory that constructs a FRESH child from the definition and the
+// parent's config (providers, credentials, plugins, tracer) on every call
+// (REQ-MULTI-02/04). The child inherits the parent's model unless the
+// definition names its own.
+func (r *AgentRegistry) Tools(parent *Agent, maxBudgetUSD float64) []core.Tool {
+	names := r.Names()
+	out := make([]core.Tool, 0, len(names))
+	for _, n := range names {
+		def, ok := r.Lookup(n)
+		if !ok {
+			continue
+		}
+		factory := func(context.Context) (*Agent, error) { return NewAgentFromDefinition(parent, def) }
+		out = append(out, SubagentTool(parent, factory, SubagentOptions{
+			Name:           def.Name,
+			Description:    def.Description,
+			BudgetFraction: def.BudgetFraction,
+			MaxBudgetUSD:   maxBudgetUSD,
+		}))
+	}
+	return out
+}
+
+// NewAgentFromDefinition constructs a fresh child from a definition. The
+// parent's infrastructure fields carry over; its history, session store,
+// queues and system prompt do not (REQ-MULTI-02).
+func NewAgentFromDefinition(parent *Agent, def AgentDefinition) (*Agent, error) {
+	parent.mu.Lock()
+	pcfg := parent.cfg
+	parent.mu.Unlock()
+
+	cfg := core.AgentConfig{
+		Model:          pcfg.Model,
+		Provider:       pcfg.Provider,
+		MaxTokens:      pcfg.MaxTokens,
+		Temperature:    pcfg.Temperature,
+		TopP:           pcfg.TopP,
+		SystemPrompt:   def.SystemPrompt,
+		StopPolicy:     def.StopPolicy,
+		ParallelTools:  pcfg.ParallelTools,
+		ThinkingLevel:  pcfg.ThinkingLevel,
+		ToolPolicy:     def.ToolPolicy,
+		BeforeToolCall: pcfg.BeforeToolCall,
+		AfterToolCall:  pcfg.AfterToolCall,
+		Middleware:     pcfg.Middleware,
+		Plugins:        pcfg.Plugins,
+		Tracer:         pcfg.Tracer,
+		Attribution:    pcfg.Attribution,
+		CacheRetention: pcfg.CacheRetention,
+		RequestOptions: pcfg.RequestOptions,
+		Providers:      pcfg.Providers,
+		TrustProject:   pcfg.TrustProject,
+	}
+	if def.Model != nil {
+		cfg.Model = def.Model
+	}
+	if cfg.StopPolicy == nil {
+		cfg.StopPolicy = pcfg.StopPolicy
+	}
+	child, err := NewAgent(cfg)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range def.Tools {
+		if err := child.RegisterTool(t); err != nil {
+			return nil, err
+		}
+	}
+	return child, nil
+}
+
 // RunParallel runs fn over items concurrently and returns the results in INPUT
 // ORDER, with a per-item error slot.
 //
@@ -143,11 +279,10 @@ func RunParallel[T, R any](ctx context.Context, items []T, fn func(context.Conte
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var (
-		wg       sync.WaitGroup
-		once     sync.Once
-		firstErr error
-	)
+	// The first failure cancels the siblings; every task's own outcome is
+	// still reported in its slot, so the caller sees which child failed and
+	// which were cancelled because of it.
+	var wg sync.WaitGroup
 	for i, it := range items {
 		wg.Add(1)
 		go func(i int, it T) {
@@ -155,18 +290,17 @@ func RunParallel[T, R any](ctx context.Context, items []T, fn func(context.Conte
 			defer func() {
 				if r := recover(); r != nil {
 					errs[i] = fmt.Errorf("agentkit: panic in parallel task %d: %v", i, r)
-					once.Do(func() { firstErr = errs[i]; cancel() })
+					cancel()
 				}
 			}()
 			r, err := fn(ctx, it)
 			results[i] = r
 			if err != nil {
 				errs[i] = err
-				once.Do(func() { firstErr = err; cancel() })
+				cancel()
 			}
 		}(i, it)
 	}
 	wg.Wait()
-	_ = firstErr
 	return results, errs
 }

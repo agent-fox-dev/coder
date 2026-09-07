@@ -475,3 +475,29 @@ func TestNormalizeToolCallID(t *testing.T) {
 		t.Errorf("an empty id must stay empty, got %q", got)
 	}
 }
+
+// TestThinkIsClampedAgainstTheRowsMap is REQ-PROV-15 on a wire whose only
+// thinking control is a boolean: think:true is sent when the row prices some
+// level reachable from the request, and omitted when it prices none — a row
+// that maps nothing above off is a model whose server rejects think:true.
+func TestThinkIsClampedAgainstTheRowsMap(t *testing.T) {
+	base := core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}}}
+	on := "true"
+
+	m := model()
+	m.Reasoning = true
+	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingHigh: &on}
+	r := base
+	r.ThinkingLevel = core.ThinkingMax
+	_, w := build(t, m, r)
+	if w.Think == nil || !*w.Think {
+		t.Fatalf("think = %v for max on a row that prices high, want true (clamped down)", w.Think)
+	}
+
+	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingHigh: nil}
+	raw, w := build(t, m, r)
+	if w.Think != nil {
+		t.Fatalf("think = %v on a row that prices no level, want the key omitted: %s", *w.Think, raw)
+	}
+}

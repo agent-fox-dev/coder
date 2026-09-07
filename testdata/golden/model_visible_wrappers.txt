@@ -6,3 +6,11 @@ Tried the wrong glob; switched to **/*.go.
 [Earlier conversation, summarized]
 
 The user asked for the Go files and got them.
+### compaction, split turn (REQ-GO-14)
+[Earlier conversation, summarized]
+
+The user asked for the Go files and got them.
+
+[The turn in progress at the cut, summarized separately]
+
+The user then asked for the tests; the assistant had listed the directory.

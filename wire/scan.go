@@ -433,7 +433,16 @@ func (s *scanner) stringValue(path string) (string, error) {
 		case c == '"':
 			// Materialized on BOTH paths: Guard needs member names too, for
 			// duplicate detection.
-			str := string(s.data[start:s.i])
+			raw := s.data[start:s.i]
+			// RFC 8259 §8.1: JSON text is UTF-8. Invalid bytes are a
+			// REJECTION, not passed through: the fuzz fixed point (NFR-TEST-09.3)
+			// found that a string carrying 0xFF re-encodes to "�" once
+			// and to a raw U+FFFD the second time, so a message accepted here
+			// would be one AgentKit can read but not stably write.
+			if !utf8.Valid(raw) {
+				return "", failf(RuleSyntax, path, "invalid UTF-8 in string")
+			}
+			str := string(raw)
 			s.i++
 			return str, nil
 		case c == '\\':
@@ -456,6 +465,12 @@ func (s *scanner) stringSlow(path string, start int) (string, error) {
 		switch {
 		case c == '"':
 			s.i++
+			// Escapes always append valid runes, so an invalid sequence in
+			// buf can only have come from the raw bytes — the same rejection
+			// as the fast path, applied once at the end.
+			if !utf8.Valid(buf) {
+				return "", failf(RuleSyntax, path, "invalid UTF-8 in string")
+			}
 			return string(buf), nil
 		case c < 0x20:
 			return "", failf(RuleSyntax, path, "unescaped control character %#x in string", c)

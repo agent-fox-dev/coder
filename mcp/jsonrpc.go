@@ -43,6 +43,8 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+
+	"github.com/agentfox/agentkit-go/wire"
 )
 
 // Version is the JSON-RPC version string every message carries.
@@ -69,6 +71,16 @@ const (
 	// answer rather than a connection that fails to open.
 	CodeMissingRequiredClientCapability = -32021
 	CodeUnsupportedProtocolVersion      = -32022
+
+	// CodeResponseStreamBroken is CLIENT-SIDE and never sent to a peer. It is
+	// in the implementation-defined range (-32000..-32019) for that reason.
+	// The Streamable HTTP transport delivers it to the waiting call when a
+	// request's response stream ends before a response arrived; 2026-07-28
+	// has no resumability, so the only recovery is to re-issue the request
+	// with a new id (REQ-MCP-CLIENT-02.3), and this is how the transport
+	// tells the client which request to re-issue without failing every other
+	// call in flight.
+	CodeResponseStreamBroken = -32001
 )
 
 // ID is a JSON-RPC id: a string, a number, or absent.
@@ -161,6 +173,92 @@ type Message struct {
 func (m *Message) IsRequest() bool      { return m.Method != "" && m.ID.IsSet() }
 func (m *Message) IsNotification() bool { return m.Method != "" && !m.ID.IsSet() }
 func (m *Message) IsResponse() bool     { return m.Method == "" }
+
+// bindEnvelope maps a decoded frame onto a Message STRICTLY (REQ-SEC-12.1,
+// REQ-SEC-11.3).
+//
+// Not encoding/json, and the reason is the two things it would let through.
+// It matches keys case-insensitively, so `{"id":1,"ID":2}` passes the
+// duplicate-key check — the keys differ — and then binds both to one field
+// with the last one winning: exactly the last-wins REQ-SEC-11.3 exists to
+// prevent, and on the field that decides which waiting call a response lands
+// on. And it ignores members it does not know, so `"bogus":true` reaches a
+// decoder that was supposed to reject anything it did not model. The member
+// set here is closed and case-sensitive; anything else is a rejection with
+// the same poisoning consequence the frame reader applies.
+func bindEnvelope(v wire.Value, m *Message) error {
+	if v.Kind != wire.KindObject {
+		return &wire.Error{Rule: wire.RuleType, Path: "$",
+			Msg: "a JSON-RPC frame is an object, got " + v.Kind.String()}
+	}
+	for _, key := range v.Keys {
+		member := v.Object[key]
+		path := "$." + key
+		switch key {
+		case "jsonrpc":
+			if member.Kind != wire.KindString {
+				return &wire.Error{Rule: wire.RuleType, Path: path, Msg: "expected string"}
+			}
+			m.JSONRPC = member.String
+		case "id":
+			switch member.Kind {
+			case wire.KindNull:
+				m.ID = ID{}
+			case wire.KindString:
+				m.ID = StringID(member.String)
+			case wire.KindNumber:
+				// The same rule as ID.UnmarshalJSON: a non-integer literal is
+				// carried as text, distinguishable but never mistaken for an
+				// integer it is not.
+				if n, err := strconv.ParseInt(string(member.Number), 10, 64); err == nil {
+					m.ID = NumberID(n)
+				} else {
+					m.ID = StringID(string(member.Number))
+				}
+			default:
+				return &wire.Error{Rule: wire.RuleType, Path: path,
+					Msg: "an id is a string, a number or null, got " + member.Kind.String()}
+			}
+		case "method":
+			if member.Kind != wire.KindString {
+				return &wire.Error{Rule: wire.RuleType, Path: path, Msg: "expected string"}
+			}
+			m.Method = member.String
+		case "params":
+			if member.Kind != wire.KindObject && member.Kind != wire.KindArray && member.Kind != wire.KindNull {
+				return &wire.Error{Rule: wire.RuleType, Path: path,
+					Msg: "params is an object or an array, got " + member.Kind.String()}
+			}
+			raw, err := member.JSON()
+			if err != nil {
+				return &wire.Error{Rule: wire.RuleSyntax, Path: path, Msg: err.Error()}
+			}
+			m.Params = raw
+		case "result":
+			raw, err := member.JSON()
+			if err != nil {
+				return &wire.Error{Rule: wire.RuleSyntax, Path: path, Msg: err.Error()}
+			}
+			m.Result = raw
+		case "error":
+			if member.Kind == wire.KindNull {
+				continue
+			}
+			// The error object is a closed struct too, and Bind is already
+			// strict about it.
+			var e Error
+			if err := wire.Bind(member, &e); err != nil {
+				return err
+			}
+			m.Error = &e
+		default:
+			return &wire.Error{Rule: wire.RuleUnknownField, Path: path,
+				Msg: fmt.Sprintf("unknown member %q; a JSON-RPC frame declares jsonrpc, id, "+
+					"method, params, result, error", key)}
+		}
+	}
+	return nil
+}
 
 // Error is a JSON-RPC error object.
 type Error struct {

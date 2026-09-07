@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -117,7 +118,15 @@ func RunArgv(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, 
 	// Resolved against PATH here rather than left to exec.Command, so a
 	// missing program is a clear error instead of a start failure whose
 	// message names only the file.
-	bin, err := exec.LookPath(argv[0])
+	prog := argv[0]
+	if hasPathSeparator(prog) && !filepath.IsAbs(prog) && opts.Dir != "" {
+		// `./script.sh` means "in the directory the command runs in", which
+		// is cmd.Dir — the workspace — and not the process working
+		// directory that exec.LookPath would consult. Resolved here so the
+		// lookup and the run agree on what "." means.
+		prog = filepath.Join(opts.Dir, prog)
+	}
+	bin, err := exec.LookPath(prog)
 	if err != nil {
 		return ExecResult{}, fmt.Errorf("tools: %q not found on PATH: %w", argv[0], err)
 	}
@@ -177,8 +186,13 @@ func runArgv(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, 
 	var ee *exec.ExitError
 	if errors.As(waitErr, &ee) {
 		exitCode = ee.ExitCode()
-		if exitCode == -1 {
-			// No exit code means it was terminated by a signal.
+		// NFR-COMPAT-06: a signal-killed child reports 128+signum on unix,
+		// the convention every shell uses, rather than Go's -1 placeholder.
+		// On Windows the wait status carries no signal and signalExitCode
+		// never claims one.
+		if code, ok := signalExitCode(ee); ok {
+			exitCode, signaled = code, true
+		} else if exitCode == -1 {
 			signaled = true
 		}
 	}
@@ -211,6 +225,13 @@ func ResolveShell() (string, []string, error) {
 	return resolveShell()
 }
 
+// hasPathSeparator reports whether a program name is a path rather than a
+// bare name to look up on PATH. Both separators are checked on every platform:
+// a model writes `./x` on Windows too.
+func hasPathSeparator(name string) bool {
+	return strings.ContainsAny(name, `/\`)
+}
+
 func lookPathAny(names ...string) (string, bool) {
 	for _, n := range names {
 		if p, err := exec.LookPath(n); err == nil {
@@ -224,9 +245,18 @@ func lookPathAny(names ...string) (string, bool) {
 // PATH verbatim (ruling P-47).
 //
 // Dropping PATH is the obvious reading of "reduced environment" and it breaks
-// every command, so it is not what this does. What it removes is provider API
-// keys, which a subprocess has no business reading and which would otherwise
-// be one `env` away from any command the model writes.
+// every command, so it is not what this does. What it removes is credentials,
+// which a subprocess has no business reading and which would otherwise be one
+// `env` away from any command the model writes (REQ-SEC-08). Two rules:
+//
+//   - provider PREFIXES, for the keys the SDK itself knows about; and
+//   - generic SUFFIXES — *_TOKEN, *_SECRET, *_API_KEY, *_PASSWORD,
+//     *_CREDENTIALS — because a provider list is only ever the providers
+//     someone thought of, and GITHUB_TOKEN or NPM_TOKEN in a developer's shell
+//     is at least as valuable to exfiltrate as an Anthropic key.
+//
+// PATH, HOME, LANG, TMPDIR and TERM are kept unconditionally: no suffix rule
+// touches them, and they are what a command needs to run at all.
 //
 // This is a real but LIMITED protection, and the limit is worth stating: a
 // command can still read the keys from any file the agent can read. The
@@ -246,16 +276,34 @@ func ReducedEnv(base []string, extraPrefixes ...string) []string {
 		if !ok {
 			continue
 		}
-		drop := false
-		for _, p := range prefixes {
-			if strings.HasPrefix(name, p) {
-				drop = true
-				break
-			}
-		}
-		if !drop {
+		if !credentialName(name, prefixes) {
 			out = append(out, kv)
 		}
 	}
 	return out
+}
+
+// credentialSuffixes is the generic half of REQ-SEC-08's rule, matched
+// case-insensitively: `github_token` is as much a token as `GITHUB_TOKEN`.
+var credentialSuffixes = []string{"_TOKEN", "_SECRET", "_API_KEY", "_PASSWORD", "_CREDENTIALS"}
+
+// keptEnv names variables ReducedEnv never drops, whatever they are called.
+var keptEnv = map[string]bool{"PATH": true, "HOME": true, "LANG": true, "TMPDIR": true, "TERM": true}
+
+func credentialName(name string, prefixes []string) bool {
+	upper := strings.ToUpper(name)
+	if keptEnv[upper] {
+		return false
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	for _, suf := range credentialSuffixes {
+		if strings.HasSuffix(upper, suf) {
+			return true
+		}
+	}
+	return false
 }

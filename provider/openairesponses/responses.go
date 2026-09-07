@@ -15,8 +15,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
+	"github.com/agentfox/agentkit-go/schema"
 )
 
 // API is the registry key and DefaultBaseURL/Path the endpoint.
@@ -242,29 +244,60 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 	return out, rep, nil
 }
 
+// clampTokens is REQ-CAT-04 for this wire: the caller's bound, else the
+// model's own cap, clamped against what the loop's anchored context estimate
+// leaves of the window. Nil when neither bounds the output and the window
+// is unknown.
 func clampTokens(m *core.Model, req core.Request) *int {
-	limit := m.MaxTokens
-	if req.MaxTokens != nil && *req.MaxTokens > 0 && (*req.MaxTokens < limit || limit == 0) {
-		limit = *req.MaxTokens
+	requested := 0
+	if req.MaxTokens != nil {
+		requested = *req.MaxTokens
 	}
+	limit := catalog.ClampMaxTokens(m, requested, req.EstContextTokens)
 	if limit <= 0 {
 		return nil
 	}
 	return &limit
 }
 
+// encodeTool is REQ-TOOL-03 for this wire: the schema is PROBED through the
+// strict-subset rewrite before anything is sent, and strict:true rides only
+// on the rewritten schema. A bare strict:true on the raw schema is rejected
+// the moment a tool has an optional property or a $ref, and the 400 kills the
+// whole request. `prefer` falls back to unconstrained; `require` fails the
+// request with the rejection reason (a pre-closed error stream, REQ-PROV-04).
+// Emission is gated on the profile's SupportsFunctionStrict (REQ-PROV-12).
 func encodeTool(t core.ToolWire, compat Compat) (tool, error) {
+	// FLAT, unlike the Chat Completions wire's nested `function` object.
+	out := tool{Type: "function", Name: t.Name, Description: t.Description}
+	cs := t.ConstrainedSampling
+	if cs != nil && cs.Type == core.ConstrainJSONSchema {
+		var rewritten *schema.Schema
+		var err error
+		if !compat.SupportsFunctionStrict {
+			err = fmt.Errorf("agentkit: this endpoint's compat profile does not support strict tool schemas")
+		} else {
+			rewritten, err = schema.StrictSubset(t.InputSchema)
+		}
+		switch {
+		case err == nil:
+			raw, merr := json.Marshal(rewritten)
+			if merr != nil {
+				return tool{}, merr
+			}
+			yes := true
+			out.Parameters, out.Strict = raw, &yes
+			return out, nil
+		case cs.Strict == core.StrictRequire:
+			return tool{}, fmt.Errorf("tool %q requires constrained sampling: %w", t.Name, err)
+		}
+		// prefer: fall through to the unconstrained schema.
+	}
 	raw, err := json.Marshal(t.InputSchema)
 	if err != nil {
 		return tool{}, err
 	}
-	// FLAT, unlike the Chat Completions wire's nested `function` object.
-	out := tool{Type: "function", Name: t.Name, Description: t.Description, Parameters: raw}
-	if compat.SupportsFunctionStrict && t.ConstrainedSampling != nil &&
-		t.ConstrainedSampling.Type == core.ConstrainJSONSchema {
-		yes := true
-		out.Strict = &yes
-	}
+	out.Parameters = raw
 	return out, nil
 }
 
@@ -311,7 +344,14 @@ func applyReasoning(out *request, m *core.Model, req core.Request, compat Compat
 	if req.ThinkingLevel == core.ThinkingUnset || req.ThinkingLevel == core.ThinkingOff {
 		return
 	}
-	out.Reasoning = &reasoningConfig{Effort: string(req.ThinkingLevel)}
+	// REQ-PROV-15: clamp upward, then downward, and send the RETURNED wire
+	// value. `effort: "xhigh"` to a model that does not know it is a 400,
+	// and a model with no map gets no reasoning object at all.
+	_, wire, ok := catalog.ClampThinkingLevel(m, req.ThinkingLevel)
+	if !ok {
+		return
+	}
+	out.Reasoning = &reasoningConfig{Effort: wire}
 	if compat.SupportsReasoningSummary {
 		out.Reasoning.Summary = "auto"
 	}

@@ -10,18 +10,20 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agentfox/agentkit-go/internal/diag"
 	"github.com/agentfox/agentkit-go/mcp"
 	"github.com/agentfox/agentkit-go/wire"
 )
 
-// ---- 2025-03-26 streamable HTTP
+// ---- 2026-07-28 streamable HTTP
 
 // TestStreamableHTTPCarriesAWholeSession is the end-to-end shape: the SHIPPED
 // client, over the SHIPPED transport, against a server that answers the way
-// the 2025-03-26 spec says to.
+// the 2026-07-28 spec says to.
 func TestStreamableHTTPCarriesAWholeSession(t *testing.T) {
 	srv := httptest.NewServer(streamableHandler(t, streamableOptions{}))
 	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
@@ -43,10 +45,10 @@ func TestStreamableHTTPCarriesAWholeSession(t *testing.T) {
 	}
 }
 
-// TestStreamableHTTPAcceptsAnSSEAnsweredPOST. A 2025-03-26 server may answer
-// the same POST with either a JSON body or an event stream, chosen per
-// request; a client that handles only one of them works against half the
-// servers and fails confusingly against the other half.
+// TestStreamableHTTPAcceptsAnSSEAnsweredPOST. A server may answer the same
+// POST with either a JSON body or an event stream, chosen per request; a
+// client that handles only one of them works against half the servers and
+// fails confusingly against the other half.
 func TestStreamableHTTPAcceptsAnSSEAnsweredPOST(t *testing.T) {
 	srv := httptest.NewServer(streamableHandler(t, streamableOptions{answerWithSSE: true}))
 	t.Cleanup(srv.Close) // LIFO: runs after the transport cleanup that unblocks it
@@ -106,9 +108,14 @@ func TestOnlyHTTPSchemesAreTransports(t *testing.T) {
 
 func httpConn(t *testing.T, opts mcp.HTTPTransportOptions) *mcp.ServerConnection {
 	t.Helper()
+	return httpConnFor(t, mcp.ServerConfig{Name: "remote"}, opts)
+}
+
+func httpConnFor(t *testing.T, cfg mcp.ServerConfig, opts mcp.HTTPTransportOptions) *mcp.ServerConnection {
+	t.Helper()
 	tr, err := mcp.StartStreamableHTTP(context.Background(), opts)
 	must(t, err)
-	conn := mcp.NewConnection(mcp.ServerConfig{Name: "remote"}, tr, mcp.ConnectionOptions{
+	conn := mcp.NewConnection(cfg, tr, mcp.ConnectionOptions{
 		Warnf: func(f string, a ...any) { t.Logf("client: "+f, a...) },
 	})
 	t.Cleanup(func() { _ = conn.Close() })
@@ -117,32 +124,16 @@ func httpConn(t *testing.T, opts mcp.HTTPTransportOptions) *mcp.ServerConnection
 
 type streamableOptions struct {
 	answerWithSSE bool
-	refuseGET     bool
 	onRequest     func(*http.Request)
 }
 
-// streamableHandler is a minimal 2025-03-26 server.
+// streamableHandler is a minimal 2026-07-28 server: one POST endpoint.
 func streamableHandler(t *testing.T, opts streamableOptions) http.Handler {
 	t.Helper()
 	theAnswer := answerRPC
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if opts.onRequest != nil {
 			opts.onRequest(r)
-		}
-		if r.Method == http.MethodGet {
-			if opts.refuseGET {
-				w.WriteHeader(http.StatusMethodNotAllowed)
-				return
-			}
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.WriteHeader(http.StatusOK)
-			w.(http.Flusher).Flush()
-			<-r.Context().Done()
-			return
-		}
-		if r.Method == http.MethodDelete {
-			w.WriteHeader(http.StatusNoContent)
-			return
 		}
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -168,75 +159,7 @@ func streamableHandler(t *testing.T, opts streamableOptions) http.Handler {
 	})
 }
 
-// sseServer is a minimal 2024-11-05 server: a GET stream plus a POST endpoint.
-type sseServer struct {
-	t            *testing.T
-	base         string
-	endpoint     string // relative or absolute; empty means "<base>/messages"
-	refusePOSTAt string // a path that answers POST with 405, like a stream url
-
-	mu      sync.Mutex
-	streams []chan string
-}
-
-func newSSEServer(t *testing.T) *sseServer { return &sseServer{t: t} }
-
-func (s *sseServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost && s.refusePOSTAt != "" && r.URL.Path == s.refusePOSTAt {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	switch {
-	case r.Method == http.MethodGet:
-		ch := make(chan string, 16)
-		s.mu.Lock()
-		s.streams = append(s.streams, ch)
-		s.mu.Unlock()
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		ep := s.endpoint
-		if ep == "" {
-			ep = s.base + "/messages"
-		}
-		fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", ep)
-		w.(http.Flusher).Flush()
-		for {
-			select {
-			case msg := <-ch:
-				fmt.Fprintf(w, "event: message\ndata: %s\n\n", msg)
-				w.(http.Flusher).Flush()
-			case <-r.Context().Done():
-				return
-			}
-		}
-
-	case r.Method == http.MethodPost:
-		id, method, params := readRPC(s.t, r)
-		w.WriteHeader(http.StatusAccepted)
-		if !id.IsSet() {
-			return
-		}
-		body, err := json.Marshal(map[string]any{
-			"jsonrpc": "2.0", "id": id, "result": answerRPC(s.t, method, params)})
-		must(s.t, err)
-		s.mu.Lock()
-		streams := append([]chan string(nil), s.streams...)
-		s.mu.Unlock()
-		for _, ch := range streams {
-			select {
-			case ch <- string(body):
-			default:
-			}
-		}
-
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-}
-
-// answerRPC is the one server behaviour both fixtures share.
+// answerRPC is the one server behaviour the fixtures share.
 func answerRPC(t *testing.T, method string, params json.RawMessage) any {
 	t.Helper()
 	switch method {
@@ -319,31 +242,28 @@ func TestARemoteServersHeadersAreInterpolatedFromSecrets(t *testing.T) {
 	}
 }
 
-// TestAHeaderThatResolvesToNothingIsDroppedNotSentBlank. An empty
-// Authorization header is not a weaker credential, it is a malformed request,
-// and the 401 it earns tells an operator far less than the warning does.
-func TestAHeaderThatResolvesToNothingIsDroppedNotSentBlank(t *testing.T) {
+// TestAnUnresolvedHeaderVariableIsAConfigurationError is NFR-SEC-03 on the
+// header path. `Bearer ${MISSING}` with no MISSING used to be a dropped header
+// and a warning; the 401 that followed explained nothing. Now nothing is
+// sent at all and the error names the variable.
+func TestAnUnresolvedHeaderVariableIsAConfigurationError(t *testing.T) {
 	var got http.Header
 	srv := httptest.NewServer(recordingHandler(t, &got))
 	t.Cleanup(srv.Close)
 
-	var warnings []string
-	p := mcp.NewPool(mcp.ConnectionOptions{
-		Warnf: func(f string, a ...any) { warnings = append(warnings, fmt.Sprintf(f, a...)) },
-	})
+	p := mcp.NewPool(mcp.ConnectionOptions{})
 	t.Cleanup(func() { _ = p.Close() })
 	_, err := p.Connect(context.Background(), mcp.ServerConfig{
 		Name: "remote", URL: srv.URL,
 		Headers: map[string]string{"Authorization": "Bearer ${MISSING}"},
 	}, nil, func(string) string { return "" })
-	must(t, err)
 
-	if _, present := got["Authorization"]; present {
-		t.Fatalf("an unresolved header must be dropped, not sent as %q", got.Get("Authorization"))
+	var unresolved *mcp.UnresolvedVariableError
+	if !errors.As(err, &unresolved) || len(unresolved.Variables) != 1 || unresolved.Variables[0] != "MISSING" {
+		t.Fatalf("err = %v; want an UnresolvedVariableError naming MISSING", err)
 	}
-	if len(warnings) == 0 {
-		t.Fatal("dropping a header must warn; silently sending no credential is how a " +
-			"401 becomes a mystery")
+	if got != nil {
+		t.Fatal("no request may be made on a configuration error")
 	}
 }
 
@@ -382,10 +302,6 @@ func hasError(diags []mcp.Diagnostic) bool {
 
 // recordingHandler is a minimal streamable-HTTP server that keeps the headers
 // of the first POST it sees.
-//
-// The method guard is not decoration: the transport also opens a standalone
-// GET for server-initiated messages, and that request has no body — decoding
-// one as JSON-RPC fails for a reason that has nothing to do with the test.
 func recordingHandler(t *testing.T, got *http.Header) http.Handler {
 	t.Helper()
 	var mu sync.Mutex
@@ -407,6 +323,134 @@ func recordingHandler(t *testing.T, got *http.Header) http.Handler {
 		}
 		writeJSONRPC(t, w, id, answerRPC(t, method, params))
 	})
+}
+
+// ---- the per-call deadline and re-issue (REQ-MCP-CLIENT-07, -02.3)
+
+// TestThePerCallDeadlineFiresOnAStallingHTTPServer. The POST was made and its
+// JSON body read under the TRANSPORT's context, synchronously inside Send, so
+// a server that accepted the request and then stalled held Call forever: the
+// call's own deadline expired on a context nothing was watching.
+func TestThePerCallDeadlineFiresOnAStallingHTTPServer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, method, params := readRPC(t, r)
+		if method != mcp.MethodToolsCall {
+			writeJSONRPC(t, w, id, answerRPC(t, method, params))
+			return
+		}
+		// Accept the POST, promise JSON, deliver nothing until the client
+		// gives up.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	conn := httpConnFor(t, mcp.ServerConfig{Name: "remote", Timeout: 300 * time.Millisecond},
+		mcp.HTTPTransportOptions{URL: srv.URL})
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Call(context.Background(), "echo", map[string]any{"message": "x"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v; want the call's own deadline", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Call hung on a stalling server; timeout_s never fired")
+	}
+}
+
+// TestABrokenResponseStreamReissuesTheRequestWithANewID is
+// REQ-MCP-CLIENT-02.3. There is no resumability in 2026-07-28: a response
+// stream that ends before the response arrived loses that request, and the
+// client must re-issue it — with a new id, once, and without failing every
+// other call in flight.
+func TestABrokenResponseStreamReissuesTheRequestWithANewID(t *testing.T) {
+	var mu sync.Mutex
+	var callIDs []mcp.ID
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, method, params := readRPC(t, r)
+		if method != mcp.MethodToolsCall {
+			writeJSONRPC(t, w, id, answerRPC(t, method, params))
+			return
+		}
+		mu.Lock()
+		callIDs = append(callIDs, id)
+		n := len(callIDs)
+		mu.Unlock()
+		if n == 1 {
+			// An event stream that ends cleanly with no response on it.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, ": keep-alive\n\n")
+			return
+		}
+		writeJSONRPC(t, w, id, answerRPC(t, method, params))
+	}))
+	t.Cleanup(srv.Close)
+
+	conn := httpConn(t, mcp.HTTPTransportOptions{URL: srv.URL})
+	res, err := conn.Call(context.Background(), "echo", map[string]any{"message": "again"})
+	must(t, err)
+	if res.Content[0].Text != "again" {
+		t.Fatalf("result = %+v", res)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(callIDs) != 2 {
+		t.Fatalf("the request was issued %d time(s); want exactly 2", len(callIDs))
+	}
+	if callIDs[0].Key() == callIDs[1].Key() {
+		t.Fatalf("the re-issued request reused id %s; it must carry a NEW id", callIDs[0])
+	}
+	if conn.Reconnects() != 0 || !conn.Alive() {
+		t.Fatal("a broken stream is one request's failure, not the transport's")
+	}
+}
+
+// TestAnHTTPTransportIsRedialledAfterItDies is NFR-REL-03 for a url server: a
+// malformed stream poisons the transport (REQ-SEC-11.4), the call that hit it
+// fails, and the NEXT call opens a fresh transport within the budget.
+func TestAnHTTPTransportIsRedialledAfterItDies(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, method, params := readRPC(t, r)
+		if method != mcp.MethodToolsCall {
+			writeJSONRPC(t, w, id, answerRPC(t, method, params))
+			return
+		}
+		if calls.Add(1) == 1 {
+			// A stream that ends MID-EVENT: not a broken-but-clean stream, a
+			// malformed one.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\"")
+			return
+		}
+		writeJSONRPC(t, w, id, answerRPC(t, method, params))
+	}))
+	t.Cleanup(srv.Close)
+
+	p := mcp.NewPool(mcp.ConnectionOptions{
+		Warnf: func(f string, a ...any) { t.Logf("client: "+f, a...) }})
+	t.Cleanup(func() { _ = p.Close() })
+	conn, err := p.Connect(context.Background(), mcp.ServerConfig{Name: "remote", URL: srv.URL}, nil, nil)
+	must(t, err)
+
+	if _, err := conn.Call(context.Background(), "echo", map[string]any{"message": "x"}); err == nil {
+		t.Fatal("the call whose stream was malformed must fail")
+	}
+	res, err := conn.Call(context.Background(), "echo", map[string]any{"message": "y"})
+	if err != nil {
+		t.Fatalf("the next call must re-dial: %v", err)
+	}
+	if res.Content[0].Text != "y" || conn.Reconnects() != 1 {
+		t.Fatalf("result = %+v, reconnects = %d", res, conn.Reconnects())
+	}
 }
 
 // ---- the SSE decoder's own bounds and framing

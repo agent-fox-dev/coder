@@ -29,10 +29,16 @@ kill-and-resume across two "processes" and three concurrent delegations.
 
 ## Status
 
-This implements the core of [`agent-kit-prd.md`](agent-kit-prd.md) v0.3.2.
-It is a working library with a thorough test suite; it is not a finished
-product. [What is not built](#what-is-not-built) is stated below rather than
-left to be discovered.
+This implements [`agent-kit-prd.md`](agent-kit-prd.md) v0.4.1. It is a
+working library with a thorough test suite; it is not a finished product.
+[What is not built](#what-is-not-built) is stated below rather than left to
+be discovered, and the requirement-by-requirement audit that produced 0.4.1
+is in [`docs/GAPS.md`](docs/GAPS.md), with what was fixed and what was
+deliberately deferred.
+
+**Go 1.24 or later.** The loop's event stream is a range-over-func iterator
+and the wire structs use `omitzero`; the PRD's original "1.21+" was corrected
+in 0.4.1 rather than the code walked back.
 
 | Package | What it owns |
 |---|---|
@@ -129,22 +135,21 @@ general-purpose JSON-RPC implementation rejects duplicate keys — because
 JSON-RPC does not ask it to. The two requirements cannot both hold; the PRD is
 amended in 0.3.5 with the argument.
 
-Two consequences worth knowing. **Server handlers run concurrently**, because a
-handler calling `RequestSampling` waits for a response arriving on the same
-transport — serving one request at a time and supporting sampling are mutually
-exclusive. And **the 50K result cap is spent across the whole result, not per
-item**: a server returning two hundred blocks of 49K each passes a per-item cap
-and delivers ten megabytes into the model's context. It counts runes, not
-bytes, or a CJK result gets a third of the room an ASCII one does.
+Two consequences worth knowing. **Server handlers run concurrently**, bounded
+by a cap, because one slow handler must not serialize every other client's
+call behind it. And **the 50K result cap is spent across the whole result, not
+per item**: a server returning two hundred blocks of 49K each passes a
+per-item cap and delivers ten megabytes into the model's context. It counts
+runes, not bytes, or a CJK result gets a third of the room an ASCII one does.
 
 **The server advertises `listChanged`, so it sends it**
 ([`mcp/server.go`](mcp/server.go)). Registering or withdrawing a tool after a
-client has connected emits `notifications/tools/list_changed` to every
-initialized session. A capability advertised in the handshake and then never
-honoured is worse than one never claimed: a client that trusts it caches its
-tool list forever. The notification is sent *after* the registry lock is
-released, so one wedged client's transport cannot block every registration on
-the server.
+client has subscribed emits `notifications/tools/list_changed` to every
+`subscriptions/listen` stream that asked for it. A capability advertised and
+then never honoured is worse than one never claimed: a client that trusts it
+caches its tool list forever. The notification is sent *after* the registry
+lock is released, so one wedged client's transport cannot block every
+registration on the server.
 
 **Resource URIs are templated** ([`mcp/resources.go`](mcp/resources.go)).
 REQ-MCP-SERVER-05's own examples are parameterised —
@@ -187,15 +192,19 @@ base64 is 4/3 the size of what it encodes, so budgeting the bytes ships an
 image a third over the limit it was checked against and nothing in the
 provider's error mentions base64.
 
-**A remote server's `endpoint` event may not leave its origin**
-([`mcp/httpsse.go`](mcp/httpsse.go)). In the 2024-11-05 transport the server
-names the URL its client should POST to. Every POST carries the configured
-headers, which is where a bearer token for that server lives — so a server that
-could name any origin would be choosing where our credential gets sent, as
-traffic that looks exactly like the protocol working. The named URL is resolved
-against the stream's own URL and then checked: same scheme, same host, same
-port, or we do not send. Relative endpoints (`/messages?sessionId=…`) are the
-common case and are precisely what the rule makes safe.
+**A shell tool with no interceptor fails the run before the first request**
+([`policy.go`](policy.go)). REQ-SEC-03 made the embedder's `BeforeToolCall`
+the one authorization boundary, and a headless embedder that never wrote one
+would otherwise hand the model an unrestricted shell by omission — the exact
+outcome OQ-8 warned was worse than the allowlist it replaced. So `execute`,
+`run_command` or `powershell` in the resolved tool set with a nil interceptor
+is `ErrUnguardedExecute`; the opt-out is `AllowAllToolCalls`, an interceptor
+that never blocks, so an unrestricted shell is something you say in code.
+`RestrictedPolicy` ships as the replaceable starting point: a program
+allowlist plus operator rejection under a *declared* grammar (POSIX sh
+quoting), with `powershell` refused outright unless you supply a PowerShell
+filter — REQ-SEC-04's rule that a filter which silently does not hold on one
+supported shell is worse than none. It is a floor, not a sandbox.
 
 **The default tool set is platform-stable, `powershell` included**
 ([`tools/powershell.go`](tools/powershell.go)). REQ-TOOL-06 asks for the second
@@ -643,7 +652,8 @@ Also included: `FuzzRepairAlwaysSendable` (432k executions clean),
 
 ## What is not built
 
-Stated plainly so nobody reports it as done.
+Stated plainly so nobody reports it as done. The full requirement-by-
+requirement ledger, fixed and deferred alike, is [`docs/GAPS.md`](docs/GAPS.md).
 
 - **Reference bodies for the differential harness.** The harness itself ships
   ([`difftest/`](difftest/), a separate module) and its own suite is
@@ -660,12 +670,31 @@ Stated plainly so nobody reports it as done.
   implementing the handshake era rather than setting a flag.
 - **MCP surface AgentKit never had.** Prompts, completions, elicitation,
   resource subscriptions and the Tasks extension are defined by the revision
-  and not implemented here; `subscriptions/listen` ships, but only the
-  list-changed filters have producers.
-- **Plugin implementations.** The four categories, the registry, discovery, the
-  lint and `validate-plugins` ship; no first-party plugin does. That is the
-  intended shape — a plugin is the embedder's code — but it means the
-  categories have no in-tree user yet.
+  and not implemented here; `subscriptions/listen` ships on both transports,
+  but only the list-changed filters have producers.
+- **Four compat flags.** `ThinkingFormat` (DeepSeek's `reasoning_content`
+  echo), `ThinkingTokenBudgetField`, `AllowsUserAfterToolResult` and
+  `CacheControlFormat` (prompt caching over Chat Completions for OpenRouter's
+  `anthropic/*` models) are declared in the PRD's table and not wired. The
+  requirement's own rule is that a flag is added only with a named vendor and
+  a reproducing case, and none has been captured yet.
+- **The schema cache and deferred tool loading on four of five wires.** Both
+  are attached to Anthropic only; the other adapters re-marshal every schema
+  each turn, and neither Responses `additional_tools` nor the "withhold and
+  re-declare" arm of REQ-CACHE-10 exists. The Anthropic implementation is the
+  template.
+- **The Vertex AI path.** The Google adapter takes an API key against
+  `v1beta`; a Vertex base URL needs a different path shape, so NFR-COMPAT-05's
+  "only a config change" does not yet hold. Ambient credentials (ADC) do
+  resolve to the *ambient* state rather than "no key".
+- **Gemini `CachedContent`, deferred requests, the re-arming drain timer.**
+  Each is optional or demoted in the PRD (NFR-PERF-08, OQ-11, REQ-TOOL-17.5)
+  and each is listed in the ledger with what it would take.
+- **Plugin implementations.** The four categories, the registry, discovery,
+  `[plugins]` config, ordered loading, `disabled`, the lint and
+  `validate-plugins` ship; no first-party plugin does. That is the intended
+  shape — a plugin is the embedder's code — but it means the categories have
+  no in-tree user yet.
 - **A vendor capture behind the request goldens.**
   [`docs/PROVIDERS.md`](docs/PROVIDERS.md) ships and is checked against the
   code by a test, so a pin bump that forgets the ledger fails. Its capture-date
@@ -675,8 +704,16 @@ Stated plainly so nobody reports it as done.
   the `difftest` harness above, pins it against *truth*.
 - **WebP normalization.** REQ-TOOL-14 downscales JPEG, PNG and GIF; the
   standard library has no WebP decoder and REQ-GO-11 forbids the module that
-  does, so a WebP image is reported unsupported and kept as-is — which is what
-  REQ-TOOL-14.5 asks for on any failure, and a format providers accept anyway.
+  does, so a WebP image is forwarded as-is with its dimensions unknown — which
+  is what REQ-TOOL-14.5 asks for on any failure, and a format providers accept
+  anyway.
+
+Two operational notes that are easy to miss. `execute` output over the cap is
+spilled to a per-workspace directory under the OS temp dir by default
+(`tools.Options.SpillDir` to move it, `DisableSpill` to turn it off), and the
+spill files are the embedder's to clean. And a shell tool with no
+`BeforeToolCall` fails the run (`ErrUnguardedExecute`); `AllowAllToolCalls` is
+the explicit opt-out.
 
 All five wire APIs ship, including `openai-responses` as a separate
 implementation rather than `openai-completions` with a flag — the two differ in

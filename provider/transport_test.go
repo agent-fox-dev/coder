@@ -279,3 +279,29 @@ func TestCancelledRequestIsNotRetried(t *testing.T) {
 			"cancellation turns one abort into five", got)
 	}
 }
+
+// TestANonRetryableResponseIsReturnedWhateverItsRetryAfter: the MaxRetryDelay
+// ceiling is judged only when a retry would otherwise happen (REQ-PROV-13).
+// A 400 carrying Retry-After: 3600 is not a throttle to abandon; it is the
+// response whose body says what was wrong with the request, and it used to
+// be discarded as ErrRetryDelayTooLong.
+func TestANonRetryableResponseIsReturnedWhateverItsRetryAfter(t *testing.T) {
+	var slept []time.Duration
+	hc := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return respond(400, `{"error":"bad request"}`, map[string]string{"Retry-After": "3600"}), nil
+	})}
+	p := noWait(3, &slept)
+	p.MaxRetryDelay = 60 * time.Second
+
+	resp, err := provider.Do(context.Background(), hc, post("http://x/y"), p)
+	if err != nil {
+		t.Fatalf("err = %v, want the 400 returned to the caller", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if len(slept) != 0 {
+		t.Fatalf("slept %v on a non-retryable status", slept)
+	}
+}

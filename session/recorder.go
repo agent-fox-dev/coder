@@ -1,6 +1,8 @@
 package session
 
 import (
+	"fmt"
+
 	"github.com/agentfox/agentkit-go/core"
 )
 
@@ -104,10 +106,22 @@ func (r *Recorder) RecordThinkingLevel(l core.ThinkingLevel) (core.EntryID, erro
 // in-memory checkpoint (REQ-SESS-04). The summarized entries stay in the file
 // and in history; only the per-request view drops them.
 //
-// firstKept must name an entry already in the log. CreatedAtLen is taken from
-// history at the moment of the call, which is exactly what REQ-GO-15's skip
-// rule (c) needs (P-2).
+// firstKept must name an entry already in the log, and that is CHECKED before
+// anything is appended. An unknown anchor used to be written as-is: the
+// checkpoint then had PrefixLen 0 (nothing dropped, so the compaction bought
+// nothing) and every later load reported RepairUnresolvedAnchor for an entry
+// the store itself had produced — the store manufacturing the damage class
+// P-37 exists to detect. The log is append-only, so the only place to refuse
+// it is here. CreatedAtLen is taken from history at the moment of the call,
+// which is exactly what REQ-GO-15's skip rule (c) needs (P-2).
 func (r *Recorder) RecordCompaction(summary string, firstKept core.EntryID, previous string) (core.CompactionCheckpoint, error) {
+	if !r.hasEntry(firstKept) {
+		err := fmt.Errorf("session: compaction anchor: %w: %q", ErrUnknownEntry, firstKept)
+		if r.onErr != nil {
+			r.onErr(err)
+		}
+		return core.CompactionCheckpoint{}, err
+	}
 	id, err := r.append(NewCompactionEntry(summary, firstKept, previous))
 	if err != nil {
 		return core.CompactionCheckpoint{}, err
@@ -122,6 +136,33 @@ func (r *Recorder) RecordCompaction(summary string, firstKept core.EntryID, prev
 		r.history.SetCheckpoint(cp)
 	}
 	return cp, nil
+}
+
+// hasEntry reports whether id can anchor a compaction: an entry the log
+// holds, or — for a recorder with no store — one history has seen. With
+// neither there is nothing to check against and the call is a no-op anyway,
+// so it is allowed; the empty id is never allowed, because it is the
+// NullLeaf sentinel and the loader treats it as unresolved.
+func (r *Recorder) hasEntry(id core.EntryID) bool {
+	if id == core.NullLeaf {
+		return false
+	}
+	if r.store != nil {
+		if s, ok := r.store.(interface{ Has(core.EntryID) bool }); ok {
+			return s.Has(id)
+		}
+		for _, e := range r.store.Entries() {
+			if e.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	if r.history != nil {
+		_, ok := r.history.IndexOfEntry(id)
+		return ok
+	}
+	return true
 }
 
 // RecordCustom appends a custom_message entry and renders it into history as a

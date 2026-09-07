@@ -13,6 +13,12 @@ import (
 // changing it changes what every compacted session says to the model.
 const CompactionSummaryPrefix = "[Earlier conversation, summarized]\n\n"
 
+// CompactionSplitSeparator joins the two halves of a SPLIT summary
+// (REQ-GO-14): the summary of the completed turns, then the summary of the
+// turn the cut landed inside. Model-visible format contract, pinned by the
+// same golden as CompactionSummaryPrefix.
+const CompactionSplitSeparator = "\n\n[The turn in progress at the cut, summarized separately]\n\n"
+
 // CompactionStrategy decides whether and where to compact.
 type CompactionStrategy interface {
 	// ShouldCompact reports whether the view needs compacting, given the
@@ -183,14 +189,45 @@ func (e *ErrBadSummary) Error() string { return "agentkit: unusable summary: " +
 // BudgetMiddleware, the retry layers' turn accounting, or the dedup cache as
 // though it were a conversational turn. A summarizer that went back through
 // the loop would satisfy the requirement only by convention.
-func ModelSummarizer(p core.ProviderClient, m *core.Model, maxTokens int) Summarizer {
+//
+// reserveTokens is REQ-GO-12.3's reserve: the summary's max_tokens is
+// min(0.8 × reserve, model.MaxTokens). A caller passing the whole reserve
+// gets a summary that cannot consume it entirely, and one passing more than
+// the model can emit gets the model's ceiling rather than a 400. Zero means
+// "the model's own ceiling".
+//
+// The request carries its OWN session id (a fresh one per summarizer, never
+// the conversation's): the summary is not part of the conversation prefix,
+// and routing it on the conversation's key would land it on the node whose
+// KV cache is warm for a prefix it does not share.
+func ModelSummarizer(p core.ProviderClient, m *core.Model, reserveTokens int) Summarizer {
+	return modelSummarizer(p, m, reserveTokens, false)
+}
+
+// ModelTurnSummarizer is the summarizer for the SPLIT half of a cut
+// (REQ-GO-14): the prefix of the turn the boundary landed inside, summarized
+// under a distinct prompt at half the token budget. Install it as
+// CompactionDeps.TurnSummarizer; when absent, the main summarizer is used for
+// both halves and the distinct prompt and the half budget are lost.
+func ModelTurnSummarizer(p core.ProviderClient, m *core.Model, reserveTokens int) Summarizer {
+	return modelSummarizer(p, m, reserveTokens/2, true)
+}
+
+func modelSummarizer(p core.ProviderClient, m *core.Model, reserveTokens int, turnOnly bool) Summarizer {
+	sessionID := newID("summary")
 	return func(ctx context.Context, prefix core.Messages, previous string) (string, error) {
 		system := "Summarize the conversation so far. Preserve decisions, file paths, " +
 			"identifiers, and anything the assistant committed to. Omit pleasantries."
+		if turnOnly {
+			system = "Summarize the PARTIAL turn below: what was asked, what the assistant " +
+				"had done so far, and any tool results it had received. It was interrupted " +
+				"at the end; do not invent a conclusion. Preserve file paths and identifiers."
+		}
 		if previous != "" {
 			system += "\n\nA previous summary covers the earliest part; extend it rather " +
 				"than restating it:\n<previous-summary>\n" + previous + "\n</previous-summary>"
 		}
+		maxTokens := summaryMaxTokens(m, reserveTokens)
 		req := core.Request{
 			System:   []core.ContentBlock{core.TextBlock{Text: system}},
 			Messages: prefix,
@@ -198,6 +235,7 @@ func ModelSummarizer(p core.ProviderClient, m *core.Model, maxTokens int) Summar
 			// tool-free turn reliably forceable (REQ-TOOL-16).
 			ToolChoice: core.ToolChoiceNone,
 			MaxTokens:  &maxTokens,
+			Options:    core.RequestOptions{SessionID: sessionID},
 		}
 		msg := core.Complete(ctx, p, m, req, core.ProviderStreamOptions{
 			// Caching is disabled for this request: it is not part of the
@@ -206,6 +244,22 @@ func ModelSummarizer(p core.ProviderClient, m *core.Model, maxTokens int) Summar
 		})
 		return ValidateSummary(msg)
 	}
+}
+
+// summaryMaxTokens is REQ-GO-12.3's clamp: min(0.8 × reserve, model.MaxTokens),
+// with each unknown side deferring to the other and a floor of 1.
+func summaryMaxTokens(m *core.Model, reserve int) int {
+	n := 0
+	if reserve > 0 {
+		n = reserve * 8 / 10
+	}
+	if m != nil && m.MaxTokens > 0 && (n <= 0 || n > m.MaxTokens) {
+		n = m.MaxTokens
+	}
+	if n <= 0 {
+		n = 1
+	}
+	return n
 }
 
 // ValidateSummary is REQ-GO-16's failure taxonomy, as a pure function.
@@ -259,8 +313,13 @@ func ValidateSummary(msg *core.AssistantMessage) (string, error) {
 type CompactionDeps struct {
 	Strategy   CompactionStrategy
 	Summarizer Summarizer
-	History    *core.ConversationHistory
-	Model      *core.Model
+	// TurnSummarizer summarizes the prefix of a SPLIT turn (REQ-GO-14) under
+	// a distinct prompt at half the budget. Nil disables the split and the
+	// whole prefix is summarized as one block; ModelTurnSummarizer is the
+	// shipped implementation.
+	TurnSummarizer Summarizer
+	History        *core.ConversationHistory
+	Model          *core.Model
 	// OnCheckpoint persists the REQ-SESS-04 entry. Optional.
 	OnCheckpoint func(core.CompactionCheckpoint) error
 	// OnError surfaces a failed summarization. Compaction never aborts the
@@ -320,7 +379,7 @@ func NewContextTransform(d CompactionDeps) core.ContextTransform {
 			return msgs[cut:]
 		}
 
-		summary, err := d.Summarizer(ctx, msgs[:cut], cp.Summary)
+		summary, err := summarizeWithSplit(ctx, d, msgs, cut, cp.Summary)
 		if err != nil {
 			// REQ-GO-16 governs the CHECKPOINT: never persist a bad summary.
 			// NFR-REL-05 governs the VIEW: never abort the session. Both hold
@@ -344,6 +403,50 @@ func NewContextTransform(d CompactionDeps) core.ContextTransform {
 		}
 		return ApplyCheckpoint(msgs, next)
 	}
+}
+
+// summarizeWithSplit is REQ-GO-14's turn split.
+//
+// CutNotToolResult permits a boundary on an ASSISTANT message, which means
+// the cut lands INSIDE a turn: the user's question is in the summarized
+// prefix and the assistant's reply — possibly tool calls and results — is in
+// the kept tail. Summarizing the whole prefix as one block folds the head of
+// that turn into "earlier conversation" and the model resumes a reply to a
+// question it can no longer see verbatim. So the prefix of the split turn,
+// from the nearest preceding user message, is summarized SEPARATELY under a
+// distinct prompt at half the budget, and the two summaries are joined with a
+// fixed separator. A cut that lands on a user message is not split.
+//
+// The split needs a summarizer with the DISTINCT prompt the requirement
+// names; with no TurnSummarizer configured there is none, and splitting would
+// only double the calls under a prompt that tells the model to "extend the
+// previous summary" over half a turn. So the split applies when a
+// TurnSummarizer is installed (ModelTurnSummarizer is the shipped one), and
+// a caller who wires only the main summarizer gets the single-block form.
+func summarizeWithSplit(ctx context.Context, d CompactionDeps, msgs core.Messages, cut int, previous string) (string, error) {
+	if _, onUser := msgs[cut].(core.UserMessage); onUser || d.TurnSummarizer == nil {
+		return d.Summarizer(ctx, msgs[:cut], previous)
+	}
+	turnStart := cut - 1
+	for turnStart > 0 {
+		if _, ok := msgs[turnStart].(core.UserMessage); ok {
+			break
+		}
+		turnStart--
+	}
+	if turnStart <= 0 {
+		// The whole prefix is one turn; there is nothing to split it from.
+		return d.Summarizer(ctx, msgs[:cut], previous)
+	}
+	head, err := d.Summarizer(ctx, msgs[:turnStart], previous)
+	if err != nil {
+		return "", err
+	}
+	tail, err := d.TurnSummarizer(ctx, msgs[turnStart:cut], "")
+	if err != nil {
+		return "", err
+	}
+	return head + CompactionSplitSeparator + tail, nil
 }
 
 func checkpointPtr(cp core.CompactionCheckpoint, ok bool) *core.CompactionCheckpoint {

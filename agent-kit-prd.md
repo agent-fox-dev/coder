@@ -1,10 +1,21 @@
 # AgentKit: A Dependency-Free Agent SDK for Go
 
 **Author:** [Platform Engineering]
-**Date:** 2026-09-05
+**Date:** 2026-09-06
 **Status:** Draft
-**Version:** 0.4.0
+**Version:** 0.4.1
 
+> **0.4.1** is a conformance pass: the implementation was audited requirement by
+> requirement and the document corrected where it disagreed with itself or with what
+> shipped. Four changes are to the text rather than the code: REQ-GO-01 / NFR-COMPAT-01
+> now state the Go floor the code actually requires (1.24 — range-over-func iterators,
+> `omitzero`); NFR-COMPAT-02 and REQ-GO-10 are amended to what 0.3.5 and 0.4.0 already
+> decided (standard-library MCP, `2026-07-28` only); REQ-LOOP-16 records that a trailing
+> aborted or errored assistant message is the REQ-LOOP-09 terminal marker and not a
+> "completed assistant turn"; and OQ-8 is resolved as recommended (the run fails loudly
+> when a shell tool has no interceptor, and `RestrictedPolicy` ships). Everything else
+> found by the audit was a code change, listed in `docs/GAPS.md`.
+>
 > **Revision note (0.3.0).** This revision incorporates a review of a shipped, zero-dependency
 > Go agent SDK and coding agent of comparable scope and identical constraints
 > ([`sky-valley/pi`](https://github.com/sky-valley/pi), a pure-Go port of Mario Zechner's `pi`
@@ -406,6 +417,8 @@ The `steering.md` convention used in the existing nightshift codebase is a degen
   - `assistant` — drain the steering and follow-up queues and run with those. If both are empty, return an error: a completed assistant turn is not continuable.
 
   Resuming a transcript that ends in a `tool_result` is the normal outcome of REQ-LOOP-09 cancellation, so `Continue` is not an optional convenience.
+
+  **Amended in 0.4.1.** The precondition is evaluated on the transcript the model will *see*. A trailing assistant message whose `stop_reason` is `Aborted` or `Error` is the REQ-LOOP-09 terminal marker, not a completed turn: REQ-PROV-11 rule 2 drops it from every outbound request, so the model still owes a reply to whatever preceded it, and `Continue` accepts the transcript. Two corollaries the implementation found: a cancellation that lands during a tool batch ends the run *at that turn boundary* — going around the loop once more issues a request on a dead context and records a content-free aborted turn that never happened; and the `assistant` branch drains the follow-up queue *before* the first request, since there is no inner loop left to exhaust and REQ-LOOP-14's "after the inner loop" would deliver it a turn late.
 ### 6.2 Model Provider Abstraction
 
 - **REQ-PROV-01:** **Streaming is the primitive.** A `ProviderClient` implements a single required method, `Stream(ctx, model, req, opts) *EventStream`. `Complete()` is a derived convenience implemented once in the SDK as `Stream(...).Result()` — never per provider. A provider therefore has exactly one place that parses its wire format, and the streaming and non-streaming paths cannot disagree.
@@ -839,7 +852,7 @@ A context file is repository-authored standing instruction text (house style, bu
 
 ### 6.9 Go Implementation
 
-- **REQ-GO-01:** Go 1.21+ target.
+- **REQ-GO-01 (amended in 0.4.1):** Go 1.24+ target. The original text said 1.21. The code uses range-over-func iterators (`iter.Seq`, Go 1.23) for `EventStream.Events()` and `encoding/json`'s `omitzero` (Go 1.24), and `go.mod` declares 1.24; a document that says 1.21 above a module that cannot build on 1.21 is a promise nobody can keep. The floor is stated once, here, and `go.mod` is the copy that binds.
 - **REQ-GO-02:** Single `Agent` type. No sync/async distinction.
 - **REQ-GO-03:** Tool handler signature: `func(ctx context.Context, input json.RawMessage) (json.RawMessage, error)`.
 - **REQ-GO-04:** Parallel tool execution uses one goroutine per tool handler invocation, joined by `sync.WaitGroup`, with results written by slot index into a pre-sized slice. **`errgroup` must not be used for tool batches.** `errgroup.Group.Wait` returns only the first error and `errgroup.WithContext` cancels the remaining siblings; in an agent loop a failing tool must not cancel its peers, because every call in the batch needs a result or the next request carries dangling `tool_use` blocks. `errgroup` additionally provides neither the hook serialization nor the emit ordering required by REQ-LOOP-05. Handler errors, panics (`recover()`), interceptor blocks, validation failures and aborts are all converted to a `ToolResultMessage` with `is_error=true`; no tool outcome is ever propagated to the caller as a Go `error`. (`errgroup` remains appropriate for parallel subagent delegation under REQ-MULTI-04, where each child is an independent run with its own transcript.)
@@ -853,7 +866,7 @@ A context file is repository-authored standing instruction text (house style, bu
   - Pushes after the stream is done are dropped silently. Cancellation is `context.Context`, propagated to the in-flight HTTP request — not a `Close()` on the stream. There is no `StreamOptions.BufferSize`.
   - The memory risk is bounded in practice by `max_tokens`: the worst case is one model response's worth of deltas held in a slice. Callers that must bound it further may set `StreamOptions.MaxPendingBytes`, which drops the **consumer** (closing its view with `ErrStreamOverrun`) rather than dropping events, and lets the run complete normally with `RunResult` still available.
 - **REQ-GO-09:** Typed sentinel errors, all comparable with `errors.Is`: `ErrMaxTurns`, `ErrBudgetExceeded`, `ErrToolRejected`, `ErrRefusal`, `ErrBusy` (a conflicting operation was attempted while a turn was in flight — REQ-LOOP-15; the caller may retry, it is never queued), `ErrAborted` (the turn was stopped by `Agent.Abort()`, distinguishable from `context.Canceled`, which signals the caller's own `ctx`), and `ErrStreamOverrun`.
-- **REQ-GO-10:** The Go MCP client uses `github.com/mark3labs/mcp-go` (MIT licensed), in the nested module of REQ-GO-11.
+- **REQ-GO-10 (amended in 0.3.5, text corrected in 0.4.1):** The MCP client is implemented on the standard library in the root module; see REQ-MCP-CLIENT-01 for why `mcp-go` cannot satisfy REQ-SEC-11. The original text named `github.com/mark3labs/mcp-go` in a nested module and was left standing after 0.3.5 removed the dependency it described.
 - **REQ-GO-11:** The root module (`github.com/agentfox/agentkit-go`) requires **nothing outside the Go standard library**. Build tags and sub-packages do **not** satisfy this: a build-tagged import still appears in `go.mod`, `go.sum`, `go list -m all`, and every downstream SBOM and vulnerability scan, and a sub-package's imports are in the root module graph unconditionally. The only mechanism in Go that confines a dependency to opt-in consumers is a **nested module**. Therefore:
   1. Any provider, plugin, or transport that needs a third-party module lives in a nested module (`providers/<name>/`, `mcp/`, `plugins/<name>/`) with its own `go.mod` and its own tag series. `go list ./...` in the root does not descend into it, so the root stays clean by construction.
   2. A nested module `require`s a **tagged** release of the root module. A `replace` directive is prohibited in any published nested module — `replace` is ignored for downstream consumers, so a `replace`-based submodule is unimportable. `replace` is permitted only in modules nobody imports (an internal test harness).
@@ -1208,8 +1221,8 @@ The protocol flow for each MCP tool call:
 
 ### Compatibility
 
-- **NFR-COMPAT-01:** Go 1.21 and later minor versions supported.
-- **NFR-COMPAT-02:** MCP client supports MCP protocol version 2025-03-26 and maintains backward compatibility with 2024-11-05 servers.
+- **NFR-COMPAT-01 (amended in 0.4.1):** Go 1.24 and later minor versions supported (REQ-GO-01).
+- **NFR-COMPAT-02 (amended in 0.4.1):** The MCP client and server speak protocol revision `2026-07-28` and only that revision, per the modern-only decision of 0.4.0 (REQ-MCP-CLIENT-02, REQ-MCP-SERVER-06). The original text — `2025-03-26` with `2024-11-05` compatibility — described the dual-era posture 0.4.0 explicitly rejected and was left standing by mistake. The cost is recorded in `docs/PROVIDERS.md`: a server that has not migrated is unreachable.
 - **NFR-COMPAT-03:** New model IDs must work without an SDK release. This is satisfied by **catalog sibling-cloning** (REQ-CAT-03), not by pure pass-through. Providers do not pass the model string through untouched: the resolved `Model` descriptor supplies the wire API, base URL, context window, pricing, reasoning support and compat profile that the request builder, the budget gate and the `max_tokens` clamp all depend on. An unknown id under a known vendor inherits a sibling row with a warning; an unknown vendor is a configuration error. The catalog is data, versioned separately from the SDK and overridable by the caller — nothing in the resolution path may reject a model ID solely because it is absent from it.
 - **NFR-COMPAT-04:** OpenAI-compatible endpoints — vLLM, llama.cpp, Ollama's `/v1`, Groq, Cerebras, DeepSeek, Together, OpenRouter, Cloudflare AI Gateway — are served by the `openai-completions` implementation with a per-model **compatibility profile** (REQ-PROV-12). A `base_url` override alone is insufficient and must not be presented as the integration path for these endpoints. Ollama's native `/api/chat` remains a separate `Api` because it is a different wire protocol, not a compat variant; it avoids Ollama's compatibility layer, which does not fully implement streaming tool calls or cache-token usage fields.
 - **NFR-COMPAT-05:** The Google provider supports both the API-key path and the Vertex AI endpoint (service account / ADC). Switching requires only a config change, not a provider swap, and the ADC case must resolve to the *ambient* credential state of REQ-AUTH-04 rather than to "no key".
@@ -1331,7 +1344,9 @@ The adopted design is an unbounded mutex + `sync.Cond` queue whose `Push` never 
 
 This resolution depends on REQ-OBS-06b: an unbounded queue is only useful if buffered events carry independent snapshots rather than pointers to one live, mutating message.
 
-### OQ-8: The `execute` boundary in non-interactive deployments
+### OQ-8: The `execute` boundary in non-interactive deployments — RESOLVED
+
+**Resolved in 0.4.1 as recommended: (b) plus (a).** A run whose resolved tool set contains a shell tool (`execute`, `run_command`, `powershell`, by name — a caller-supplied tool of that name is no less a shell) and whose config carries no `BeforeToolCall` fails with `ErrUnguardedExecute` before the first request is built. The explicit opt-out is an interceptor that never blocks (`AllowAllToolCalls`), so an unrestricted shell is something an embedder says in code, not something it gets by omission. `RestrictedPolicy` ships as the importable, replaceable starting point: a program allowlist plus shell-operator rejection with a declared grammar (POSIX sh quoting), and `powershell` refused outright unless the embedder supplies a PowerShell filter, per REQ-SEC-04's rule that a filter must refuse on a grammar it does not have. It is a floor, not a sandbox; the original reasoning below still holds and is why it is kept out of the SDK's enforcement path. Option (c) remains open as a separate decision.
 
 REQ-SEC-03 and REQ-SEC-04 replace the command allowlist and shell-operator regex with a per-call interceptor, on the grounds that a static allowlist is both trivially escaped and too narrow to run a build. That reasoning assumes an embedder that can answer a permission question — interactively, or from a policy with real context.
 

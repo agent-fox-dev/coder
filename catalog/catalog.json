@@ -73,12 +73,8 @@
           "cost": { "input": 2.5, "output": 10.0, "cache_read": 1.25, "cache_write": 0.0 },
           "input": ["text", "image"],
           "reasoning": false,
-          "compat": {
-            "max_tokens_field": "max_tokens",
-            "supports_temperature": true,
-            "supports_parallel_tool_calls": true
-          },
-          "note": "No thinking_level_map at all: absent means unsupported (REQ-PROV-15), and ClampThinkingLevel therefore reports 'omit the key' rather than sending a level this model would 400 on. Cache write is free on this vendor; cache read is half of input. Vendor default_model: the clone template for unknown openai ids."
+          "compat": { "use_max_tokens": true },
+          "note": "No thinking_level_map at all: absent means unsupported (REQ-PROV-15), and ClampThinkingLevel therefore reports 'omit the key' rather than sending a level this model would 400 on. compat keys are the openai-completions profile's OWN json names (provider/openai.Compat, REQ-PROV-12); that profile rejects any other key at request time, because a key it does not read is an override that silently never happens. Cache write is free on this vendor; cache read is half of input. Vendor default_model: the clone template for unknown openai ids."
         },
         "gpt-4o-mini": {
           "name": "GPT-4o mini",
@@ -87,11 +83,7 @@
           "cost": { "input": 0.15, "output": 0.6, "cache_read": 0.075, "cache_write": 0.0 },
           "input": ["text", "image"],
           "reasoning": false,
-          "compat": {
-            "max_tokens_field": "max_tokens",
-            "supports_temperature": true,
-            "supports_parallel_tool_calls": true
-          }
+          "compat": { "use_max_tokens": true }
         },
         "o3": {
           "name": "o3",
@@ -101,10 +93,9 @@
           "input": ["text", "image"],
           "reasoning": true,
           "compat": {
-            "max_tokens_field": "max_completion_tokens",
+            "use_max_tokens": false,
             "supports_temperature": false,
-            "supports_parallel_tool_calls": true,
-            "reasoning_effort_field": "reasoning_effort"
+            "supports_reasoning_effort": true
           },
           "thinking_level_map": {
             "off": null,
@@ -112,7 +103,7 @@
             "medium": "medium",
             "high": "high"
           },
-          "note": "'off' is present-and-null: this model cannot be asked not to reason, and recording that explicitly is what makes the REQ-CAT-06 diff able to distinguish a checked fact from an unfilled row. It changes nothing at runtime (ruling P-28). 'minimal', 'xhigh' and 'max' are absent, so requesting max clamps DOWN to high -- REQ-PROV-15's own worked example. max_tokens_field is max_completion_tokens and temperature is rejected: that is what compat exists for, and a sibling clone of this row would inherit both."
+          "note": "'off' is present-and-null: this model cannot be asked not to reason, and recording that explicitly is what makes the REQ-CAT-06 diff able to distinguish a checked fact from an unfilled row. It changes nothing at runtime (ruling P-28). 'minimal', 'xhigh' and 'max' are absent, so requesting max clamps DOWN to high -- REQ-PROV-15's own worked example. use_max_tokens is false (max_completion_tokens) and supports_temperature is false (the o-series rejects temperature and top_p): that is what compat exists for, and a sibling clone of this row would inherit both."
         }
       }
     }

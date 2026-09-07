@@ -12,6 +12,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/google"
 	"github.com/agentfox/agentkit-go/provider/ollama"
 	"github.com/agentfox/agentkit-go/provider/openai"
+	"github.com/agentfox/agentkit-go/provider/openairesponses"
 )
 
 // Target is one wire API under test.
@@ -20,14 +21,18 @@ type Target struct {
 	Provider core.APIProvider
 }
 
-// Targets returns every first-party wire API. faux is deliberately absent: it
-// has no wire format, and including it would inflate the scenario count with a
-// comparison that cannot fail.
+// Targets returns every first-party wire API — all FIVE of REQ-PROV-02's
+// table, openai-responses included, because NFR-TEST-06.1 says a provider
+// with no scenarios is untested regardless of its unit-test coverage, and a
+// provider absent from this list is untested regardless of its scenarios.
+// faux is deliberately absent: it has no wire format, and including it would
+// inflate the scenario count with a comparison that cannot fail.
 func Targets() []Target {
 	noEnv := func(string) string { return "" }
 	return []Target{
 		{API: string(anthropic.API), Provider: anthropic.Provider(anthropic.Options{Getenv: noEnv})},
 		{API: string(openai.API), Provider: openai.Provider(openai.Options{Getenv: noEnv})},
+		{API: string(openairesponses.API), Provider: openairesponses.Provider(openairesponses.Options{Getenv: noEnv})},
 		{API: string(google.API), Provider: google.Provider(google.Options{Getenv: noEnv})},
 		{API: string(ollama.API), Provider: ollama.Provider(ollama.Options{Getenv: noEnv})},
 	}

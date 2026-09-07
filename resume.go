@@ -25,12 +25,21 @@ func OpenSession(path string, opts session.Options) (*session.Store, *session.Re
 		// A session that does not exist yet is the ordinary first-run case,
 		// not an error the caller should have to distinguish.
 		cwd, _ := os.Getwd()
-		store, err = session.Create(path, core.SessionHeader{
-			Version:   core.SessionLogVersion,
-			ID:        newID("sess"),
-			Timestamp: time.Now(),
-			CWD:       cwd,
-		}, opts)
+		// The id and timestamp are left for session.Create to fill from
+		// opts.NewID and opts.Now when the caller supplied them, exactly as
+		// session.Create does on its own: those hooks exist so a golden can
+		// pin a whole file byte-for-byte (NFR-TEST-08), and a front door that
+		// overrode them made the header unpinnable through the one path an
+		// embedder is told to use. The "sess_" prefix and wall-clock default
+		// are kept for the caller that supplied neither.
+		h := core.SessionHeader{Version: core.SessionLogVersion, CWD: cwd}
+		if opts.NewID == nil {
+			h.ID = newID("sess")
+		}
+		if opts.Now == nil {
+			h.Timestamp = time.Now()
+		}
+		store, err = session.Create(path, h, opts)
 		if err != nil {
 			return nil, nil, err
 		}
