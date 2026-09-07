@@ -62,3 +62,46 @@ func TestAnUntrustedProjectSkillNeverReachesTheAssembledPrompt(t *testing.T) {
 		t.Fatalf("with trust established the project skill must be offered:\n%s", got)
 	}
 }
+
+// TestLoadSkillsAuditsEverySkillItReturns is REQ-SKILL-11 through the root
+// package: the selection and the audit event come from ONE call, so there is
+// no arrangement in which skills reach the model and the trail does not say
+// which (REQ-OBS-04).
+func TestLoadSkillsAuditsEverySkillItReturns(t *testing.T) {
+	work := t.TempDir()
+	for _, name := range []string{"alpha", "beta"} {
+		dir := filepath.Join(work, skills.GlobalDirName, skills.SkillsDirName, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, skills.ManifestName),
+			[]byte(`description = "the `+name+` skill"`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, skills.PromptName), []byte("# "+name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	log := &auditLog{}
+	s := &scripted{}
+	a := newTestAgent(t, s, func(c *core.AgentConfig) {
+		c.TrustProject = true
+		c.Hooks.OnAudit = log.add
+	})
+	cfg := SkillsConfigFor(a.cfg, work, "")
+	sel := a.LoadSkills(skills.Discover(cfg), "", "", cfg)
+	if len(sel) != 2 {
+		t.Fatalf("selected %d skills, want 2", len(sel))
+	}
+
+	events := log.of(core.AuditSkillsLoaded)
+	if len(events) != 1 {
+		t.Fatalf("%d skills-loaded audit events, want exactly 1", len(events))
+	}
+	got := strings.Join(events[0].Skills, ",")
+	if got != "alpha,beta" {
+		t.Fatalf("audited %q, want every selected skill in selection order", got)
+	}
+}

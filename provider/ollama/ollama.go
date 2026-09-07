@@ -41,6 +41,7 @@ import (
 	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
+	"github.com/agentfox/agentkit-go/schema"
 )
 
 // API is the wire API id.
@@ -213,12 +214,51 @@ const Path = "/api/chat"
 // provider contract, not the loop's, because the loop is not running when a
 // transcript is loaded from disk.
 func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairReport, error) {
+	out, rep, _, err := BuildRequestCached(m, req, nil)
+	return out, rep, err
+}
+
+// BuildRequestCached is BuildRequest with REQ-CACHE-06's per-session schema
+// cache attached. A nil prefix marshals every schema, which is what
+// BuildRequest does and what a one-shot caller wants.
+//
+// NFR-PERF-03: "tool schema serialization must be computed once per session
+// and cached, not recomputed on every model call." This wire sends the plain
+// JSON Schema, so the marshaller is the canonical one — but it is passed
+// explicitly rather than defaulted, because the entry the cache stores is the
+// bytes THIS wire sends and nothing else may assume they are shared.
+func BuildRequestCached(m *core.Model, req core.Request, prefix *provider.ToolPrefix) (
+	*request, provider.RepairReport, provider.SyncReport, error) {
+	var sync provider.SyncReport
 	compat := CompatFor(m)
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeToolCallID))
 
+	// REQ-CACHE-10, third arm. /api/chat has neither Anthropic's
+	// defer_loading nor Responses' additional_tools, so a tool added
+	// mid-session is WITHHELD from the top-level tools array and re-declared
+	// in a system message placed after the tool-result run that introduced it.
+	// Prepending it to the array instead would rewrite the cached prefix.
+	split := provider.SplitDeferredTools(req.Tools, req.Messages)
+	// ONE Sync over the whole tool list, before the split. Syncing the two
+	// halves separately would make each call see the other half as removed —
+	// reporting a prefix invalidation on every turn and evicting the very
+	// entries the cache exists to keep.
+	schemas, srep, err := prefix.SyncWith(req.Tools, func(s *schema.Schema) (json.RawMessage, error) {
+		return json.Marshal(s)
+	})
+	if err != nil {
+		return nil, rep, sync, err
+	}
+	sync = srep
+	byName := make(map[string]json.RawMessage, len(req.Tools))
+	for i, tw := range req.Tools {
+		byName[tw.Name] = schemas[i]
+	}
+
 	out := &request{
-		Model:     m.ID,
-		Messages:  encodeMessages(repaired, req.System, compat),
+		Model: m.ID,
+		Messages: encodeMessages(repaired, req.System, compat,
+			deferredNote(split, byName), deferredAnchor(repaired, split)),
 		Stream:    true,
 		KeepAlive: compat.KeepAlive,
 	}
@@ -251,13 +291,11 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 		}
 	}
 
-	for _, tw := range req.Tools {
-		raw, err := json.Marshal(tw.InputSchema)
-		if err != nil {
-			return nil, rep, err
-		}
+	// Only the IMMEDIATE half is declared here (REQ-CACHE-10); the deferred
+	// half rode into the transcript above.
+	for _, tw := range split.Immediate {
 		out.Tools = append(out.Tools, tool{Type: "function", Function: toolFunction{
-			Name: tw.Name, Description: tw.Description, Parameters: raw,
+			Name: tw.Name, Description: tw.Description, Parameters: byName[tw.Name],
 		}})
 	}
 
@@ -271,7 +309,67 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 		out.Tools = nil
 	}
 
-	return out, rep, nil
+	return out, rep, sync, nil
+}
+
+// deferredNote renders REQ-CACHE-10's re-declaration: the same
+// {name, description, parameters} objects the tools array carries, in the same
+// bytes, because a tool described in prose the model has never seen in a
+// declaration is a tool it will not call correctly.
+func deferredNote(split provider.DeferredSplit, byName map[string]json.RawMessage) string {
+	if len(split.Deferred) == 0 {
+		return ""
+	}
+	decls := make([]toolFunction, 0, len(split.Deferred))
+	for _, tw := range split.Deferred {
+		decls = append(decls, toolFunction{
+			Name: tw.Name, Description: tw.Description, Parameters: byName[tw.Name],
+		})
+	}
+	raw, err := json.Marshal(decls)
+	if err != nil {
+		return ""
+	}
+	return "Additional tools became available at this point in the conversation " +
+		"and may be used from here on:\n" + string(raw)
+}
+
+// deferredAnchor is the message index the re-declaration follows: the last
+// message of the tool-result run that INTRODUCED the deferred tools.
+//
+// The position is the requirement — "declared at the transcript position where
+// they appeared, not prepended to the cached prompt prefix" — because
+// everything before it must stay byte-identical to the previous turn's
+// request. It returns -1 when no marker survives the repair pass, and the
+// system message is then appended at the end, which is still after every tool
+// result.
+func deferredAnchor(ms core.Messages, split provider.DeferredSplit) int {
+	anchor := -1
+	for i, m := range ms {
+		tr, ok := m.(core.ToolResultMessage)
+		if !ok {
+			continue
+		}
+		for _, name := range tr.AddedToolNames {
+			if split.IsDeferred(name) {
+				anchor = i
+				break
+			}
+		}
+	}
+	if anchor < 0 {
+		return -1
+	}
+	// Extend to the end of the run. Results are paired to calls BY POSITION on
+	// this wire, so a message inserted BETWEEN two results of one batch would
+	// re-pair every result after it with the wrong call.
+	for anchor+1 < len(ms) {
+		if _, ok := ms[anchor+1].(core.ToolResultMessage); !ok {
+			break
+		}
+		anchor++
+	}
+	return anchor
 }
 
 // encodeMessages is REQ-LOOP-02's Ollama half: it follows the OpenAI-compatible
@@ -297,7 +395,8 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 // other provider uses them. Setting Compat.SupportsToolName emits the newer
 // tool_name field, which lets a modern server disambiguate by NAME — still not
 // by identity, so two parallel calls to the SAME tool remain positional.
-func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat) []message {
+func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat,
+	note string, afterIdx int) []message {
 	var out []message
 
 	if len(system) > 0 {
@@ -312,7 +411,7 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat)
 		}
 	}
 
-	for _, m := range ms {
+	for i, m := range ms {
 		switch v := m.(type) {
 		case core.UserMessage:
 			text, images := splitContent(v.Content)
@@ -350,6 +449,22 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat)
 			}
 			out = append(out, tm)
 		}
+		// REQ-CACHE-10's re-declaration, as a SYSTEM message placed after the
+		// tool-result run that introduced the tools. It sits here rather than
+		// with the system prompt at the head precisely because the head is the
+		// cached prefix: a declaration prepended there rewrites every byte
+		// after it.
+		if note != "" && i == afterIdx {
+			out = append(out, message{Role: "system", Content: note})
+			note = ""
+		}
+	}
+	if note != "" {
+		// No surviving marker (the repair pass can drop the message that
+		// carried it). The end of the transcript is still after every tool
+		// result, and dropping the declaration would leave the model with a
+		// tool it can neither see nor call.
+		out = append(out, message{Role: "system", Content: note})
 	}
 	return out
 }

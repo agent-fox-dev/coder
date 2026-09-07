@@ -219,14 +219,14 @@ func TestLoadForSessionAppliesTheArchetypeFilter(t *testing.T) {
 	writeSkill(t, userSkills(home), "coderonly", "description = \"coder\"\narchetypes = [\"coder\"]\n")
 
 	reg := Discover(Config{HomeDir: home})
-	if got := names(reg.LoadForSession("coder", "")); got != "coderonly@user,universal@user" {
+	if got := names(reg.LoadForSession("coder", "", reg.Config())); got != "coderonly@user,universal@user" {
 		t.Fatalf("coder session = %q", got)
 	}
-	if got := names(reg.LoadForSession("planner", "")); got != "universal@user" {
+	if got := names(reg.LoadForSession("planner", "", reg.Config())); got != "universal@user" {
 		t.Fatalf("planner session = %q", got)
 	}
 	// A skill that scoped itself has said it is not for the general case.
-	if got := names(reg.LoadForSession("", "")); got != "universal@user" {
+	if got := names(reg.LoadForSession("", "", reg.Config())); got != "universal@user" {
 		t.Fatalf("unscoped session = %q", got)
 	}
 }
@@ -237,7 +237,7 @@ func TestTheTaskPromptDoesNotFilterSkills(t *testing.T) {
 	home := t.TempDir()
 	writeSkill(t, userSkills(home), "review", `description = "reviews diffs"`)
 	reg := Discover(Config{HomeDir: home})
-	if got := names(reg.LoadForSession("", "please write me a haiku about ducks")); got != "review@user" {
+	if got := names(reg.LoadForSession("", "please write me a haiku about ducks", reg.Config())); got != "review@user" {
 		t.Fatalf("skills = %q, want the skill offered regardless of the task text", got)
 	}
 }
@@ -281,5 +281,45 @@ func TestThePromptPathIsAbsolute(t *testing.T) {
 	}
 	if filepath.Dir(s.PromptPath) != s.Dir {
 		t.Fatalf("the prompt file must sit in the skill directory: %q vs %q", s.PromptPath, s.Dir)
+	}
+}
+
+// REQ-SKILL-05: the trust gate travels with the CALL. A registry discovered
+// with project trust must not serve project skills to a session whose config
+// does not have it — a long-lived process that discovers once and runs many
+// sessions is exactly where a gate fixed at discovery time leaks.
+func TestLoadForSessionAppliesTheTrustGateFromTheConfigItIsGiven(t *testing.T) {
+	home, work := t.TempDir(), t.TempDir()
+	writeSkill(t, userSkills(home), "mine", `description = "the user's own skill"`)
+	writeSkill(t, projectSkills(work), "repo", `description = "a repository skill"`)
+
+	cfg := Config{HomeDir: home, WorkDir: work, TrustProject: true}
+	reg := Discover(cfg)
+	if got := names(reg.LoadForSession("", "", cfg)); got != "mine@user,repo@project" {
+		t.Fatalf("trusted call = %q", got)
+	}
+
+	untrusted := cfg
+	untrusted.TrustProject = false
+	if got := names(reg.LoadForSession("", "", untrusted)); got != "mine@user" {
+		t.Fatalf("untrusted call = %q, want the project skill gated out", got)
+	}
+}
+
+// The fail-closed half, stated as a test so nobody "fixes" it: a config that
+// names no roots has authorized no roots.
+func TestLoadForSessionWithAZeroConfigSelectsNothing(t *testing.T) {
+	home := t.TempDir()
+	writeSkill(t, userSkills(home), "mine", `description = "d"`)
+	reg := Discover(Config{HomeDir: home})
+	if got := names(reg.LoadForSession("", "", Config{})); got != "" {
+		t.Fatalf("zero config selected %q", got)
+	}
+	// A different home is a different root, not a permission to serve this one.
+	if got := names(reg.LoadForSession("", "", Config{HomeDir: t.TempDir()})); got != "" {
+		t.Fatalf("a foreign root selected %q", got)
+	}
+	if got := names(reg.LoadForSession("", "", reg.Config())); got != "mine@user" {
+		t.Fatalf("the registry's own config selected %q", got)
 	}
 }

@@ -689,12 +689,64 @@ func TestAConfiguredPrefixOverridesTheDefault(t *testing.T) {
 	}
 }
 
-// TestAShadowedNativeToolIsRefusedAtConnectionTime is REQ-MCP-CLIENT-06.
+// TestAShadowedNativeToolIsRefusedAtConnect is REQ-MCP-CLIENT-06 where the
+// requirement puts it: at CONNECTION time.
 //
-// At CONNECTION time, not call time: a shadowed native tool is a
-// misconfiguration, and discovering it when the model happens to call the tool
-// means discovering it in production — with the wrong tool having run.
-func TestAShadowedNativeToolIsRefusedAtConnectionTime(t *testing.T) {
+// The pool is told what the host's own tools are called, so the collision is a
+// refused connection at startup. The check that used to live only in Tools was
+// unreachable for a host that never called Tools — it would connect the server
+// happily and find out when the model called `echo` and the server answered,
+// which is discovering it in production with the wrong tool having run.
+func TestAShadowedNativeToolIsRefusedAtConnect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, method, params := readRPC(t, r)
+		writeJSONRPC(t, w, id, answerRPC(t, method, params)) // exposes `echo`
+	}))
+	t.Cleanup(srv.Close)
+
+	p := mcp.NewPool(mcp.ConnectionOptions{})
+	p.NativeTools = []string{"echo"} // the host's own tool of the same name
+	t.Cleanup(func() { _ = p.Close() })
+
+	conn, err := p.Connect(context.Background(), mcp.ServerConfig{
+		Name: "remote", URL: srv.URL, DisablePrefix: true}, nil, nil)
+	if !errors.Is(err, mcp.ErrNameCollision) {
+		t.Fatalf("err = %v, want ErrNameCollision at Connect", err)
+	}
+	if conn != nil {
+		t.Fatal("a refused connection must not be returned")
+	}
+	if len(p.Names()) != 0 {
+		t.Fatalf("names = %v; the connection must be torn down, not pooled", p.Names())
+	}
+}
+
+// TestAPrefixedToolDoesNotCollideAtConnect is the other arm: the default
+// `server__tool` qualification is what keeps an MCP `echo` and a native `echo`
+// apart, and a connect-time check that compared UNQUALIFIED names would refuse
+// every ordinary configuration.
+func TestAPrefixedToolDoesNotCollideAtConnect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, method, params := readRPC(t, r)
+		writeJSONRPC(t, w, id, answerRPC(t, method, params))
+	}))
+	t.Cleanup(srv.Close)
+
+	p := mcp.NewPool(mcp.ConnectionOptions{})
+	p.NativeTools = []string{"echo"}
+	t.Cleanup(func() { _ = p.Close() })
+
+	if _, err := p.Connect(context.Background(), mcp.ServerConfig{
+		Name: "remote", URL: srv.URL}, nil, nil); err != nil {
+		t.Fatalf("connect: %v; `remote__echo` shadows nothing", err)
+	}
+}
+
+// TestANativeToolRegisteredAfterConnectIsCaughtByTheBackstop keeps the check in
+// Tools honest. Connect can only see the names the pool had been told about by
+// then; a host that registers a native tool later, or a server that grows one
+// during the session, is caught here and nowhere else.
+func TestANativeToolRegisteredAfterConnectIsCaughtByTheBackstop(t *testing.T) {
 	p := poolWith(t, mcp.ServerConfig{Name: "srv", DisablePrefix: true})
 	native := []core.Tool{{Name: "echo", Description: "the native one"}}
 

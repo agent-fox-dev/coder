@@ -80,6 +80,11 @@ type AssistantMessage struct {
 	ResponseID    string
 	ThinkingLevel ThinkingLevel
 
+	// Deferred is the REQ-PROV-19 receipt, present INSTEAD OF CONTENT when
+	// StopReason is deferred. It is persisted with the message so a
+	// submission survives the process that made it.
+	Deferred *DeferredHandle
+
 	Unknown jsonx.OrderedObject
 }
 
@@ -113,6 +118,11 @@ func (m UserMessage) Clone() Message {
 func (m AssistantMessage) Clone() Message {
 	m.Content = m.Content.Clone()
 	m.Unknown = m.Unknown.Clone()
+	if m.Deferred != nil {
+		h := *m.Deferred
+		h.Data = append(json.RawMessage(nil), h.Data...)
+		m.Deferred = &h
+	}
 	return m
 }
 

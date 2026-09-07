@@ -15,6 +15,22 @@ type RunResult struct {
 	Error      error
 }
 
+// DeferredHandle returns the REQ-PROV-19 receipt a deferred run ended
+// holding, and false for every other run. It is the one thing a caller must
+// keep from a RunStopDeferred result: the answer does not exist yet, and this
+// is the only way back to it.
+func (r RunResult) DeferredHandle() (DeferredHandle, bool) {
+	for i := len(r.Messages) - 1; i >= 0; i-- {
+		if a, ok := r.Messages[i].(AssistantMessage); ok {
+			if a.Deferred != nil && !a.Deferred.IsZero() {
+				return *a.Deferred, true
+			}
+			return DeferredHandle{}, false
+		}
+	}
+	return DeferredHandle{}, false
+}
+
 func (r RunResult) FinalText() string {
 	for i := len(r.Messages) - 1; i >= 0; i-- {
 		if a, ok := r.Messages[i].(AssistantMessage); ok {

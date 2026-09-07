@@ -71,6 +71,18 @@ func defaultToolSet(t *testing.T) []core.Tool {
 }
 
 // TestGoldenDefaultSystemPrompt pins the whole assembled default prompt.
+//
+// PROVENANCE (NFR-TEST-08.1)
+//
+//	golden:    testdata/golden/system_prompt_default.txt
+//	reference: AgentKit itself — BuildSystemPrompt over the real default tool
+//	           set, resolved through tools.All and ResolveToolPolicy. There is
+//	           no external reference for this artifact and there cannot be:
+//	           the prompt IS ours, and NFR-TEST-08.2's "regenerate from the
+//	           reference" reduces here to "regenerate from the resolver, never
+//	           from a hand-edited expectation".
+//	version:   the working tree
+//	command:   go test -run TestGoldenDefaultSystemPrompt -update .
 func TestGoldenDefaultSystemPrompt(t *testing.T) {
 	got := BuildSystemPrompt(PromptInput{Tools: defaultToolSet(t)})
 	checkGolden(t, "system_prompt_default.txt", got)
@@ -78,6 +90,14 @@ func TestGoldenDefaultSystemPrompt(t *testing.T) {
 
 // TestGoldenCustomSystemPrompt is the second golden NFR-TEST-08(a) asks for:
 // assembly order, and the assertion that built-in blocks are ABSENT.
+//
+// PROVENANCE (NFR-TEST-08.1)
+//
+//	golden:    testdata/golden/system_prompt_custom.txt
+//	reference: AgentKit itself, as above — the custom-prompt branch of
+//	           BuildSystemPrompt over the real default tool set.
+//	version:   the working tree
+//	command:   go test -run TestGoldenCustomSystemPrompt -update .
 func TestGoldenCustomSystemPrompt(t *testing.T) {
 	got := BuildSystemPrompt(PromptInput{
 		Custom: "You are a release engineer. Answer only about this repository.",
@@ -107,6 +127,14 @@ func TestGoldenCustomSystemPrompt(t *testing.T) {
 // TestGoldenPromptWithoutFileNavigationTools pins REQ-TOOL-04e: the guideline
 // appears when list_files, find_files and search_files are ABSENT and execute
 // is present. Its condition is an absence, which no per-tool field can express.
+//
+// PROVENANCE (NFR-TEST-08.1)
+//
+//	golden:    testdata/golden/system_prompt_no_navigation.txt
+//	reference: AgentKit itself — the real default set with the navigation
+//	           trio removed, through the real resolver.
+//	version:   the working tree
+//	command:   go test -run TestGoldenPromptWithoutFileNavigationTools -update .
 func TestGoldenPromptWithoutFileNavigationTools(t *testing.T) {
 	all := defaultToolSet(t)
 	var kept []core.Tool
@@ -132,6 +160,23 @@ func TestGoldenPromptWithoutFileNavigationTools(t *testing.T) {
 //
 // The same input for all of them, so a diff shows what a provider does
 // DIFFERENTLY rather than what its fixture happened to contain.
+//
+// PROVENANCE (NFR-TEST-08.1) — and the honest limit of these five files
+//
+//	goldens:   testdata/golden/request_{anthropic,openai,openai_responses,google,ollama}.json
+//	reference: AgentKit itself, captured through RequestOptions.OnPayload with
+//	           no network and no API key. THIS IS NOT A VENDOR CAPTURE. These
+//	           pin the request body against REGRESSION — they catch AgentKit
+//	           changing what it sends — and say nothing about whether what it
+//	           sends is what the vendor currently accepts.
+//	version:   the working tree; the pinned API versions are in docs/PROVIDERS.md
+//	command:   go test -run TestGoldenProviderRequestBodies -update .
+//
+// Pinning these against TRUTH is NFR-TEST-06's differential harness
+// (difftest/), which reports DARK until a vendor SDK or a live capture
+// supplies an independent reference. NFR-TEST-08.2 forbids treating this
+// file's output as that reference, which is why the ledger's capture-date
+// column is empty rather than filled in with today.
 func TestGoldenProviderRequestBodies(t *testing.T) {
 	for _, tc := range goldenRequestCases(t) {
 		t.Run(tc.name, func(t *testing.T) {
@@ -146,6 +191,17 @@ func TestGoldenProviderRequestBodies(t *testing.T) {
 //
 // Ids and timestamps are injected, which is what makes a whole-file golden
 // possible at all — session.Options documents both hooks as existing for this.
+//
+// PROVENANCE (NFR-TEST-08.1)
+//
+//	golden:    testdata/golden/session_log.jsonl
+//	reference: AgentKit itself — the real store writing through the real
+//	           codec. The format is ours to define, so there is no external
+//	           reference; what the golden buys is that a codec change shows
+//	           up as a diff in the durable format rather than as a resume
+//	           failure in someone's session six months from now.
+//	version:   the working tree
+//	command:   go test -run TestGoldenSessionLog -update .
 func TestGoldenSessionLog(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.jsonl")
@@ -228,6 +284,14 @@ func padID(n int) string {
 // The constants are already asserted in their own packages; what this pins is
 // the composed result — prefix, body and suffix as the model reads them. A
 // change to either constant, or to how they are joined, shows up here.
+//
+// PROVENANCE (NFR-TEST-08.1)
+//
+//	golden:    testdata/golden/model_visible_wrappers.txt
+//	reference: AgentKit itself — REQ-SESS-07 makes these strings OUR format
+//	           contract with the model, so we are the reference by definition.
+//	version:   the working tree
+//	command:   go test -run TestGoldenModelVisibleWrappers -update .
 func TestGoldenModelVisibleWrappers(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("### branch_summary\n")

@@ -29,12 +29,12 @@ kill-and-resume across two "processes" and three concurrent delegations.
 
 ## Status
 
-This implements [`agent-kit-prd.md`](agent-kit-prd.md) v0.4.1. It is a
+This implements [`agent-kit-prd.md`](agent-kit-prd.md) v0.4.2. It is a
 working library with a thorough test suite; it is not a finished product.
 [What is not built](#what-is-not-built) is stated below rather than left to
 be discovered, and the requirement-by-requirement audit that produced 0.4.1
-is in [`docs/GAPS.md`](docs/GAPS.md), with what was fixed and what was
-deliberately deferred.
+and 0.4.2 is in [`docs/GAPS.md`](docs/GAPS.md), with what was fixed and what
+was deliberately left.
 
 **Go 1.24 or later.** The loop's event stream is a range-over-func iterator
 and the wire structs use `omitzero`; the PRD's original "1.21+" was corrected
@@ -663,7 +663,9 @@ requirement ledger, fixed and deferred alike, is [`docs/GAPS.md`](docs/GAPS.md).
   vendor SDK or a live key. So `go run ./cmd/difftest` reports **DARK** and
   exits 1, which is NFR-TEST-07.3's required answer rather than a bug. The
   unit suite pins the wire format against *regression*; only a reference pins
-  it against *truth*, and the weaker claim is the honest one until then.
+  it against *truth*, and the weaker claim is the honest one until then. The
+  same limit applies to `testdata/golden/request_*.json`, and each golden's
+  provenance docblock says so in place.
 - **The legacy MCP era.** AgentKit speaks `2026-07-28` and nothing else, so it
   cannot talk to a server that has not migrated — which today is most of them.
   This is a decision, not an oversight (PRD 0.4.0), and reversing it means
@@ -672,41 +674,30 @@ requirement ledger, fixed and deferred alike, is [`docs/GAPS.md`](docs/GAPS.md).
   resource subscriptions and the Tasks extension are defined by the revision
   and not implemented here; `subscriptions/listen` ships on both transports,
   but only the list-changed filters have producers.
-- **Four compat flags.** `ThinkingFormat` (DeepSeek's `reasoning_content`
-  echo), `ThinkingTokenBudgetField`, `AllowsUserAfterToolResult` and
-  `CacheControlFormat` (prompt caching over Chat Completions for OpenRouter's
-  `anthropic/*` models) are declared in the PRD's table and not wired. The
-  requirement's own rule is that a flag is added only with a named vendor and
-  a reproducing case, and none has been captured yet.
-- **The schema cache and deferred tool loading on four of five wires.** Both
-  are attached to Anthropic only; the other adapters re-marshal every schema
-  each turn, and neither Responses `additional_tools` nor the "withhold and
-  re-declare" arm of REQ-CACHE-10 exists. The Anthropic implementation is the
-  template.
-- **The Vertex AI path.** The Google adapter takes an API key against
-  `v1beta`; a Vertex base URL needs a different path shape, so NFR-COMPAT-05's
-  "only a config change" does not yet hold. Ambient credentials (ADC) do
-  resolve to the *ambient* state rather than "no key".
-- **Gemini `CachedContent`, deferred requests, the re-arming drain timer.**
-  Each is optional or demoted in the PRD (NFR-PERF-08, OQ-11, REQ-TOOL-17.5)
-  and each is listed in the ledger with what it would take.
 - **Plugin implementations.** The four categories, the registry, discovery,
   `[plugins]` config, ordered loading, `disabled`, the lint and
   `validate-plugins` ship; no first-party plugin does. That is the intended
   shape — a plugin is the embedder's code — but it means the categories have
   no in-tree user yet.
-- **A vendor capture behind the request goldens.**
-  [`docs/PROVIDERS.md`](docs/PROVIDERS.md) ships and is checked against the
-  code by a test, so a pin bump that forgets the ledger fails. Its capture-date
-  column is empty, and that is the honest state: `testdata/golden/request_*.json`
-  were produced by AgentKit, so they pin the wire format against *regression*
-  and say nothing about whether it still matches the vendor. Only a capture, or
-  the `difftest` harness above, pins it against *truth*.
+- **A poller for deferred requests.** The handle, the stop reason, the
+  capability probe and `Agent.RedeemDeferred` ship; nothing sleeps, retries or
+  watches a handle. That is OQ-11 option (b) on purpose: when to come back is
+  the embedder's decision, and a library that guessed would spend someone
+  else's latency budget on a schedule it invented.
 - **WebP normalization.** REQ-TOOL-14 downscales JPEG, PNG and GIF; the
   standard library has no WebP decoder and REQ-GO-11 forbids the module that
   does, so a WebP image is forwarded as-is with its dimensions unknown — which
   is what REQ-TOOL-14.5 asks for on any failure, and a format providers accept
   anyway.
+
+Three wire-level limits are consequences rather than omissions, and are
+recorded as rulings in [`docs/PROVIDERS.md`](docs/PROVIDERS.md) so they are not
+rediscovered as bugs: on `openai-completions` a deferred tool is re-declared in
+**prose** because that wire has neither `defer_loading` nor `additional_tools`,
+and a model may call a tool absent from `tools`; on Gemini a deferred tool is
+not callable at all, because that wire gates calling on `functionDeclarations`;
+and on Ollama `is_error` has nowhere to go and rides as an `Error: ` text
+prefix.
 
 Two operational notes that are easy to miss. `execute` output over the cap is
 spilled to a per-workspace directory under the OS temp dir by default

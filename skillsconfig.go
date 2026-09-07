@@ -23,6 +23,26 @@ import (
 // unresolvable — containers, CI, cron — it is skipped entirely, never
 // resolved relatively. The built-in tier is opt-in through builtinDir; empty
 // skips it.
+// LoadSkills selects the skills for this run, records every one of them in
+// the session audit event (REQ-SKILL-11 / REQ-OBS-04), and returns the
+// selection ready for SkillBlocks.
+//
+// It is one call rather than three because the audit is the step an embedder
+// forgets: with `LoadForSession` + `AuditSkills` + `SkillBlocks` written out
+// separately, dropping the middle one is a refactor away and nothing fails —
+// the skills still reach the model and the audit trail silently stops saying
+// which. Here the selection cannot be obtained without the event being
+// emitted.
+//
+// Discovery stays the embedder's affirmative act (REQ-SKILL-04, REQ-SEC-10):
+// this takes a registry the caller discovered, it does not go looking.
+func (a *Agent) LoadSkills(reg *skills.Registry, archetype, taskPrompt string, cfg skills.Config) []skills.Skill {
+	if reg == nil {
+		return nil
+	}
+	return skills.Record(a, reg.LoadForSession(archetype, taskPrompt, cfg))
+}
+
 func SkillsConfigFor(cfg core.AgentConfig, workDir, builtinDir string) skills.Config {
 	home := ""
 	if h, err := os.UserHomeDir(); err == nil && filepath.IsAbs(h) {

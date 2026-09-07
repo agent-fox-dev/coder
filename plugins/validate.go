@@ -230,6 +230,13 @@ type BadImport struct {
 // not compile against this SDK version is still linted rather than skipped,
 // which is the case where the lint matters most.
 func LintImports(dir string) ([]BadImport, error) {
+	return lintImports(dir, forbiddenImport)
+}
+
+// lintImports is the shared pass. The predicate is a parameter so that
+// REQ-SKILL-09's larger prohibited set (lint.go) reuses this exact walk rather
+// than shipping a second linter that would drift from it.
+func lintImports(dir string, forbidden func(string) bool) ([]BadImport, error) {
 	info, err := os.Stat(dir)
 	if err != nil {
 		return nil, err
@@ -265,7 +272,7 @@ func LintImports(dir string) ([]BadImport, error) {
 			if uerr != nil {
 				continue
 			}
-			if forbiddenImport(p) {
+			if forbidden(p) {
 				out = append(out, BadImport{File: path, Import: p})
 			}
 		}

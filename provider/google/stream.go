@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agentfox/agentkit-go/core"
@@ -19,6 +20,99 @@ import (
 // REQ-AUTH-04 (NFR-COMPAT-05); set it through the catalog row or
 // GOOGLE_GEMINI_BASE_URL.
 const DefaultBaseURL = "https://generativelanguage.googleapis.com"
+
+const (
+	// vertexHostSuffix identifies a Vertex AI endpoint. Every Vertex host is
+	// either this or "<location>-" + this.
+	vertexHostSuffix = "aiplatform.googleapis.com"
+	// VertexGlobalLocation is the location used when none is configured. The
+	// global endpoint is the one that needs no regional host prefix, so it is
+	// the only safe default for a deployment that named a project and nothing
+	// else.
+	VertexGlobalLocation = "global"
+)
+
+// ResolveVertex decides NFR-COMPAT-05's deployment from configuration alone.
+//
+// The switch is a CONFIG change, and it can be spelled two ways, because the
+// two halves of a Vertex deployment arrive from different places in practice:
+//
+//   - project (Options.VertexProject, else GOOGLE_CLOUD_PROJECT /
+//     CLOUDSDK_CORE_PROJECT) selects the Vertex path shape and, with no base
+//     URL configured, the Vertex host;
+//   - a Vertex base URL (catalog row or GOOGLE_GEMINI_BASE_URL) selects it
+//     too, with the project supplied by the environment.
+//
+// The environment variables alone do NOT flip a deployment to Vertex: they are
+// set on every GCE/Cloud Run instance and are also what VendorAuth.Ambient
+// reads, so treating them as the switch would break every AI Studio API-key
+// deployment that happens to run on Google Cloud. Something has to name Vertex
+// explicitly — a project on the provider Options, or a Vertex host.
+//
+// A Vertex host with no resolvable project is an error rather than a silent
+// fallback: the AI Studio path shape on a Vertex host is a 404 several layers
+// down, and the message that produces says nothing about the missing project.
+func ResolveVertex(base, project, location string, env provider.Env) (Vertex, error) {
+	onHost := isVertexHost(base)
+	if project == "" && !onHost {
+		return Vertex{}, nil
+	}
+	if project == "" {
+		project = firstEnv(env, "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT")
+	}
+	if project == "" {
+		return Vertex{}, errors.New("google: the Vertex AI endpoint needs a project: " +
+			"set Options.VertexProject or GOOGLE_CLOUD_PROJECT")
+	}
+	if location == "" {
+		location = firstEnv(env, "GOOGLE_CLOUD_LOCATION", "CLOUDSDK_COMPUTE_REGION")
+	}
+	if location == "" {
+		location = locationFromHost(base)
+	}
+	if location == "" {
+		location = VertexGlobalLocation
+	}
+	return Vertex{Project: project, Location: location}, nil
+}
+
+func firstEnv(env provider.Env, names ...string) string {
+	for _, n := range names {
+		if v := env.Get(n); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// hostOf is deliberately string surgery rather than net/url parsing: the base
+// URL may be a bare host, and a parse failure must not decide a deployment.
+func hostOf(base string) string {
+	h := base
+	if i := strings.Index(h, "://"); i >= 0 {
+		h = h[i+3:]
+	}
+	if i := strings.IndexAny(h, "/:"); i >= 0 {
+		h = h[:i]
+	}
+	return strings.ToLower(h)
+}
+
+func isVertexHost(base string) bool {
+	h := hostOf(base)
+	return h == vertexHostSuffix || strings.HasSuffix(h, "-"+vertexHostSuffix)
+}
+
+// locationFromHost reads the region out of a regional Vertex host, so
+// "https://us-central1-aiplatform.googleapis.com" needs no second config
+// field to say what it already says.
+func locationFromHost(base string) string {
+	h := hostOf(base)
+	if s, ok := strings.CutSuffix(h, "-"+vertexHostSuffix); ok {
+		return s
+	}
+	return ""
+}
 
 // VendorAuth is REQ-AUTH-03's ordered table for Google.
 //
@@ -48,28 +142,69 @@ type Options struct {
 	Attribution   *bool
 	BillingLookup func(string) *core.Model
 	Now           func() time.Time
+	// VertexProject and VertexLocation select the Vertex AI deployment
+	// (NFR-COMPAT-05). Setting the project is the whole switch: it selects the
+	// Vertex path shape and, with no base URL configured, the regional Vertex
+	// host. Both fall back to the environment — see ResolveVertex — so a
+	// deployment can also flip with no code change at all.
+	VertexProject  string
+	VertexLocation string
 	// Credentials is REQ-AUTH-05's application-owned store. When set it is
 	// consulted BEFORE the environment table, because it is the layer that can
 	// hold a refreshed OAuth token and the environment is static. An empty
 	// store falls through, so adding one never breaks a working env setup.
 	Credentials      *provider.Credentials
 	MaxSSEEventBytes int
+	// ToolPrefix is REQ-CACHE-06's per-session schema cache. Nil means this
+	// provider value owns one, which is the right scope in practice: a
+	// registry is built per agent config. Pass one explicitly to share it, or
+	// to read its reconciliation reports.
+	ToolPrefix *provider.ToolPrefix
+	// OnToolPrefixSync reports each reconciliation, so an embedder can feed
+	// REQ-CACHE-11's prefix-invalidation counter.
+	OnToolPrefixSync func(provider.SyncReport)
+	// ContextCache opts this provider into §6.2a Level 1's explicit
+	// CachedContent resource (NFR-PERF-08). Nil — the default — leaves Gemini's
+	// implicit caching to do its work and makes no creation call.
+	ContextCache *ContextCacheOptions
 }
 
 func Provider(opts Options) core.APIProvider {
-	c := &client{opts: opts}
+	c := &client{opts: opts, prefix: opts.ToolPrefix}
+	if c.prefix == nil {
+		c.prefix = &provider.ToolPrefix{}
+	}
 	return core.APIProvider{API: API, Stream: c.Stream}
 }
 
-type client struct{ opts Options }
+type client struct {
+	opts   Options
+	prefix *provider.ToolPrefix
+	// caches is the §6.2a Level 1 CachedContent resource per cached prefix.
+	// It is a value on the provider, like ToolPrefix, and never a package
+	// global: two agents in one process hold different system prompts.
+	caches sync.Map // prefix key -> *cacheEntry
+}
 
 func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o core.ProviderStreamOptions) *core.EventStream {
-	body, rep, err := BuildRequest(m, req)
+	body, rep, sync, err := BuildRequestCached(m, req, c.prefix)
 	if err != nil {
 		return core.ErrorStream(nil, fmt.Errorf("google: building request: %w", err))
 	}
+	if fn := c.opts.OnToolPrefixSync; fn != nil {
+		fn(sync)
+	}
 	if rep.Changed() && o.Warnf != nil {
 		o.Warnf("google: %s", rep.String())
+	}
+
+	// §6.2a Level 1 / NFR-PERF-08. The lookup is a map read and a mutex: if
+	// the resource for this prefix exists it is referenced and the prefix is
+	// withheld from the body; if creation is still in flight — or has never
+	// started — this request goes out uncached. Nothing here waits.
+	job := c.contextCacheJob(m, body)
+	if job != nil && c.attachCachedContent(body, job) {
+		job = nil
 	}
 
 	var payload any = body
@@ -88,11 +223,12 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 	}
 
 	s := core.NewEventStream(core.StreamOptions{})
-	go c.run(ctx, s, m, req, raw)
+	go c.run(ctx, s, m, req, raw, job)
 	return s
 }
 
-func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, req core.Request, raw []byte) {
+func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, req core.Request,
+	raw []byte, job *cacheJob) {
 	now := time.Now
 	if c.opts.Now != nil {
 		now = c.opts.Now
@@ -123,6 +259,22 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	if base == "" {
 		base = DefaultBaseURL
 	}
+	// NFR-COMPAT-05: the deployment is resolved from config, never from a
+	// different provider implementation. The base URL is resolved FIRST
+	// because an operator may have named the Vertex host there (catalog row or
+	// GOOGLE_GEMINI_BASE_URL) and said nothing else.
+	url := provider.ResolveBaseURL(m, auth, base)
+	vx, err := ResolveVertex(url, c.opts.VertexProject, c.opts.VertexLocation, env)
+	if err != nil {
+		d.fail(err.Error(), err)
+		return
+	}
+	// A project configured with no base URL anywhere: follow it to the Vertex
+	// host rather than sending a Vertex path to AI Studio. An explicitly
+	// configured base URL (a proxy, a gateway) is left exactly as it is.
+	if vx.On() && url == strings.TrimRight(DefaultBaseURL, "/") {
+		url = vx.BaseURL()
+	}
 	headers := map[string]string{
 		"content-type": "application/json",
 		"accept":       "text/event-stream",
@@ -146,12 +298,19 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 
 	call := provider.Call{
 		Method:  http.MethodPost,
-		URL:     provider.ResolveBaseURL(m, auth, base) + Path(m, true),
+		URL:     url + vx.Path(m, true),
 		Body:    raw,
 		Headers: headers,
 		Auth:    auth, Model: m, Options: req.Options,
 		Attribution: c.opts.Attribution, Env: env,
 		Client: c.opts.HTTPClient, Retry: c.opts.Retry,
+	}
+
+	// NFR-PERF-08: creation starts BEFORE the first model call and the loop
+	// does not wait for it — startContextCache launches a goroutine and
+	// returns. The model request below goes out uncached this turn.
+	if job != nil {
+		c.startContextCache(ctx, job, m, vx, url, auth, env, req.Options)
 	}
 
 	resp, err := call.Do(ctx)

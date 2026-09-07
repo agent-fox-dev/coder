@@ -86,7 +86,7 @@ func TestTheShippedSkillRendersThroughAssemble(t *testing.T) {
 	}
 	reg := Discover(Config{BuiltinDir: dir})
 	out := Assemble(Input{
-		Skills: reg.LoadForSession("", ""),
+		Skills: reg.LoadForSession("", "", reg.Config()),
 		Tools:  []core.Tool{{Name: "read_file"}},
 	})
 	want := `<skill name="code-review" path="` + filepath.Join(dir, "code-review", PromptName) + `">`

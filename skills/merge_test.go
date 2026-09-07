@@ -127,3 +127,7 @@ func TestContributionCarriesTheManifestsOverridesList(t *testing.T) {
 		t.Fatalf("the manifest's own overrides did not reach the merge: %v", err)
 	}
 }
+
+// asConflict is errors.As specialized, so the activation tests can assert the
+// same conflict type the merge tests do.
+func asConflict(err error, target **SkillConflictError) bool { return errors.As(err, target) }
