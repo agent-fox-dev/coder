@@ -8,7 +8,7 @@
 // defaults to the current one:
 //
 //	go run ./examples/codingagent --dir ./tools "Summarise this package."
-//	AGENTKIT_MODEL=openai/gpt-4o go run ./examples/codingagent --dir /tmp/scratch
+//	AGENTKIT_MODEL=openai/gpt-5.6-terra go run ./examples/codingagent --dir /tmp/scratch
 //
 // See examples/README.md for the full environment-variable table.
 package main
@@ -229,7 +229,7 @@ func modelSpec() string {
 	if s := os.Getenv("AGENTKIT_MODEL"); s != "" {
 		return s
 	}
-	return "anthropic/claude-sonnet-4-5"
+	return "anthropic/claude-sonnet-5"
 }
 
 // checkCredentials fails BEFORE the request with a message naming the variable

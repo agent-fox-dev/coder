@@ -124,7 +124,7 @@ set on every GCE and Cloud Run box: pass the project explicitly, or point
 ### 3. A model, resolved through the catalog
 
 ```go
-model, err := catalog.ResolveModel("anthropic/claude-sonnet-4-5")
+model, err := catalog.ResolveModel("anthropic/claude-sonnet-5")
 ```
 
 `ResolveModel` is the single entry point, and it is what supplies the wire
@@ -142,9 +142,26 @@ and errors rather than guessing.
 Every example takes `AGENTKIT_MODEL` to override its default:
 
 ```bash
-AGENTKIT_MODEL=openai/gpt-4o          go run ./examples/chat "hello"
-AGENTKIT_MODEL=ollama/llama3.2        go run ./examples/chat "hello"   # with OLLAMA_HOST set
+AGENTKIT_MODEL=openai/gpt-5.6-terra    go run ./examples/chat "hello"
+AGENTKIT_MODEL=google/gemini-3.8-flash go run ./examples/chat "hello"
 ```
+
+`catalog.Default().Vendors()` lists what the shipped snapshot knows — today
+`anthropic`, `google` and `openai`. **A vendor with a provider is not
+necessarily a vendor with catalog rows.** Ollama, OpenRouter, Groq, DeepSeek
+and the rest have a wire implementation and a credential table (above) but no
+rows here, so `AGENTKIT_MODEL=ollama/llama3.2` is an *unknown vendor* error
+rather than a sibling clone. To reach one, build the `core.Model` descriptor
+yourself, or supply your own catalog with `catalog.Parse` and resolve through
+that — the shipped snapshot is data, versioned separately and overridable,
+not a gate.
+
+One caution about sibling-cloning, because it costs real money to miss: an
+unknown id under a *known* vendor resolves, it does not validate. Ask for
+`anthropic/claude-sonnet-4-5` today and you get a working descriptor cloned
+from the current default row — and then the request fails at the vendor,
+because that model is gone. Resolution succeeding means "AgentKit knows how
+to build this request", never "this model exists".
 
 ### Other variables
 

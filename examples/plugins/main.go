@@ -617,7 +617,7 @@ func modelSpec() string {
 	if s := os.Getenv("AGENTKIT_MODEL"); s != "" {
 		return s
 	}
-	return "anthropic/claude-sonnet-4-5"
+	return "anthropic/claude-sonnet-5"
 }
 
 // checkCredentials fails BEFORE the request with a message naming the variable

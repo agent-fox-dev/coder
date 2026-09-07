@@ -7,7 +7,7 @@
 // With no task argument it uses a default one that needs both specialists.
 // Any model in the catalog works:
 //
-//	AGENTKIT_MODEL=openai/gpt-4o go run ./examples/delegation
+//	AGENTKIT_MODEL=openai/gpt-5.6-terra go run ./examples/delegation
 //
 // Two specialists are registered, and the difference between them is the
 // point: the researcher may read and search files inside the working
@@ -276,7 +276,7 @@ func modelSpec() string {
 	if s := os.Getenv("AGENTKIT_MODEL"); s != "" {
 		return s
 	}
-	return "anthropic/claude-sonnet-4-5"
+	return "anthropic/claude-sonnet-5"
 }
 
 // checkCredentials fails BEFORE the request with a message naming the variable

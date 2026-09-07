@@ -7,8 +7,8 @@
 // Any model in the catalog works, and so does one that is not in it — an
 // unknown id under a known vendor inherits that vendor's row:
 //
-//	AGENTKIT_MODEL=openai/gpt-4o        go run ./examples/chat "hello"
-//	AGENTKIT_MODEL=anthropic/some-new-id go run ./examples/chat "hello"
+//	AGENTKIT_MODEL=openai/gpt-5.6-terra        go run ./examples/chat "hello"
+//	AGENTKIT_MODEL=anthropic/some-unreleased-id go run ./examples/chat "hello"
 //
 // See examples/README.md for the full environment-variable table.
 package main
@@ -104,7 +104,7 @@ func modelSpec() string {
 	if s := os.Getenv("AGENTKIT_MODEL"); s != "" {
 		return s
 	}
-	return "anthropic/claude-sonnet-4-5"
+	return "anthropic/claude-sonnet-5"
 }
 
 // checkCredentials fails BEFORE the request with a message naming the variable
