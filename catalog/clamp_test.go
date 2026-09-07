@@ -292,41 +292,50 @@ func TestThinkingWireReturnsTheRowsOwnValue(t *testing.T) {
 
 // The shipped catalog, exercised through the real clamps.
 func TestShippedCatalogClamps(t *testing.T) {
-	o3, err := ResolveModel("o3")
+	haiku, err := ResolveModel("claude-haiku-4-5")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// REQ-PROV-15's worked example, against a real row: o3 has low/medium/high
-	// and neither xhigh nor max, so max clamps down to high — and never to off,
-	// which o3 records as present-null because it cannot stop reasoning.
-	lvl, wire, ok := ClampThinkingLevel(o3, core.ThinkingMax)
-	if !ok || lvl != core.ThinkingHigh || wire != "high" {
-		t.Errorf("o3 max -> (%q, %q, %v), want (high, high, true)", lvl, wire, ok)
-	}
-	if lvl, _, _ := ClampThinkingLevel(o3, core.ThinkingMinimal); lvl != core.ThinkingLow {
-		t.Errorf("o3 minimal -> %q, want low (upward, and never off)", lvl)
+	// REQ-PROV-15's worked example, against a real row: this row prices
+	// minimal through high and neither xhigh nor max, so max clamps DOWN to
+	// high — and never to off, which the row records as a level of its own.
+	lvl, wire, ok := ClampThinkingLevel(haiku, core.ThinkingMax)
+	if !ok || lvl != core.ThinkingHigh || wire != "32768" {
+		t.Errorf("haiku max -> (%q, %q, %v), want (high, 32768, true)", lvl, wire, ok)
 	}
 
-	gpt4o, err := ResolveModel("gpt-4o")
+	astra, err := ResolveModel("gpt-6-astra")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok := ClampThinkingLevel(gpt4o, core.ThinkingHigh); ok {
-		t.Error("gpt-4o has no thinking map; the parameter must be omitted, not clamped")
+	// Upward first, and never to off: this row's ladder starts at low, and
+	// its off entry is present-and-null because the model cannot stop
+	// reasoning.
+	if lvl, _, _ := ClampThinkingLevel(astra, core.ThinkingMinimal); lvl != core.ThinkingLow {
+		t.Errorf("gpt-6-astra minimal -> %q, want low (upward, and never off)", lvl)
 	}
-	if got := ClampMaxTokens(gpt4o, 100000, 0); got != 16384 {
-		t.Errorf("gpt-4o max_tokens = %d, want its 16384 output cap", got)
+	if got := ClampMaxTokens(astra, 1000000, 0); got != 128000 {
+		t.Errorf("gpt-6-astra max_tokens = %d, want its 128000 output cap", got)
 	}
 
-	opus, err := ResolveModel("anthropic/claude-opus-4-5")
+	// A row whose whole ladder is present-and-null supports no reachable
+	// level, so the parameter is omitted rather than clamped: the current
+	// Anthropic models price reasoning in an effort field this wire does not
+	// carry (see the row notes), and guessing a budget for them is a 400.
+	opus, err := ResolveModel("anthropic/claude-opus-5")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := ClampMaxTokens(opus, 64000, 190000); got != 5904 {
-		t.Errorf("opus deep in a session: %d, want 5904", got)
+	if _, _, ok := ClampThinkingLevel(opus, core.ThinkingHigh); ok {
+		t.Error("claude-opus-5 prices no level above off; the parameter must be omitted, not clamped")
+	}
+	if got := ClampMaxTokens(haiku, 64000, 190000); got != 5904 {
+		t.Errorf("haiku deep in a session: %d, want 5904", got)
 	}
 	// A sibling clone inherits the window, so the clamp keeps working on a
 	// model that did not exist when this catalog was written (NFR-COMPAT-03).
+	// The template here is the vendor's default_model, whose 1M window is the
+	// one the clone is clamped against.
 	clone, err := ResolveModel("anthropic/claude-opus-5-1-20991231")
 	if err != nil {
 		t.Fatal(err)
@@ -334,7 +343,7 @@ func TestShippedCatalogClamps(t *testing.T) {
 	if !clone.Cloned {
 		t.Fatal("expected a clone")
 	}
-	if got := ClampMaxTokens(clone, 64000, 190000); got != 5904 {
-		t.Errorf("clone clamp = %d, want 5904 from the inherited window", got)
+	if got := ClampMaxTokens(clone, 128000, 995000); got != 904 {
+		t.Errorf("clone clamp = %d, want 904 from the inherited 1M window", got)
 	}
 }

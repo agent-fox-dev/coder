@@ -72,65 +72,69 @@ func strp(s string) *string { return &s }
 func TestEmbeddedCatalogPopulatesTheREQPROV10Descriptor(t *testing.T) {
 	c := Default()
 
-	opus, err := c.ResolveModel("anthropic/claude-opus-4-5")
+	haiku, err := c.ResolveModel("anthropic/claude-haiku-4-5")
 	if err != nil {
-		t.Fatalf("resolve opus: %v", err)
+		t.Fatalf("resolve haiku: %v", err)
 	}
-	if opus.API != core.APIAnthropicMessages {
-		t.Errorf("API = %q, want %q", opus.API, core.APIAnthropicMessages)
+	if haiku.API != core.APIAnthropicMessages {
+		t.Errorf("API = %q, want %q", haiku.API, core.APIAnthropicMessages)
 	}
-	if opus.Provider != "anthropic" {
-		t.Errorf("Provider = %q, want anthropic", opus.Provider)
+	if haiku.Provider != "anthropic" {
+		t.Errorf("Provider = %q, want anthropic", haiku.Provider)
 	}
-	if opus.BaseURL == "" {
+	if haiku.BaseURL == "" {
 		t.Error("BaseURL is empty; it is inherited from the vendor and no request can be built without it")
 	}
-	if got := opus.Headers["anthropic-version"]; got == nil || *got == "" {
+	if got := haiku.Headers["anthropic-version"]; got == nil || *got == "" {
 		t.Errorf("Headers[anthropic-version] = %v, want the vendor-inherited version header", got)
 	}
-	if opus.ContextWindow != 200000 || opus.MaxTokens != 64000 {
-		t.Errorf("window/max = %d/%d, want 200000/64000", opus.ContextWindow, opus.MaxTokens)
+	if haiku.ContextWindow != 200000 || haiku.MaxTokens != 64000 {
+		t.Errorf("window/max = %d/%d, want 200000/64000", haiku.ContextWindow, haiku.MaxTokens)
 	}
-	if opus.Cost.Input != 5 || opus.Cost.Output != 25 {
-		t.Errorf("cost = %v/%v per 1M, want 5/25", opus.Cost.Input, opus.Cost.Output)
+	if haiku.Cost.Input != 1 || haiku.Cost.Output != 5 {
+		t.Errorf("cost = %v/%v per 1M, want 1/5", haiku.Cost.Input, haiku.Cost.Output)
 	}
-	if !opus.SupportsImages() {
+	if !haiku.SupportsImages() {
 		t.Error("SupportsImages() = false; REQ-CAT-05 would replace every image block")
 	}
-	if !opus.Reasoning {
+	if !haiku.Reasoning {
 		t.Error("Reasoning = false")
 	}
-	if opus.Cloned {
+	if haiku.Cloned {
 		t.Error("a catalog hit must not be marked Cloned")
 	}
 
-	o3, err := c.ResolveModel("o3")
+	astra, err := c.ResolveModel("gpt-6-astra")
 	if err != nil {
-		t.Fatalf("resolve o3: %v", err)
+		t.Fatalf("resolve gpt-6-astra: %v", err)
 	}
-	if o3.API != core.APIOpenAICompletions {
-		t.Errorf("o3 API = %q", o3.API)
+	if astra.API != core.APIOpenAICompletions {
+		t.Errorf("gpt-6-astra API = %q", astra.API)
 	}
 	var compat map[string]any
-	if err := json.Unmarshal(o3.Compat, &compat); err != nil {
-		t.Fatalf("o3 compat is not an object: %v", err)
+	if err := json.Unmarshal(astra.Compat, &compat); err != nil {
+		t.Fatalf("gpt-6-astra compat is not an object: %v", err)
 	}
 	// The keys are provider/openai.Compat's own json names (REQ-PROV-12);
 	// that profile rejects any other key, so a row written in a vocabulary
 	// it does not read fails the request instead of silently doing nothing.
-	if compat["use_max_tokens"] != false {
-		t.Errorf("o3 compat.use_max_tokens = %v, want false (max_completion_tokens)", compat["use_max_tokens"])
-	}
 	if compat["supports_temperature"] != false {
-		t.Errorf("o3 compat.supports_temperature = %v, want false", compat["supports_temperature"])
+		t.Errorf("gpt-6-astra compat.supports_temperature = %v, want false", compat["supports_temperature"])
+	}
+	// use_max_tokens is ABSENT rather than false: the api.openai.com profile
+	// already defaults it to false (max_completion_tokens), and a row that
+	// restates a default is a row that has to be re-diffed when the default
+	// moves. Its absence must not read as "true".
+	if _, ok := compat["use_max_tokens"]; ok {
+		t.Errorf("gpt-6-astra restates the profile default use_max_tokens: %v", compat)
 	}
 	// Present-and-null: REQ-PROV-15's "explicitly unsupported".
-	w, present := o3.ThinkingLevelMap[core.ThinkingOff]
+	w, present := astra.ThinkingLevelMap[core.ThinkingOff]
 	if !present {
-		t.Error("o3 thinking map has no entry for off; the snapshot recorded it as present-null on purpose")
+		t.Error("gpt-6-astra thinking map has no entry for off; the snapshot recorded it as present-null on purpose")
 	}
 	if w != nil {
-		t.Errorf("o3 thinking map off = %q, want null (this model cannot stop reasoning)", *w)
+		t.Errorf("gpt-6-astra thinking map off = %q, want null (this model cannot stop reasoning)", *w)
 	}
 }
 
@@ -315,8 +319,8 @@ func TestCatalogAccessors(t *testing.T) {
 	if !strings.Contains(c.Note(), "REQ-CAT-06") {
 		t.Error("Note() does not carry the regeneration ritual")
 	}
-	if got := c.Vendors(); len(got) != 2 || got[0] != "anthropic" || got[1] != "openai" {
-		t.Errorf("Vendors() = %v, want sorted [anthropic openai]", got)
+	if got := c.Vendors(); len(got) != 3 || got[0] != "anthropic" || got[1] != "google" || got[2] != "openai" {
+		t.Errorf("Vendors() = %v, want sorted [anthropic google openai]", got)
 	}
 	if !c.KnownVendor("openai") || c.KnownVendor("deepseek-ai") {
 		t.Error("KnownVendor is the predicate REQ-CAT-02 rule 1 turns on")
