@@ -1,12 +1,13 @@
 # AgentKit examples
 
-Ten examples, smallest first. Each is a single self-contained `main.go` you
+Eleven examples, smallest first. Each is a single self-contained `main.go` you
 can read top to bottom and copy into your own project — they deliberately
 repeat their setup rather than sharing a helper package, so nothing you need
 is in a file you have not opened.
 
-**Four of them need no API key at all**: `agentdemo`, `testing`, `plugins` and
-`mcp` do their real work before any model call, so you can run them right now.
+**Five of them need no API key at all**: `agentdemo`, `testing`, `plugins`,
+`mcp` and `skills` do their real work before any model call, so you can run
+them right now.
 
 | Example | Run it | What it teaches |
 |---|---|---|
@@ -16,8 +17,8 @@ is in a file you have not opened.
 | [`session`](session) | `go run ./examples/session "pick a number"` then `go run ./examples/session "which number?"` | Durable append-only sessions. The second run answers from the first one's transcript, on disk. |
 | [`delegation`](delegation) | `go run ./examples/delegation "which files define the agent loop?"` | Named specialists, per-child tool scoping, budget propagation. |
 
-Then the ones that go deeper. `testing`, `plugins` and `mcp` run fully without
-a key:
+Then the ones that go deeper. `testing`, `plugins`, `mcp` and `skills` run
+fully without a key:
 
 | Example | Run it | What it teaches |
 |---|---|---|
@@ -26,6 +27,7 @@ a key:
 | [`plugins`](plugins) | `go run ./examples/plugins` | The four plugin categories, manifest discovery, load ordering, the `disabled` list, and why a plugin hook can only narrow what the host already allowed. |
 | [`mcp`](mcp) | `go run ./examples/mcp` · `--serve` | Model Context Protocol both ways: consuming a server's tools under qualified names, and exposing your own over stdio. |
 | [`interactive`](interactive) | `go run ./examples/interactive` | Typing *while* the agent works: steering a running turn, queued follow-ups, out-of-band abort, phase and snapshot. |
+| [`skills`](skills) | `go run ./examples/skills` | Repository- and user-authored prompt material: the three discovery tiers, the project trust gate, progressive disclosure and its escaping, context files, the tool-merge and mid-session activation seams, the subagent step. |
 
 There is also [`agentdemo`](agentdemo), which needs **no API key and no
 network**: it drives the real loop against a scripted provider and prints
@@ -196,7 +198,7 @@ deliberately *not* contained — that is what the interceptor above is for.
 under the working directory are not discovered, not listed and not named in
 the system prompt. A cloned repository would otherwise author part of your
 prompt by being the current directory. Establishing trust is an affirmative
-act by your application.
+act by your application. See [`skills`](skills).
 
 ## Troubleshooting
 
@@ -222,16 +224,7 @@ Deltas are an optimization; the authoritative events always arrive.
 
 ## Not yet covered by an example
 
-**Skills and project context.** Repository-authored prompt material is loaded
-only when your application says so. `agentkit.SkillsConfigFor` derives the
-discovery config from your `AgentConfig` so the trust gate travels with it,
-and `Agent.LoadSkills` selects and audits in one call.
-
 **Compaction.** `agentkit.NewContextTransform` installs a context transform
 that summarizes a growing transcript in place. Once a summary checkpoint
 exists it is always re-applied; the threshold only decides whether to extend
 it. The naive "compact when over threshold" reading oscillates.
-
-**Plugins.** Four categories, discovered from `plugin.toml` manifests in
-directories you configure. `plugins.Load` applies the ordering and the
-`disabled` list and refuses a plugin whose imports fail the lint.

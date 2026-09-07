@@ -12,10 +12,10 @@ go test ./...          # everything, offline, no API key
 go run ./examples/agentdemo
 ```
 
-[`examples/`](examples/) has ten of them — chat, streaming, a coding agent,
+[`examples/`](examples/) has eleven of them — chat, streaming, a coding agent,
 durable sessions, delegation, writing your own tools, plugins, MCP in both
-directions, mid-run steering, and a test file showing how to test the agent
-code *you* write. Four need no API key. [`examples/README.md`](examples/README.md)
+directions, mid-run steering, skills and project context, and a test file
+showing how to test the agent code *you* write. Five need no API key. [`examples/README.md`](examples/README.md)
 is the configuration reference: which environment variable each vendor reads,
 what a base URL does and does not buy you, and the three decisions every
 embedding application has to make.
