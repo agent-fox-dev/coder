@@ -36,6 +36,16 @@ import (
 //
 // Discovery stays the embedder's affirmative act (REQ-SKILL-04, REQ-SEC-10):
 // this takes a registry the caller discovered, it does not go looking.
+//
+// Injection is a second call, and it is SetPromptBlocks rather than a field
+// write, because the selection is only half of what reaches the model — the
+// project-context files of REQ-CTX-01 come from DiscoverContext and the tool
+// the block names comes from the resolved tool set:
+//
+//	cfg := SkillsConfigFor(agentCfg, workDir, skills.BuiltinDir())
+//	sel := agent.LoadSkills(skills.Discover(cfg), archetype, task, cfg)
+//	files, _ := skills.DiscoverContext(cfg)
+//	err := agent.SetPromptBlocks(SkillBlocks(sel, files, agent.Tools()))
 func (a *Agent) LoadSkills(reg *skills.Registry, archetype, taskPrompt string, cfg skills.Config) []skills.Skill {
 	if reg == nil {
 		return nil

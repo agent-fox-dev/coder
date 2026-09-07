@@ -164,6 +164,58 @@ func (a *Agent) RegisterTool(t core.Tool) error {
 	return nil
 }
 
+// SetPromptBlocks replaces AgentConfig.PromptBlocks: the extra system-prompt
+// sections appended after the built-in ones, which is where the skills and
+// project-context block goes (SkillBlocks builds it).
+//
+// It exists because the two halves of the skills wiring sat on opposite sides
+// of the constructor. The assembled block is a field on core.AgentConfig, so
+// it had to be set BEFORE NewAgent; the audit sink of REQ-SKILL-11 lives on
+// the agent, so LoadSkills could only be called AFTER it — and the selection
+// it audited then had no exported route into the prompt. An embedder had to
+// assemble the block from a second selection and emit the event by hand with
+// AuditSkills — which is the exact call LoadSkills exists to make
+// unforgettable. Now there is one order that does both:
+//
+//	cfg := agentkit.SkillsConfigFor(agentCfg, workDir, skills.BuiltinDir())
+//	sel := agent.LoadSkills(skills.Discover(cfg), archetype, task, cfg)
+//	files, _ := skills.DiscoverContext(cfg)
+//	err := agent.SetPromptBlocks(agentkit.SkillBlocks(sel, files, agent.Tools()))
+//
+// Like RegisterTool it returns ErrBusy while a run is in flight, for the same
+// reason: the assembled prompt is the provider's cached prefix (REQ-CACHE-06),
+// and changing it mid-turn would silently alter what the model was shown after
+// it was shown something else. A skill that activates DURING a turn takes the
+// other seam — skills.Activate and Activation.Mark — which declares its tools
+// at their transcript position instead of rewriting the prefix.
+//
+// The blocks are copied, so a caller that keeps and mutates its own slice
+// cannot change the prompt a later turn sends. Nothing is written to the
+// session log: the block is derived from discovery, and a resumed session
+// re-derives it from the config the embedder passes to
+// NewAgentFromSession — a logged copy could only disagree with the trust
+// decision that session was constructed with.
+func (a *Agent) SetPromptBlocks(blocks []string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return core.ErrBusy
+	}
+	a.cfg.PromptBlocks = append([]string(nil), blocks...)
+	return nil
+}
+
+// PromptBlocks returns the extra system-prompt sections currently configured.
+//
+// It is a copy: the caller that wants to APPEND a block reads, appends and
+// calls SetPromptBlocks, rather than writing into the agent's own slice
+// between turns.
+func (a *Agent) PromptBlocks() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.cfg.PromptBlocks...)
+}
+
 // Tools returns the resolved tool set for a run, after ToolPolicy resolution
 // (REQ-TOOL-10).
 func (a *Agent) Tools() []core.Tool {

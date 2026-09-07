@@ -267,7 +267,7 @@ func run() error {
 	)
 	// The allowlist keeps this to a reading agent: no execute, so no
 	// authorization boundary is required for it (see examples/codingagent),
-	// and the block below will name read_file because read_file is what the
+	// and the block below will name read_file, because read_file is what the
 	// resolved set actually contains.
 	cfg.ToolPolicy.ToolNames = []string{"read_file", "list_files"}
 	cfg.StopPolicy = agentkit.StopAny(
@@ -284,17 +284,6 @@ func run() error {
 		}
 	}
 
-	// The block must name the tool the model will HAVE, and tools are
-	// registered after construction, so resolve the policy first and hand the
-	// resolved set to the assembler. Passing the registry instead would
-	// describe a set the model may not have.
-	active := agentkit.ResolveToolPolicy(built, cfg.ToolPolicy)
-	skillCfg := agentkit.SkillsConfigFor(cfg, work, skills.BuiltinDir())
-	sessionReg := skills.Discover(skillCfg)
-	session := sessionReg.LoadForSession("coder", task, skillCfg)
-	ctxFiles, _ := skills.DiscoverContext(skillCfg)
-	cfg.PromptBlocks = agentkit.SkillBlocks(session, ctxFiles, active)
-
 	agent, err := agentkit.NewAgent(cfg)
 	if err != nil {
 		return err
@@ -304,20 +293,27 @@ func run() error {
 			return err
 		}
 	}
-	// REQ-SKILL-11: every skill that reached the prompt is named in the audit
-	// trail. Record wraps the selection and returns it unchanged, so the
-	// event cannot be dropped by a refactor that moves the injection.
+
+	// Four lines, and the order is the whole of the wiring.
 	//
-	// Order here is forced and it is worth knowing why: PromptBlocks is a
-	// CONSTRUCTION input, so the block is assembled before NewAgent, while the
-	// audit sink lives on the agent and can only be reached after it.
-	// Agent.LoadSkills is the same select-and-audit pair in one call, for a
-	// session whose agent already exists.
-	session = skills.Record(agent, session)
+	// SkillsConfigFor derives the discovery config from the agent config, so
+	// the trust decision travels with it. LoadSkills selects AND records every
+	// selected name in the audit event (REQ-SKILL-11) — one call, because the
+	// audit is the step an embedder forgets. DiscoverContext supplies the
+	// §6.5a files. SetPromptBlocks installs the assembled section, and it is
+	// handed agent.Tools() — the set AFTER the policy resolved — because the
+	// block names the tool the model must read a skill with and naming one it
+	// does not have buys a hallucinated call and a wasted turn.
+	skillCfg := agentkit.SkillsConfigFor(cfg, work, skills.BuiltinDir())
+	session := agent.LoadSkills(skills.Discover(skillCfg), "coder", task, skillCfg)
+	ctxFiles, _ := skills.DiscoverContext(skillCfg)
+	if err := agent.SetPromptBlocks(agentkit.SkillBlocks(session, ctxFiles, agent.Tools())); err != nil {
+		return err
+	}
 
 	fmt.Println("\n  the system prompt the provider will receive:")
 	fmt.Print(indent(agentkit.BuildSystemPrompt(agentkit.PromptInput{
-		Custom: cfg.SystemPrompt, Tools: agent.Tools(), ExtraBlocks: cfg.PromptBlocks,
+		Custom: cfg.SystemPrompt, Tools: agent.Tools(), ExtraBlocks: agent.PromptBlocks(),
 	})))
 	fmt.Println("\n  A custom SystemPrompt replaces the built-in base and guidelines and")
 	fmt.Println("  nothing else: skills and context still append, because switching them off")
