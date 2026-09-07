@@ -92,10 +92,18 @@ type block struct {
 	Content   []block `json:"content,omitzero"`
 	IsError   bool    `json:"is_error,omitzero"`
 
-	// thinking
-	Thinking  string `json:"thinking,omitzero"`
-	Signature string `json:"signature,omitzero"`
-	Data      string `json:"data,omitzero"` // redacted_thinking
+	// thinking. Thinking and Data are pointers because they are REQUIRED on
+	// the block types that carry them, and an empty one is a value the model
+	// really sends: a thinking block whose summary came out empty still
+	// arrives signed and still has to be replayed. A plain string would be
+	// dropped by omitzero and produce `{"type":"thinking","signature":"…"}`,
+	// which the Messages API rejects with
+	// `content.0.thinking.thinking: Field required` — the same shape of 400
+	// an empty tool_result placeholder used to cause. A nil pointer omits the
+	// key; a pointer to "" writes it.
+	Thinking  *string `json:"thinking,omitzero"`
+	Signature string  `json:"signature,omitzero"`
+	Data      *string `json:"data,omitzero"` // redacted_thinking
 
 	// image
 	Source *imageSource `json:"source,omitzero"`
@@ -468,9 +476,9 @@ func encodeBlock(b core.ContentBlock) block {
 		return block{Type: "text", Text: v.Text}
 	case core.ThinkingBlock:
 		if v.Redacted {
-			return block{Type: "redacted_thinking", Data: v.Signature}
+			return block{Type: "redacted_thinking", Data: &v.Signature}
 		}
-		return block{Type: "thinking", Thinking: v.Thinking, Signature: v.Signature}
+		return block{Type: "thinking", Thinking: &v.Thinking, Signature: v.Signature}
 	case core.ToolUseBlock:
 		// The model's own argument bytes are written into the input position
 		// UNCHANGED — no decode-and-re-encode round trip, which would sort the
