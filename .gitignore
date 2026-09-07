@@ -5,6 +5,12 @@
 *.dylib
 /agentkit
 /agentdemo
+# `go build ./examples/<name>` drops the binary in the working directory.
+/chat
+/streaming
+/codingagent
+/session
+/delegation
 
 # Test artifacts
 *.test
