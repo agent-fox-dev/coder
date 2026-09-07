@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -161,9 +162,42 @@ const AbortText = "Request was aborted"
 // TransportErrorText renders a transport failure for the semantic classifier,
 // preserving the underlying text where "getaddrinfo", "connection reset" and
 // "unexpected EOF" live.
-func TransportErrorText(prefix string, ctx context.Context, err error) string {
-	if ctx.Err() != nil {
-		return AbortText
+//
+// It takes BOTH contexts a request runs under, because they mean different
+// things when they fire (REQ-PROV-18): caller is the ctx the caller passed to
+// Stream, and its cancellation is an abort — terminal, never retried
+// (REQ-LOOP-09, REQ-PROV-14). req is the per-request ctx derived from it by
+// RequestOptions.TimeoutMs; its deadline expiring with the caller still alive
+// is a transient failure the semantic layer MAY retry. A classifier that saw
+// only the derived ctx reported every timeout as an abort, which is how a
+// slow gateway silently disabled retries.
+func TransportErrorText(prefix string, caller, req context.Context, err error) string {
+	if text, ok := cancellationText(prefix, caller, req, err); ok {
+		return text
 	}
 	return prefix + ": " + err.Error()
+}
+
+// StreamErrorText is TransportErrorText for a failure raised while the
+// response body was being decoded. The error text already carries the
+// provider's prefix (or is one of the shared sentinels the REQ-PROV-14
+// allowlist matches verbatim), so it is passed through unprefixed; only the
+// two cancellation channels are classified.
+func StreamErrorText(prefix string, caller, req context.Context, err error) string {
+	if text, ok := cancellationText(prefix, caller, req, err); ok {
+		return text
+	}
+	return err.Error()
+}
+
+func cancellationText(prefix string, caller, req context.Context, err error) (string, bool) {
+	if caller.Err() != nil {
+		return AbortText, true
+	}
+	if req.Err() != nil && errors.Is(req.Err(), context.DeadlineExceeded) {
+		// "timeout" is on the REQ-PROV-14 allowlist; the wording is what
+		// makes the expiry retryable rather than merely reported.
+		return prefix + ": request timeout (RequestOptions.TimeoutMs elapsed): " + err.Error(), true
+	}
+	return "", false
 }

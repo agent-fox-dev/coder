@@ -47,6 +47,9 @@ type SearchResult struct {
 	Matches       []SearchMatch `json:"matches"`
 	Truncated     bool          `json:"truncated"`
 	FilesSearched int           `json:"files_searched"`
+	// TruncatedBy names which limit fired when Truncated is set: the match
+	// cap ("lines") or the 50 KB byte cap ("bytes") (REQ-TOOL-09).
+	TruncatedBy TruncatedBy `json:"truncated_by,omitzero"`
 }
 
 // binarySniffBytes is how much of a file is examined for a NUL byte.
@@ -141,7 +144,7 @@ func (f *fileTools) searchFiles() core.Tool {
 					"context_lines must be between 0 and %d", MaxSearchContextLines))
 			}
 
-			res, _, err := Search(ctx, root, a)
+			res, _, err := SearchIn(ctx, root, a, f.ig)
 			if err != nil {
 				if ctx.Err() != nil {
 					return core.ErrResult("aborted", "Operation aborted")
@@ -159,9 +162,14 @@ func (f *fileTools) searchFiles() core.Tool {
 				"files_searched": res.FilesSearched,
 			})
 			if res.Truncated {
-				out.Data["note"] = FindMarker(effectiveMax(a.MaxMatches))
+				// The marker names THIS tool's parameter, max_matches, and its
+				// cap of 100 — not find_files' `limit` (REQ-TOOL-09b).
+				out.Data["note"] = SearchMarker(effectiveMax(a.MaxMatches))
+				if res.TruncatedBy == TruncatedByBytes {
+					out.Data["note"] = SearchBytesMarker(len(res.Matches), DefaultByteLimit)
+				}
 				out.Metadata = &core.ToolMetadata{
-					Truncated: true, TruncatedBy: string(TruncatedByLines),
+					Truncated: true, TruncatedBy: string(res.TruncatedBy),
 				}
 			}
 			return out
@@ -187,15 +195,59 @@ func effectiveMax(n int) int {
 // Search runs the search and reports which backend answered.
 //
 // It is exported so the parity test can drive both backends over one tree, and
-// so an embedder can search without going through the tool envelope.
+// so an embedder can search without going through the tool envelope. It reads
+// the real ignore environment; SearchIn takes an explicit one.
 func Search(ctx context.Context, root string, p SearchParams) (SearchResult, SearchBackend, error) {
+	return SearchIn(ctx, root, p, IgnoreOptions{})
+}
+
+// SearchIn is Search with an injected ignore environment (NFR-TEST-04), so a
+// test can pin an empty global excludes layer instead of inheriting the
+// developer's.
+func SearchIn(ctx context.Context, root string, p SearchParams, ig IgnoreOptions) (SearchResult, SearchBackend, error) {
+	res, backend, err := searchIn(ctx, root, p, ig)
+	if err != nil {
+		return res, backend, err
+	}
+	// REQ-TOOL-09: the 50 KB byte limit composes with the match cap on BOTH
+	// backends. 100 matches with 20 lines of context either side at 500
+	// chars a line is two megabytes; without this the model paid for it.
+	capSearchBytes(&res, DefaultByteLimit)
+	return res, backend, nil
+}
+
+// capSearchBytes applies the head-mode byte budget over the assembled matches,
+// dropping whole matches from the end until the payload fits, and records
+// which limit fired.
+func capSearchBytes(res *SearchResult, budget int) {
+	if res.Truncated {
+		res.TruncatedBy = TruncatedByLines
+	}
+	used := 0
+	for i, m := range res.Matches {
+		b, err := json.Marshal(m)
+		if err != nil {
+			continue
+		}
+		// +1 for the separator; the envelope's own keys are a rounding error
+		// next to the budget.
+		used += len(b) + 1
+		if used > budget && i > 0 {
+			res.Matches = res.Matches[:i]
+			res.Truncated, res.TruncatedBy = true, TruncatedByBytes
+			return
+		}
+	}
+}
+
+func searchIn(ctx context.Context, root string, p SearchParams, ig IgnoreOptions) (SearchResult, SearchBackend, error) {
 	if _, err := compilePattern(p); err != nil {
 		// Compiled up front even on the ripgrep path, so an invalid pattern is
 		// one error message rather than two depending on what is installed.
 		return SearchResult{}, "", err
 	}
 	if path, ok := ripgrepPath(); ok {
-		res, err := searchRipgrep(ctx, path, root, p)
+		res, err := searchRipgrep(ctx, path, root, p, ig)
 		if err == nil {
 			return res, BackendRipgrep, nil
 		}
@@ -206,13 +258,13 @@ func Search(ctx context.Context, root string, p SearchParams) (SearchResult, Sea
 		// moved, a sandbox that blocks exec — must not take the tool down with
 		// it. The native path is a complete implementation, not a stub, so
 		// falling through costs correctness nothing.
-		res, nerr := searchNative(ctx, root, p)
+		res, nerr := searchNative(ctx, root, p, ig)
 		if nerr != nil {
 			return SearchResult{}, BackendNative, nerr
 		}
 		return res, BackendNative, nil
 	}
-	res, err := searchNative(ctx, root, p)
+	res, err := searchNative(ctx, root, p, ig)
 	return res, BackendNative, err
 }
 
@@ -261,7 +313,7 @@ func caseSensitive(p SearchParams) bool {
 
 // ---------------------------------------------------------------- native
 
-func searchNative(ctx context.Context, root string, p SearchParams) (SearchResult, error) {
+func searchNative(ctx context.Context, root string, p SearchParams, igOpts IgnoreOptions) (SearchResult, error) {
 	re, err := compilePattern(p)
 	if err != nil {
 		return SearchResult{}, err
@@ -269,7 +321,7 @@ func searchNative(ctx context.Context, root string, p SearchParams) (SearchResul
 	max := effectiveMax(p.MaxMatches)
 
 	out := SearchResult{Matches: []SearchMatch{}}
-	ig := loadIgnore(root)
+	ig := newIgnoreEngine(root, igOpts)
 
 	walkErr := filepath.WalkDir(root, func(abs string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -415,18 +467,34 @@ func searchFile(abs, rel string, re *regexp.Regexp, contextLines, budget int) (f
 }
 
 // capLine bounds one returned line (REQ-TOOL-09's per-line cap).
+//
+// The cap is 500 CHARACTERS, cut on a rune boundary. A byte slice at 500
+// lands inside a multi-byte rune one time in a few, and the result is
+// invalid UTF-8 that a JSON encoder replaces with U+FFFD — a line the model
+// then cannot match back against the file.
 func capLine(s string) string {
 	if len(s) <= SearchLineChars {
-		return s
+		return s // at most 500 bytes is at most 500 runes
 	}
-	return s[:SearchLineChars] + "…"
+	n := 0
+	for i := range s {
+		if n == SearchLineChars {
+			return s[:i] + "…"
+		}
+		n++
+	}
+	return s
 }
 
 // CountCandidates counts the files a search would select: everything left
 // after the ignore rules, the hidden-entry rule and file_glob.
 func CountCandidates(ctx context.Context, root string, p SearchParams) (int, error) {
+	return countCandidates(ctx, root, p, IgnoreOptions{})
+}
+
+func countCandidates(ctx context.Context, root string, p SearchParams, igOpts IgnoreOptions) (int, error) {
 	n := 0
-	ig := loadIgnore(root)
+	ig := newIgnoreEngine(root, igOpts)
 	err := filepath.WalkDir(root, func(abs string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -470,7 +538,7 @@ func CountCandidates(ctx context.Context, root string, p SearchParams) (int, err
 // supplies reaches a shell: the argv is built here, exec.Command takes it as a
 // vector, and every model-supplied value is a separate argument. `--` before
 // the pattern is what stops a pattern beginning with `-` from becoming a flag.
-func searchRipgrep(ctx context.Context, rg, root string, p SearchParams) (SearchResult, error) {
+func searchRipgrep(ctx context.Context, rg, root string, p SearchParams, ig IgnoreOptions) (SearchResult, error) {
 	max := effectiveMax(p.MaxMatches)
 
 	args := []string{
@@ -505,6 +573,17 @@ func searchRipgrep(ctx context.Context, rg, root string, p SearchParams) (Search
 	}
 	if p.ContextLines > 0 {
 		args = append(args, "--context", fmt.Sprint(p.ContextLines))
+	}
+	// The global excludes layer is handed to rg EXPLICITLY. rg runs with an
+	// empty environment (below), so it cannot locate core.excludesFile or
+	// ~/.config/git/ignore itself — which meant the accelerated path silently
+	// applied no global layer while the native path did, and an injected
+	// layer (NFR-TEST-04) reached one backend but not the other. --ignore-file
+	// has the lowest precedence in rg's ignore stack, matching ours.
+	if g := globalExcludesPath(ig); g != "" {
+		if _, err := os.Stat(g); err == nil {
+			args = append(args, "--ignore-file", g)
+		}
 	}
 	// file_glob is deliberately NOT passed to rg.
 	//
@@ -546,7 +625,7 @@ func searchRipgrep(ctx context.Context, rg, root string, p SearchParams) (Search
 	// One extra walk, with no file contents read: readdir plus ignore matching
 	// is cheap next to the content scan rg just did, and it is the only way the
 	// two backends report the same number.
-	n, cerr := CountCandidates(ctx, root, p)
+	n, cerr := countCandidates(ctx, root, p, ig)
 	if cerr != nil && ctx.Err() != nil {
 		return SearchResult{}, cerr
 	}

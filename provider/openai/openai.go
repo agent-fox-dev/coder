@@ -13,11 +13,17 @@
 package openai
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
 	"strings"
 
+	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
+	"github.com/agentfox/agentkit-go/schema"
 )
 
 // API is the wire API id.
@@ -89,6 +95,15 @@ type contentPart struct {
 	Type     string    `json:"type"`
 	Text     string    `json:"text,omitzero"`
 	ImageURL *imageURL `json:"image_url,omitzero"`
+	// CacheControl is Anthropic's breakpoint carried over the Chat Completions
+	// wire, which OpenRouter forwards for its anthropic/* routes (§6.2a,
+	// REQ-PROV-12 CacheControlFormat). Absent everywhere else.
+	CacheControl *cacheControl `json:"cache_control,omitzero"`
+}
+
+type cacheControl struct {
+	Type string `json:"type"`         // "ephemeral"
+	TTL  string `json:"ttl,omitzero"` // "1h" when long retention is supported
 }
 
 type imageURL struct {
@@ -125,16 +140,46 @@ type toolFunction struct {
 // corresponds to a request that 400s, hangs, or silently produces no answer
 // when the default is used. A flag is added only with a named vendor and a
 // reproducing case.
+//
+// The JSON keys ARE the catalog vocabulary: a row's `compat` object is decoded
+// straight into this struct with unknown fields rejected (see CompatFor), so
+// a key this struct does not declare cannot be written into the catalog and
+// silently ignored — which is exactly how every override was being lost.
 type Compat struct {
 	UseMaxTokens            bool `json:"use_max_tokens"`
 	SupportsStore           bool `json:"supports_store"`
 	SupportsDeveloperRole   bool `json:"supports_developer_role"`
 	SupportsReasoningEffort bool `json:"supports_reasoning_effort"`
 	SupportsStrictTools     bool `json:"supports_strict_tools"`
+	// SupportsTemperature: the o-series rejects temperature and top_p
+	// outright. When false both are omitted, whatever the caller set.
+	SupportsTemperature bool `json:"supports_temperature"`
+	// SupportsLongCacheRetention gates the 1h cache TTL where cache_control
+	// is emitted at all (CacheControlFormat); false on Together, Cloudflare
+	// and Nvidia, which reject the ttl field.
+	SupportsLongCacheRetention bool `json:"supports_long_cache_retention"`
+	// SupportsFinishReason: whether finish_reason may be trusted. False on
+	// servers that never emit it, or emit one that contradicts the content;
+	// the stop reason is then inferred from the content instead.
+	SupportsFinishReason bool `json:"supports_finish_reason"`
 	// AllowsNullAssistantContent: some gateways reject content:null and want "".
 	AllowsNullAssistantContent bool `json:"allows_null_assistant_content"`
+	// AllowsUserAfterToolResult: where false, a user message directly after a
+	// tool result needs a synthetic assistant turn between them. Declared so
+	// the catalog can record it; not yet wired.
+	AllowsUserAfterToolResult bool `json:"allows_user_after_tool_result"`
 	// RequiresToolResultName: some gateways require name on a tool message.
 	RequiresToolResultName bool `json:"requires_tool_result_name"`
+	// ThinkingFormat is the wire shape for reasoning replay: openai,
+	// deepseek, together, openrouter or chat-template. Declared; not yet wired.
+	ThinkingFormat string `json:"thinking_format"`
+	// ThinkingTokenBudgetField names the reasoning-budget field on servers
+	// that share max_tokens between reasoning and the answer. Declared; not
+	// yet wired.
+	ThinkingTokenBudgetField string `json:"thinking_token_budget_field"`
+	// CacheControlFormat: "anthropic" emits cache_control on content parts
+	// (OpenRouter anthropic/* routes). Empty emits nothing.
+	CacheControlFormat string `json:"cache_control_format"`
 }
 
 // DefaultCompat is the api.openai.com profile. Every other vendor turns
@@ -145,18 +190,110 @@ func DefaultCompat() Compat {
 		SupportsDeveloperRole:      true,
 		SupportsReasoningEffort:    true,
 		SupportsStrictTools:        true,
+		SupportsTemperature:        true,
+		SupportsLongCacheRetention: true,
+		SupportsFinishReason:       true,
 		AllowsNullAssistantContent: true,
+		AllowsUserAfterToolResult:  true,
+		ThinkingFormat:             "openai",
 	}
 }
 
-// CompatFor resolves a model's profile, starting from the default and applying
-// whatever the catalog row overrides key by key.
-func CompatFor(m *core.Model) Compat {
+// ErrUnknownCompatKey is returned by CompatFor for a catalog row whose compat
+// object carries a key this profile does not declare.
+var ErrUnknownCompatKey = errors.New("agentkit: unknown compat key for openai-completions")
+
+// CompatFor resolves a model's profile (REQ-PROV-12): the default, then the
+// profile INFERRED from model.Provider and model.BaseURL, then the catalog
+// row's key-by-key overrides on top.
+//
+// An unknown key in the row is an ERROR, never ignored. The catalog rows
+// once used a vocabulary this struct did not read, and every override — the
+// o-series' max_completion_tokens rename, its temperature rejection — was
+// dropped without a sound. Failing here turns that into a request that ends
+// with a pre-closed error stream naming the key (REQ-PROV-04).
+func CompatFor(m *core.Model) (Compat, error) {
+	c := InferCompat(m)
+	if len(m.Compat) == 0 {
+		return c, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(m.Compat))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
+		return Compat{}, fmt.Errorf("%w: model %q: %v", ErrUnknownCompatKey, m.ID, err)
+	}
+	return c, nil
+}
+
+// InferCompat is the Provider+BaseURL half of REQ-PROV-12: the profile a
+// model gets before its catalog row says anything.
+//
+// Every departure from DefaultCompat below is a row of the REQ-PROV-12 table.
+// "OpenAI-compatible" is not a base-URL swap: the first request to any of
+// these hosts with the api.openai.com profile 400s on `store`, or on the
+// developer role, or on max_completion_tokens.
+func InferCompat(m *core.Model) Compat {
 	c := DefaultCompat()
-	if len(m.Compat) > 0 {
-		_ = json.Unmarshal(m.Compat, &c)
+	if m == nil {
+		return c
+	}
+	host := strings.ToLower(hostOf(m.BaseURL))
+	vendor := strings.ToLower(m.Provider)
+	if host == "" || host == "api.openai.com" {
+		return c
+	}
+	// Every non-api.openai.com host.
+	c.SupportsStore = false
+	c.SupportsDeveloperRole = false
+
+	switch {
+	case vendor == "openrouter" || host == "openrouter.ai":
+		id := strings.ToLower(m.ID)
+		if strings.HasPrefix(id, "anthropic/") || strings.HasPrefix(id, "openai/") {
+			c.SupportsDeveloperRole = true
+		}
+		if strings.HasPrefix(id, "anthropic/") {
+			c.CacheControlFormat = "anthropic"
+			c.ThinkingFormat = "openrouter"
+		}
+	case vendor == "deepseek" || strings.HasSuffix(host, "deepseek.com"):
+		c.UseMaxTokens = true
+		c.ThinkingFormat = "deepseek"
+	case vendor == "moonshot" || strings.Contains(host, "moonshot"):
+		c.UseMaxTokens = true
+		c.SupportsReasoningEffort = false
+		c.SupportsStrictTools = false
+	case vendor == "together" || strings.HasSuffix(host, "together.xyz") || strings.HasSuffix(host, "together.ai"):
+		c.UseMaxTokens = true
+		c.SupportsReasoningEffort = false
+		c.SupportsStrictTools = false
+		c.SupportsLongCacheRetention = false
+		c.ThinkingFormat = "together"
+	case vendor == "nvidia" || strings.HasSuffix(host, "api.nvidia.com"):
+		c.UseMaxTokens = true
+		c.SupportsReasoningEffort = false
+		c.SupportsStrictTools = false
+		c.SupportsLongCacheRetention = false
+	case vendor == "cloudflare" || strings.HasSuffix(host, "gateway.ai.cloudflare.com"):
+		c.UseMaxTokens = true
+		c.SupportsReasoningEffort = false
+		c.SupportsStrictTools = false
+		c.SupportsLongCacheRetention = false
+	case vendor == "xai" || strings.HasSuffix(host, "api.x.ai"):
+		c.SupportsReasoningEffort = false
 	}
 	return c
+}
+
+func hostOf(base string) string {
+	if base == "" {
+		return ""
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return base
+	}
+	return u.Hostname()
 }
 
 // NormalizeToolCallID: OpenAI accepts its own ids and is tolerant, but a
@@ -180,27 +317,51 @@ func NormalizeToolCallID(s string) string {
 
 // BuildRequest converts a canonical request into the Chat Completions body.
 // Exported for the golden and differential harnesses (NFR-TEST-06.2).
+//
+// Cache retention is read from req.Options.CacheRetention, defaulting to
+// short; Stream applies the ProviderStreamOptions default first.
 func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairReport, error) {
-	compat := CompatFor(m)
+	retention := core.CacheRetentionShort
+	if r := req.Options.CacheRetention; r != nil {
+		retention = *r
+	}
+	out, rep, _, err := buildRequest(m, req, retention)
+	return out, rep, err
+}
+
+func buildRequest(m *core.Model, req core.Request, retention core.CacheRetention) (*request, provider.RepairReport, Compat, error) {
+	compat, err := CompatFor(m)
+	if err != nil {
+		return nil, provider.RepairReport{}, compat, err
+	}
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeToolCallID))
 
 	out := &request{
-		Model:       m.ID,
-		Messages:    encodeMessages(repaired, req.System, compat),
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stop:        req.StopSequences,
-		Stream:      true,
+		Model:    m.ID,
+		Messages: encodeMessages(repaired, req.System, compat),
+		Stop:     req.StopSequences,
+		Stream:   true,
 
 		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
+	if compat.SupportsTemperature {
+		// The o-series rejects both fields outright; omitting them is the
+		// only request that is not a 400, and the 400 names sampling rather
+		// than the model, sending the reader to the wrong knob.
+		out.Temperature = req.Temperature
+		out.TopP = req.TopP
+	}
 
+	// REQ-CAT-04: the caller's max_tokens is an UPPER BOUND, clamped against
+	// what remains of the window after the loop's anchored context estimate.
+	// Absent stays absent — this wire does not require the field, and
+	// inventing one caps output the caller never asked to cap.
 	// The rename is a real vendor split, not a preference.
-	if req.MaxTokens != nil {
+	if v := catalog.ClampRequestMaxTokens(m, req); v != nil {
 		if compat.UseMaxTokens {
-			out.MaxTokens = req.MaxTokens
+			out.MaxTokens = v
 		} else {
-			out.MaxCompletionTokens = req.MaxTokens
+			out.MaxCompletionTokens = v
 		}
 	}
 
@@ -211,23 +372,29 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 	if req.Options.SessionID != "" {
 		out.PromptCacheKey = clampCacheKey(req.Options.SessionID)
 	}
-	if compat.SupportsReasoningEffort && req.ThinkingLevel != "" && req.ThinkingLevel != core.ThinkingOff {
-		out.ReasoningEffort = string(req.ThinkingLevel)
+	// REQ-PROV-15: clamp upward, then downward, and send the RETURNED wire
+	// value. `reasoning_effort: "xhigh"` to a model that does not know it is
+	// a 400, and a model with no map at all gets no key.
+	if compat.SupportsReasoningEffort && req.ThinkingLevel != core.ThinkingUnset &&
+		req.ThinkingLevel != core.ThinkingOff {
+		if _, wire, ok := catalog.ClampThinkingLevel(m, req.ThinkingLevel); ok {
+			out.ReasoningEffort = wire
+		}
 	}
 
 	for _, tw := range req.Tools {
-		raw, err := json.Marshal(tw.InputSchema)
+		params, strict, err := encodeSchema(tw, compat.SupportsStrictTools)
 		if err != nil {
-			return nil, rep, err
+			return nil, rep, compat, err
 		}
-		f := toolFunction{Name: tw.Name, Description: tw.Description, Parameters: raw}
-		if compat.SupportsStrictTools && tw.ConstrainedSampling != nil &&
-			tw.ConstrainedSampling.Type == core.ConstrainJSONSchema {
+		f := toolFunction{Name: tw.Name, Description: tw.Description, Parameters: params}
+		if strict {
 			t := true
 			f.Strict = &t
 		}
 		out.Tools = append(out.Tools, tool{Type: "function", Function: f})
 	}
+	stampCacheControl(out.Messages, retention, compat)
 
 	switch req.ToolChoice {
 	case core.ToolChoiceAuto:
@@ -235,7 +402,95 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 	case core.ToolChoiceNone:
 		out.ToolChoice = "none"
 	}
-	return out, rep, nil
+	return out, rep, compat, nil
+}
+
+// encodeSchema is REQ-TOOL-03 for this wire: the schema is PROBED through the
+// strict-subset rewrite before anything is sent, and strict:true is emitted
+// only on the rewritten schema.
+//
+// A bare strict:true on the raw schema is rejected the moment a tool has an
+// optional property or a $ref, and the 400 kills the whole request — every
+// turn carrying that tool, not just that tool. On a failed rewrite `prefer`
+// (the default) falls back to the unconstrained schema; `require` fails the
+// request with the rejection reason, which Stream turns into a pre-closed
+// error stream (REQ-PROV-04). Emission is additionally gated on the compat
+// profile's SupportsStrictTools (REQ-PROV-12): a profile that cannot emit
+// strict cannot satisfy `require` either.
+func encodeSchema(tw core.ToolWire, supportsStrict bool) (json.RawMessage, bool, error) {
+	cs := tw.ConstrainedSampling
+	wantStrict := cs != nil && cs.Type == core.ConstrainJSONSchema
+	if wantStrict {
+		var rewritten *schema.Schema
+		var err error
+		if !supportsStrict {
+			err = fmt.Errorf("agentkit: this endpoint's compat profile does not support strict tool schemas")
+		} else {
+			rewritten, err = schema.StrictSubset(tw.InputSchema)
+		}
+		switch {
+		case err == nil:
+			raw, merr := json.Marshal(rewritten)
+			if merr != nil {
+				return nil, false, merr
+			}
+			return raw, true, nil
+		case cs.Strict == core.StrictRequire:
+			return nil, false, fmt.Errorf("tool %q requires constrained sampling: %w", tw.Name, err)
+		}
+		// prefer: fall through to the unconstrained schema.
+	}
+	raw, err := json.Marshal(tw.InputSchema)
+	if err != nil {
+		return nil, false, err
+	}
+	return raw, false, nil
+}
+
+// stampCacheControl places §6.2a Level 1 breakpoints on the Chat Completions
+// wire where the compat profile says the gateway forwards them (OpenRouter's
+// anthropic/* routes): on the system text and on the last user message's
+// last text part. Everywhere else the wire has no such field and nothing is
+// emitted. The 1h TTL is emitted only where SupportsLongCacheRetention says
+// the gateway accepts it; Together, Cloudflare and Nvidia reject the field.
+func stampCacheControl(ms []message, retention core.CacheRetention, compat Compat) {
+	if compat.CacheControlFormat != "anthropic" || retention == core.CacheRetentionNone {
+		return
+	}
+	cc := &cacheControl{Type: "ephemeral"}
+	if retention == core.CacheRetentionLong && compat.SupportsLongCacheRetention {
+		cc.TTL = "1h"
+	}
+	stamp := func(msg *message) {
+		var parts []contentPart
+		switch c := msg.Content.(type) {
+		case string:
+			parts = []contentPart{{Type: "text", Text: c}}
+		case []contentPart:
+			parts = c
+		default:
+			return
+		}
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i].Type == "text" {
+				parts[i].CacheControl = cc
+				msg.Content = parts
+				return
+			}
+		}
+	}
+	lastUser := -1
+	for i := range ms {
+		switch ms[i].Role {
+		case "system", "developer":
+			stamp(&ms[i])
+		case "user":
+			lastUser = i
+		}
+	}
+	if lastUser >= 0 {
+		stamp(&ms[lastUser])
+	}
 }
 
 func clampCacheKey(s string) string {
@@ -385,4 +640,15 @@ func MapFinishReason(s string, hasToolCalls bool) core.StopReason {
 		return core.StopReasonToolUse
 	}
 	return core.StopReasonStop
+}
+
+// mapFinishReason is MapFinishReason gated on the compat profile
+// (REQ-PROV-12 SupportsFinishReason): a server whose finish_reason cannot be
+// trusted has its stop reason inferred from the content alone, as if the
+// field had never arrived. The raw string is still recorded by the caller.
+func mapFinishReason(s string, hasToolCalls bool, compat Compat) core.StopReason {
+	if !compat.SupportsFinishReason {
+		s = ""
+	}
+	return MapFinishReason(s, hasToolCalls)
 }

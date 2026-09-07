@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/agentfox/agentkit-go/core"
@@ -146,9 +147,15 @@ type blockAcc struct {
 // then reduces to `{}`, a tool call with no arguments that still validates
 // against a schema with no required properties. On the whole-response path the
 // same field IS the arguments.
-func startFrom(raw json.RawMessage, seedInput bool) *blockAcc {
+func startFrom(raw json.RawMessage, seedInput bool) (*blockAcc, error) {
 	var wb wireBlock
-	_ = json.Unmarshal(raw, &wb)
+	if err := json.Unmarshal(raw, &wb); err != nil {
+		// A content_block that does not decode is a stream error, not a block
+		// to drop: a discarded start leaves every later delta for that index
+		// with nothing to accumulate into, and the turn ends short with no
+		// message saying why (REQ-PROV-04).
+		return nil, fmt.Errorf("content_block: %w", err)
+	}
 	acc := &blockAcc{typ: wb.Type, id: wb.ID, name: wb.Name,
 		signature: wb.Signature, data: wb.Data}
 	switch wb.Type {
@@ -166,7 +173,7 @@ func startFrom(raw json.RawMessage, seedInput bool) *blockAcc {
 			acc.raw = append(json.RawMessage(nil), raw...)
 		}
 	}
-	return acc
+	return acc, nil
 }
 
 func knownBlockType(t string) bool {

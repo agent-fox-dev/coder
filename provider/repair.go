@@ -128,6 +128,12 @@ func RepairTranscript(in core.Messages, t Target) (core.Messages, RepairReport) 
 	// and fixing up thinking blocks. Tool results are held back for 2b.
 	kept := make(core.Messages, 0, len(in))
 	liveToolUse := make(map[string]bool) // tool_use ids that survived
+	// foreignToolUse is the subset of liveToolUse produced by a DIFFERENT
+	// model. Rule 5 is written "when not same_model": an id the target
+	// itself issued is already in its own format, and rewriting it anyway
+	// would rename a call the model remembers making — a prompt-cache miss
+	// at best and a confused replay at worst.
+	foreignToolUse := make(map[string]bool)
 	for _, m := range in {
 		switch v := m.(type) {
 		case core.AssistantMessage:
@@ -146,6 +152,9 @@ func RepairTranscript(in core.Messages, t Target) (core.Messages, RepairReport) 
 			for _, b := range c {
 				if tu, ok := b.(core.ToolUseBlock); ok {
 					liveToolUse[tu.ID] = true
+					if !same {
+						foreignToolUse[tu.ID] = true
+					}
 				}
 			}
 			kept = append(kept, v)
@@ -169,9 +178,10 @@ func RepairTranscript(in core.Messages, t Target) (core.Messages, RepairReport) 
 	}
 
 	// ---- Rule 5: rewrite tool-call ids for a cross-model replay, recording
-	// the mapping so every matching result is rewritten identically.
-	if t.NormalizeToolCallID != nil {
-		out = rewriteToolCallIDs(out, t, &rep)
+	// the mapping so every matching result is rewritten identically. Only
+	// ids from another model are candidates; the target's own pass through.
+	if t.NormalizeToolCallID != nil && len(foreignToolUse) > 0 {
+		out = rewriteToolCallIDs(out, t, foreignToolUse, &rep)
 	}
 
 	// ---- Rule 6: a synthetic result for every tool_use still unanswered.
@@ -234,9 +244,20 @@ func repairAssistantContent(c core.Content, sameModel bool, t Target, rep *Repai
 // result. Collisions get a deterministic suffix inside the target's budget:
 // two distinct calls must not collapse onto one id, which would make the
 // results ambiguous (ruling P-26).
-func rewriteToolCallIDs(in core.Messages, t Target, rep *RepairReport) core.Messages {
+func rewriteToolCallIDs(in core.Messages, t Target, foreign map[string]bool, rep *RepairReport) core.Messages {
 	mapping := make(map[string]string)
 	used := make(map[string]bool)
+	// The target's own ids are reserved BEFORE any rewrite is chosen, so a
+	// rewritten foreign id can never land on a native one.
+	for _, m := range in {
+		if am, ok := m.(core.AssistantMessage); ok {
+			for _, b := range am.Content {
+				if tu, ok := b.(core.ToolUseBlock); ok && !foreign[tu.ID] {
+					used[tu.ID] = true
+				}
+			}
+		}
+	}
 
 	assign := func(old string) string {
 		if n, ok := mapping[old]; ok {
@@ -261,7 +282,7 @@ func rewriteToolCallIDs(in core.Messages, t Target, rep *RepairReport) core.Mess
 		case core.AssistantMessage:
 			c := make(core.Content, 0, len(v.Content))
 			for _, b := range v.Content {
-				if tu, ok := b.(core.ToolUseBlock); ok {
+				if tu, ok := b.(core.ToolUseBlock); ok && foreign[tu.ID] {
 					tu.ID = assign(tu.ID)
 					c = append(c, tu)
 					continue

@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -207,39 +208,79 @@ func (h *httpCommon) applyHeaders(r *http.Request) {
 	}
 }
 
-// readStream pumps an SSE body until it ends, delivering `message` events.
-func (h *httpCommon) readStream(body io.ReadCloser, onEndpoint func(string)) {
-	_ = onEndpoint
+// readStream pumps one request's SSE body until it ends, delivering `message`
+// events.
+//
+// ctx is the REQUEST's context: the call's deadline joined with the
+// transport's lifetime. want is the id of the request this stream answers, or
+// unset for a notification. A stream that ends cleanly before that response
+// arrived is reported to the waiting call alone (REQ-MCP-CLIENT-02.3), not
+// to the whole transport: the other calls in flight have their own streams
+// and nothing about them has failed.
+func (h *httpCommon) readStream(ctx context.Context, body io.ReadCloser, want ID) {
 	defer body.Close()
 	dec := newSSEDecoder(body, int(h.limits.MaxMessageBytes))
+	answered := !want.IsSet()
 	for {
 		ev, err := dec.next()
 		if err != nil {
+			if ctx.Err() != nil || h.ctx.Err() != nil {
+				return // our own cancellation or shutdown, not the server's failure
+			}
 			if errors.Is(err, io.EOF) {
+				if !answered {
+					h.reportBroken(want)
+				}
 				return
 			}
-			if h.ctx.Err() != nil {
-				return // our own shutdown, not the server's failure
-			}
+			// A malformed stream poisons the transport (REQ-SEC-11.4): the
+			// framing is untrustworthy, and every stream shares the decoder
+			// rules that just failed.
 			h.fail(fmt.Errorf("mcp: reading the event stream: %w", err))
 			return
 		}
 		switch ev.name {
-		case "endpoint":
-			if onEndpoint != nil {
-				onEndpoint(string(ev.data))
-			}
 		case "", "message":
-			if len(bytes.TrimSpace(ev.data)) == 0 {
+			data := bytes.TrimSpace(ev.data)
+			if len(data) == 0 {
 				continue // a keep-alive with no payload
 			}
-			h.deliver(append([]byte(nil), ev.data...))
+			if !answered && isResponseTo(data, want) {
+				answered = true
+			}
+			h.deliver(append([]byte(nil), data...))
 		default:
 			// `ping` and vendor events are not ours to interpret, and treating
 			// an unknown event as a frame would feed the decoder garbage.
 			h.warn("ignoring sse event %q", ev.name)
 		}
 	}
+}
+
+// reportBroken hands the waiting call a synthetic error frame naming its
+// request, so the client can re-issue that one request with a new id.
+func (h *httpCommon) reportBroken(id ID) {
+	frame, err := json.Marshal(Message{JSONRPC: Version, ID: id, Error: Errorf(
+		CodeResponseStreamBroken, "the response stream ended before a response arrived")})
+	if err != nil {
+		return
+	}
+	h.deliver(frame)
+}
+
+// isResponseTo is a cheap probe: does this frame answer the request with id
+// want? It is a hint for reportBroken, not a decode — the frame goes through
+// the strict decoder on delivery regardless, so a lenient read here cannot
+// let anything through.
+func isResponseTo(frame []byte, want ID) bool {
+	var probe struct {
+		ID     ID     `json:"id"`
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(frame, &probe); err != nil {
+		return false
+	}
+	return probe.Method == "" && probe.ID.IsSet() && probe.ID.Key() == want.Key()
 }
 
 // drainAndClose reads a bounded amount of a body we are discarding, so the

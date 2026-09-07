@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,24 +55,54 @@ type ignoreLayer struct {
 	repoStart bool
 }
 
-// ignoreOptions injects the environment the engine reads, so the whole thing
-// is testable without mutating process state or requiring a git binary
-// (NFR-TEST-04).
-type ignoreOptions struct {
+// IgnoreOptions injects the environment the ignore engine reads, so the whole
+// thing is testable without mutating process state or requiring a git binary
+// (NFR-TEST-04). The zero value reads the real environment.
+//
+// It is threaded through Options so a TOOL-level test can pin an empty global
+// layer: without it find_files and search_files read the developer's own
+// global excludes, and a test passes or fails depending on whose machine runs
+// it.
+type IgnoreOptions struct {
 	Getenv func(string) string
 	Home   func() (string, error)
-	// GitConfig returns core.excludesFile. Nil runs `git config` once.
+	// GitConfig returns core.excludesFile. Nil runs `git config`.
 	GitConfig func() string
 }
 
-func (o ignoreOptions) getenv(k string) string {
+// NoGlobalExcludes returns options with an EMPTY global layer — no
+// core.excludesFile, no XDG path, no home directory — so a scan honours only
+// the ignore files found in the tree. It is what tests use; an embedder that
+// wants a hermetic tool set can use it too.
+func NoGlobalExcludes() IgnoreOptions {
+	return IgnoreOptions{
+		Getenv:    func(string) string { return "" },
+		Home:      func() (string, error) { return "", os.ErrNotExist },
+		GitConfig: func() string { return "" },
+	}
+}
+
+// cached memoizes the `git config` lookup. The global excludes path does not
+// change within a session, and find_files/search_files used to spawn git on
+// EVERY call — a subprocess per tool call for a value that is the same each
+// time (NFR-TEST-04's hidden global dependency, paid over and over).
+func (o IgnoreOptions) cached() IgnoreOptions {
+	lookup := o.GitConfig
+	if lookup == nil {
+		lookup = func() string { return gitExcludesFile(IgnoreOptions{}) }
+	}
+	o.GitConfig = sync.OnceValue(lookup)
+	return o
+}
+
+func (o IgnoreOptions) getenv(k string) string {
 	if o.Getenv != nil {
 		return o.Getenv(k)
 	}
 	return os.Getenv(k)
 }
 
-func (o ignoreOptions) home() (string, error) {
+func (o IgnoreOptions) home() (string, error) {
 	if o.Home != nil {
 		return o.Home()
 	}
@@ -86,10 +117,8 @@ type ignoreEngine struct {
 	seen   map[string]bool
 }
 
-// loadIgnore builds the engine for a scan rooted at root.
-func loadIgnore(root string) *ignoreEngine { return newIgnoreEngine(root, ignoreOptions{}) }
-
-func newIgnoreEngine(root string, opts ignoreOptions) *ignoreEngine {
+// newIgnoreEngine builds the engine for a scan rooted at root.
+func newIgnoreEngine(root string, opts IgnoreOptions) *ignoreEngine {
 	e := &ignoreEngine{root: root, seen: map[string]bool{}}
 	e.global = append(e.global, parseIgnoreFile(globalExcludesPath(opts))...)
 	// The scan root's own layer, which also carries the repository's
@@ -251,7 +280,7 @@ func parseIgnoreFile(path string) []ignorePattern {
 // the only one that reflects an explicitly configured path; the XDG locations
 // are git's own defaults, and reading them first would ignore a user who
 // pointed core.excludesFile somewhere else.
-func globalExcludesPath(opts ignoreOptions) string {
+func globalExcludesPath(opts IgnoreOptions) string {
 	if p := gitExcludesFile(opts); p != "" {
 		return p
 	}
@@ -264,7 +293,7 @@ func globalExcludesPath(opts ignoreOptions) string {
 	return ""
 }
 
-func gitExcludesFile(opts ignoreOptions) string {
+func gitExcludesFile(opts IgnoreOptions) string {
 	if opts.GitConfig != nil {
 		return opts.GitConfig()
 	}

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -13,11 +14,14 @@ import (
 // express them at all. A host would otherwise have to enumerate every issue it
 // has ever seen as a separate resource.
 type ResourceTemplate struct {
-	URITemplate string `json:"uriTemplate"`
-	Name        string `json:"name"`
-	Title       string `json:"title,omitzero"`
-	Description string `json:"description,omitzero"`
-	MimeType    string `json:"mimeType,omitzero"`
+	URITemplate string          `json:"uriTemplate"`
+	Name        string          `json:"name"`
+	Title       string          `json:"title,omitzero"`
+	Description string          `json:"description,omitzero"`
+	MimeType    string          `json:"mimeType,omitzero"`
+	Icons       json.RawMessage `json:"icons,omitzero"`
+	Annotations json.RawMessage `json:"annotations,omitzero"`
+	Meta        json.RawMessage `json:"_meta,omitzero"`
 }
 
 func (t ResourceTemplate) Validate() error {
@@ -32,7 +36,7 @@ type ResourceTemplatesListResult struct {
 	ResultType        ResultType         `json:"resultType"`
 	ResourceTemplates []ResourceTemplate `json:"resourceTemplates"`
 	NextCursor        string             `json:"nextCursor,omitzero"`
-	Meta              *ResultMeta        `json:"_meta,omitzero"`
+	Meta              json.RawMessage    `json:"_meta,omitzero"`
 	CacheHints
 }
 

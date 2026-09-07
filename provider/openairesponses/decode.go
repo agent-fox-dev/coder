@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
@@ -425,14 +426,35 @@ func (d *decoder) finish(m *core.Model, lookup func(string) *core.Model, tier pr
 		// POST HOC — the tier scales the computed cost rather than selecting a
 		// different rate table, so it composes with REQ-PROV-05.4's tiering
 		// instead of replacing it.
+		//
+		// REQ-PROV-05.6 bills the tier that SERVED the request, which the
+		// response names and which can differ from the one configured: a
+		// flex request served at standard was charged in full. The
+		// configured tier is used only when the response names the same tier
+		// (it may carry a caller-negotiated multiplier) or none at all.
 		final.Usage.SetCost(provider.ApplyServiceTier(
-			provider.ComputeCost(billModel, final.Usage), tier))
+			provider.ComputeCost(billModel, final.Usage), d.servedTier(tier)))
 	}
 
 	d.s.Push(core.MessageEndEvent{Message: final})
 	d.s.End(core.StreamResult{Message: &final})
 }
 
+func (d *decoder) servedTier(configured provider.ServiceTier) provider.ServiceTier {
+	if d.tier == "" || strings.EqualFold(d.tier, configured.Name) {
+		return configured
+	}
+	if known, ok := provider.KnownServiceTier(d.tier); ok {
+		return known
+	}
+	return configured
+}
+
+// fail is REQ-PROV-04: the partial content and the failure are ONE value, and
+// the stream carries a terminal ErrorEvent before MessageEnd — the sequence
+// faux, the normative double, emits and every other wire matches. An abort
+// carries no ErrorEvent: it is the caller's own doing, not a failure to
+// report (REQ-LOOP-09).
 func (d *decoder) fail(text string, err error) {
 	final := d.partial
 	final.Content = d.snapshot()
@@ -446,6 +468,7 @@ func (d *decoder) fail(text string, err error) {
 	}
 	final.StopReason = core.StopReasonError
 	final.ErrorMessage = text
+	d.s.Push(core.ErrorEvent{Message: text, Err: err, Terminal: true})
 	d.s.Push(core.MessageEndEvent{Message: final})
 	d.s.End(core.StreamResult{Message: &final, Err: err})
 }

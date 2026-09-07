@@ -29,4 +29,15 @@ var (
 	// a deferred response would become "an empty completion" — the exact
 	// failure reserving the constant is supposed to prevent.
 	ErrDeferredUnsupported = errors.New("agentkit: provider returned a deferred response; v1 has no poller")
+
+	// ErrUnguardedExecute is OQ-8's resolution: a run whose tool set carries a
+	// shell tool (execute, run_command, powershell) and whose config has no
+	// BeforeToolCall interceptor fails BEFORE the first request. A headless
+	// embedder with no policy would otherwise hand the model an unrestricted
+	// shell by omission. Supply an interceptor — RestrictedPolicy is the
+	// shipped starting point — or pass AllowAllToolCalls to say so explicitly.
+	ErrUnguardedExecute = errors.New(
+		"agentkit: a shell tool is registered but AgentConfig.BeforeToolCall is nil; " +
+			"supply an interceptor (agentkit.RestrictedPolicy is the shipped starting point) " +
+			"or agentkit.AllowAllToolCalls to opt out explicitly (OQ-8)")
 )

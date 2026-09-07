@@ -117,17 +117,24 @@ func Do(ctx context.Context, hc *http.Client, newReq func() (*http.Request, erro
 			continue
 		}
 
-		retry, serverDelay, derr := shouldRetry(resp, p)
-		if derr != nil {
-			drain(resp)
-			return nil, derr
-		}
+		retry, serverDelay, dictated := shouldRetry(resp, p)
 		if !retry || attempt >= p.MaxRetries {
 			return resp, nil
 		}
+		// The MaxRetryDelay ceiling is evaluated ONLY once a retry would
+		// otherwise be attempted. A non-retryable 400 carrying Retry-After
+		// 3600 is a response the caller must see — its body names what was
+		// wrong with the request — not a delay to be judged; abandoning it
+		// with ErrRetryDelayTooLong discarded the one diagnostic there was
+		// (REQ-PROV-13).
+		if dictated && serverDelay > p.MaxRetryDelay {
+			drain(resp)
+			return nil, fmt.Errorf("%w: server asked for %s, ceiling is %s (status %d)",
+				ErrRetryDelayTooLong, serverDelay, p.MaxRetryDelay, resp.StatusCode)
+		}
 
 		d := backoffDelay(p, attempt)
-		if serverDelay > 0 {
+		if dictated {
 			// A server-dictated delay WINS over computed backoff. The server
 			// knows when its window reopens; our exponential curve is a guess.
 			d = serverDelay
@@ -140,15 +147,10 @@ func Do(ctx context.Context, hc *http.Client, newReq func() (*http.Request, erro
 }
 
 // shouldRetry applies the status policy and reads the server-dictated delay.
-//
-// The returned error is the REQ-PROV-13 abandonment: a delay above the ceiling
-// fails the request outright instead of being clamped.
-func shouldRetry(resp *http.Response, p RetryPolicy) (bool, time.Duration, error) {
-	delay, ok := serverDelay(resp.Header, p.Now())
-	if ok && delay > p.MaxRetryDelay {
-		return false, 0, fmt.Errorf("%w: server asked for %s, ceiling is %s (status %d)",
-			ErrRetryDelayTooLong, delay, p.MaxRetryDelay, resp.StatusCode)
-	}
+// dictated reports whether the server named one at all; the caller compares
+// it against the ceiling only if it is about to retry.
+func shouldRetry(resp *http.Response, p RetryPolicy) (retry bool, delay time.Duration, dictated bool) {
+	delay, dictated = serverDelay(resp.Header, p.Now())
 
 	// x-should-retry OVERRIDES the status logic ENTIRELY, in BOTH directions.
 	// A 200 with `x-should-retry: true` is retried and a 503 with
@@ -157,18 +159,18 @@ func shouldRetry(resp *http.Response, p RetryPolicy) (bool, time.Duration, error
 	// stops a client hammering a server that has already said not to.
 	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("x-should-retry"))) {
 	case "true":
-		return true, delay, nil
+		return true, delay, dictated
 	case "false":
-		return false, 0, nil
+		return false, 0, false
 	}
 
 	switch {
 	case resp.StatusCode == 408, resp.StatusCode == 409, resp.StatusCode == 429:
-		return true, delay, nil
+		return true, delay, dictated
 	case resp.StatusCode >= 500:
-		return true, delay, nil
+		return true, delay, dictated
 	}
-	return false, 0, nil
+	return false, 0, false
 }
 
 // serverDelay reads the dictated delay in REQ-PROV-13's order: retry-after-ms,

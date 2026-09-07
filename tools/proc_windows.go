@@ -38,6 +38,12 @@ func killGroup(cmd *exec.Cmd) {
 	}
 }
 
+// signalExitCode never claims a signal on Windows: a wait status there carries
+// none, and tool output must not report what it cannot observe
+// (NFR-COMPAT-06). A tree killed by taskkill reports the exit code Windows
+// assigns it.
+func signalExitCode(*exec.ExitError) (int, bool) { return 0, false }
+
 func resolveShell() (string, []string, error) {
 	// Git Bash, or a hard error naming what was searched. Never cmd.exe: the
 	// grammar differs so completely that a command written for bash does not

@@ -39,7 +39,7 @@ type ServerOptions struct {
 	Audit  func(core.AuditEvent)
 	Warnf  func(format string, args ...any)
 	Limits wire.Limits
-	// Instructions is the optional free-text hint returned by initialize.
+	// Instructions is the optional free-text hint returned by server/discover.
 	Instructions string
 	// PageSize bounds a tools/list or resources/list page. Zero means one
 	// page: pagination costs a round trip, and a server with nine tools
@@ -118,7 +118,7 @@ func NewServer(opts ServerOptions) *Server {
 // already registered, and getting that wrong is worse than the override.
 //
 // A change after a client has connected emits notifications/tools/list_changed
-// to every live session. The initialize handshake advertises
+// to every session that subscribed to it. server/discover advertises
 // `tools.listChanged: true`, and a capability we advertise but never honour is
 // worse than one we never claimed: a client that trusts it caches a tool list
 // forever.
@@ -440,20 +440,32 @@ func NeedSampling(state, key string, p SamplingParams) error {
 	})
 }
 
+// MaxConcurrentHandlers bounds the handler goroutines one stdio session may
+// have running at once.
+//
+// Without it a client is the only thing deciding how many goroutines this
+// process runs: every request it writes is a goroutine until the handler
+// finishes, and a request that never finishes (a slow tool, a listen stream)
+// is a goroutine for the life of the session. Past the cap the read loop
+// stops reading, which is back-pressure rather than a dropped request — the
+// peer's writes block until a handler completes.
+const MaxConcurrentHandlers = 64
+
 // Serve runs the protocol over one transport until it ends (REQ-MCP-SERVER-02,
 // stdio mode).
 //
 // Each request is dispatched on its OWN goroutine. That is not an
-// optimization: a handler calling RequestSampling waits for a response that
-// arrives on this same transport, so a synchronous dispatch loop would be
-// blocked inside the handler and could never read it. Serving one request at a
-// time and supporting sampling are mutually exclusive.
+// optimization: subscriptions/listen holds its request open for the life of
+// the stream, and notifications/cancelled arrives on this same transport
+// while the handler it cancels is still running. A synchronous dispatch loop
+// would be blocked inside the handler and could never read either.
 //
 // Responses may therefore be written out of order. JSON-RPC correlates by id
 // and permits it.
 func (s *Server) Serve(ctx context.Context, tr Transport) error {
 	sess := &serverSession{tr: tr, corr: newCorrelator(), inflight: map[string]*inflightRequest{}}
 	ctx = context.WithValue(ctx, sessionKey{}, sess)
+	slots := make(chan struct{}, MaxConcurrentHandlers)
 
 	s.mu.Lock()
 	s.sessions[sess] = struct{}{}
@@ -496,8 +508,7 @@ func (s *Server) Serve(ctx context.Context, tr Transport) error {
 			// safe place to resume — and an MCP server that resynchronizes
 			// lets a peer choose where the next message starts.
 			s.warnf("undecodable frame; tearing the connection down: %v", derr)
-			sess.send(Message{JSONRPC: Version,
-				Error: Errorf(CodeParseError, "malformed message: %v", derr)})
+			sess.sendRaw(parseErrorFrame(derr))
 			return derr
 		}
 
@@ -512,29 +523,27 @@ func (s *Server) Serve(ctx context.Context, tr Transport) error {
 			continue
 		}
 
-		reqCtx, cancel := context.WithCancel(ctx)
-		// initialize is exempt: the spec says it MUST NOT be cancelled, and
-		// tracking it would let a client cancel the handshake it is in the
-		// middle of and leave the session permanently un-initialized.
-		var tracked *inflightRequest
-		if m.Method != MethodInitialize {
-			tracked = sess.track(m.ID.Key(), cancel)
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
+		reqCtx, cancel := context.WithCancel(ctx)
+		tracked := sess.track(m.ID.Key(), cancel)
 
 		wg.Add(1)
 		go func(m Message) {
 			defer wg.Done()
+			defer func() { <-slots }()
 			defer cancel()
-			if tracked != nil {
-				defer sess.untrack(m.ID.Key())
-			}
+			defer sess.untrack(m.ID.Key())
 
 			result, rpcErr := s.dispatch(reqCtx, &m)
 
 			// A cancelled request is answered with silence. Sending a result
 			// the client has already stopped waiting for makes it look like a
 			// response to whatever it asked next.
-			if tracked != nil && tracked.cancelled.Load() {
+			if tracked.cancelled.Load() {
 				return
 			}
 
@@ -586,24 +595,40 @@ func (sess *serverSession) send(m Message) {
 	if err != nil {
 		return
 	}
+	sess.sendRaw(raw)
+}
+
+func (sess *serverSession) sendRaw(raw []byte) {
 	sess.sendMu.Lock()
 	defer sess.sendMu.Unlock()
 	_ = sess.tr.Send(raw)
 }
 
+// parseErrorFrame is the reply to a frame that could not be decoded.
+//
+// JSON-RPC 2.0 §5 requires `"id": null` when the id could not be read.
+// Message omits an unset id — that is how a notification is written — so the
+// null has to be spelled out here rather than left to the struct tag.
+func parseErrorFrame(derr error) []byte {
+	raw, err := json.Marshal(struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   *Error          `json:"error"`
+	}{Version, json.RawMessage("null"), Errorf(CodeParseError, "malformed message: %v", derr)})
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
 // dispatch handles one request and returns the result or a JSON-RPC error. It
 // is shared by the stdio loop and the HTTP mode.
 func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
-	sess, _ := ctx.Value(sessionKey{}).(*serverSession)
-
-	// Initialize-first, on connection-oriented transports only.
-	//
 	// 2026-07-28 has no handshake to enforce ordering against. What replaces
 	// it is a PER-REQUEST check: the version and capabilities arrive in
 	// `_meta` on every request, and a request that names a version we do not
 	// speak is rejected on its own rather than failing a connection nobody
 	// opened.
-	_ = sess
 	if rpcErr := s.checkVersion(m); rpcErr != nil {
 		return nil, rpcErr
 	}
@@ -635,7 +660,7 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 			SupportedVersions: SupportedProtocolVersions(),
 			Capabilities:      caps,
 			Instructions:      s.opts.Instructions,
-			Meta:              &ResultMeta{ServerInfo: &s.opts.Info},
+			Meta:              s.meta(),
 			CacheHints:        s.cacheHints(),
 		}, nil
 
@@ -649,7 +674,7 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 		}
 		s.mu.RLock()
 		names, next, perr := s.page(s.toolOrder, p.Cursor)
-		out := ToolsListResult{ResultType: ResultComplete, Meta: &ResultMeta{ServerInfo: &s.opts.Info},
+		out := ToolsListResult{ResultType: ResultComplete, Meta: s.meta(),
 			CacheHints: s.cacheHints(),
 			Tools:      make([]ToolDefinition, 0, len(names)), NextCursor: next}
 		for _, n := range names {
@@ -696,7 +721,7 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 				out := InputRequiredResult{
 					ResultType:   ResultInputRequired,
 					RequestState: need.RequestState,
-					Meta:         &ResultMeta{ServerInfo: &s.opts.Info},
+					Meta:         s.meta(),
 				}
 				if len(need.Requests) > 0 {
 					out.InputRequests = make(map[string]json.RawMessage, len(need.Requests))
@@ -723,7 +748,7 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 		}
 		s.mu.RLock()
 		uris, next, perr := s.page(s.resOrder, p.Cursor)
-		out := ResourcesListResult{ResultType: ResultComplete, Meta: &ResultMeta{ServerInfo: &s.opts.Info},
+		out := ResourcesListResult{ResultType: ResultComplete, Meta: s.meta(),
 			CacheHints: s.cacheHints(),
 			Resources:  make([]Resource, 0, len(uris)), NextCursor: next}
 		for _, u := range uris {
@@ -738,7 +763,7 @@ func (s *Server) dispatch(ctx context.Context, m *Message) (any, *Error) {
 	case MethodResourceTemplatesList:
 		s.mu.RLock()
 		out := ResourceTemplatesListResult{
-			ResultType: ResultComplete, Meta: &ResultMeta{ServerInfo: &s.opts.Info},
+			ResultType: ResultComplete, Meta: s.meta(),
 			CacheHints:        s.cacheHints(),
 			ResourceTemplates: make([]ResourceTemplate, 0, len(s.templates)),
 		}
@@ -836,11 +861,16 @@ func (s *Server) capabilities() ServerCapabilities {
 // handler written by a host does not have to know about them.
 func (s *Server) stampRead(res ResourcesReadResult) ResourcesReadResult {
 	res.ResultType = ResultComplete
-	if res.Meta == nil {
-		res.Meta = &ResultMeta{ServerInfo: &s.opts.Info}
+	if len(res.Meta) == 0 {
+		res.Meta = s.meta()
 	}
 	res.CacheHints = s.cacheHints()
 	return res
+}
+
+// meta is the `_meta` every result carries: this server's identity.
+func (s *Server) meta() json.RawMessage {
+	return ResultMeta{ServerInfo: &s.opts.Info}.JSON()
 }
 
 func (s *Server) cacheHints() CacheHints {
@@ -870,15 +900,13 @@ func mustJSON(v any) json.RawMessage {
 // means the server tore the subscription down.
 //
 // It therefore blocks a dispatch goroutine for the life of the stream, which
-// is only safe because Serve dispatches each request on its own goroutine.
+// is safe because Serve dispatches each request on its own goroutine and
+// serveListen gives the HTTP request its own.
 func (s *Server) listen(ctx context.Context, m *Message) (any, *Error) {
 	sess, _ := ctx.Value(sessionKey{}).(*serverSession)
 	if sess == nil {
-		// HTTP mode answers one request per connection and returns; there is
-		// no session object to hang a long-lived stream on. Saying so beats
-		// holding the request open forever and returning nothing.
-		return nil, Errorf(CodeInvalidRequest,
-			"subscriptions/listen needs a connection-oriented transport")
+		return nil, Errorf(CodeInternalError,
+			"subscriptions/listen was dispatched without a session")
 	}
 	var p SubscriptionsListenParams
 	if err := decodeParams(m.Params, &p, s.opts.Limits); err != nil {
@@ -916,7 +944,7 @@ func (s *Server) listen(ctx context.Context, m *Message) (any, *Error) {
 	id := m.ID
 	return SubscriptionsListenResult{
 		ResultType: ResultComplete,
-		Meta:       &ResultMeta{ServerInfo: &s.opts.Info, SubscriptionID: &id},
+		Meta:       ResultMeta{ServerInfo: &s.opts.Info, SubscriptionID: &id}.JSON(),
 	}, nil
 }
 
@@ -1117,21 +1145,27 @@ func (s *Server) HTTPHandler(opts HTTPOptions) (http.Handler, error) {
 
 		var m Message
 		if derr := decodeFrame(body, &m, s.opts.Limits); derr != nil {
-			writeRPC(w, Message{JSONRPC: Version,
-				Error: Errorf(CodeParseError, "malformed message: %v", derr)})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(parseErrorFrame(derr))
+			return
+		}
+		// Header/body agreement (-32020), BEFORE a notification is accepted.
+		// The headers exist so a gateway can route without parsing the body;
+		// if the two disagree, the gateway and the server are acting on
+		// different requests, which is the exact split this check exists to
+		// prevent — and a notification routed on the wrong header is still a
+		// mis-routed message, not a 202.
+		if mismatch := validateRoutingHeaders(r.Header, &m); mismatch != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			writeRPC(w, Message{JSONRPC: Version, ID: m.ID, Error: mismatch})
 			return
 		}
 		if m.IsNotification() {
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
-		// Header/body agreement (-32020). The headers exist so a gateway can
-		// route without parsing the body; if the two disagree, the gateway and
-		// the server are acting on different requests, which is the exact
-		// split this check exists to prevent.
-		if mismatch := validateRoutingHeaders(r.Header, &m); mismatch != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			writeRPC(w, Message{JSONRPC: Version, ID: m.ID, Error: mismatch})
+		if m.Method == MethodSubscriptionsListen {
+			s.serveListen(w, r, &m)
 			return
 		}
 
@@ -1154,6 +1188,109 @@ func (s *Server) HTTPHandler(opts HTTPOptions) (http.Handler, error) {
 		}
 		writeRPC(w, out)
 	}), nil
+}
+
+// serveListen is subscriptions/listen over HTTP (REQ-MCP-SERVER-06.5).
+//
+// It is the one request whose response is a STREAM: the handler answers with
+// text/event-stream, keeps the response open with a session that lives
+// exactly as long as this request, flushes each subscribed notification as
+// an SSE event, and ends when the client disconnects — which under
+// 2026-07-28 is how a client cancels a listen, since there is no session for
+// a notifications/cancelled to name.
+//
+// Validation runs BEFORE the stream is committed. Once a 200 with an event
+// stream has gone out, a refusal can only be an event on it; a client is far
+// better served by an ordinary JSON error it can correlate.
+func (s *Server) serveListen(w http.ResponseWriter, r *http.Request, m *Message) {
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		writeRPC(w, Message{JSONRPC: Version, ID: m.ID,
+			Error: Errorf(CodeInternalError, "this server cannot stream a response")})
+		return
+	}
+	if rpcErr := s.checkVersion(m); rpcErr != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeRPC(w, Message{JSONRPC: Version, ID: m.ID, Error: rpcErr})
+		return
+	}
+	var p SubscriptionsListenParams
+	if err := decodeParams(m.Params, &p, s.opts.Limits); err != nil {
+		writeRPC(w, Message{JSONRPC: Version, ID: m.ID, Error: Errorf(CodeInvalidParams, "%v", err)})
+		return
+	}
+	if !p.Notifications.Any() {
+		writeRPC(w, Message{JSONRPC: Version, ID: m.ID, Error: Errorf(CodeInvalidParams,
+			"subscriptions/listen must opt in to at least one notification type")})
+		return
+	}
+
+	tr := &sseResponseTransport{w: w, fl: fl}
+	sess := &serverSession{tr: tr, corr: newCorrelator(), inflight: map[string]*inflightRequest{}}
+	s.mu.Lock()
+	s.sessions[sess] = struct{}{}
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	fl.Flush()
+
+	ctx := context.WithValue(r.Context(), sessionKey{}, sess)
+	result, rpcErr := s.dispatch(ctx, m) // returns when the client goes away
+
+	// Out of the registry BEFORE the final write and the close, so no
+	// registration racing this return writes to a ResponseWriter the handler
+	// has already given back.
+	s.mu.Lock()
+	delete(s.sessions, sess)
+	s.mu.Unlock()
+
+	out := Message{JSONRPC: Version, ID: m.ID, Error: rpcErr}
+	if rpcErr == nil {
+		raw, merr := json.Marshal(result)
+		if merr != nil {
+			out.Error = Errorf(CodeInternalError, "%v", merr)
+		} else {
+			out.Result = raw
+		}
+	}
+	sess.send(out)
+	_ = tr.Close()
+}
+
+// sseResponseTransport is the server end of an HTTP listen stream: frames go
+// out as SSE events on the still-open response. Nothing arrives on a response,
+// so Receive is never called; Close fences the ResponseWriter off, because it
+// is invalid the moment the handler returns and a late notification must not
+// reach it.
+type sseResponseTransport struct {
+	mu     sync.Mutex
+	w      http.ResponseWriter
+	fl     http.Flusher
+	closed bool
+}
+
+func (t *sseResponseTransport) Send(msg []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return ErrTransportClosed
+	}
+	if _, err := fmt.Fprintf(t.w, "event: message\ndata: %s\n\n", msg); err != nil {
+		return err
+	}
+	t.fl.Flush()
+	return nil
+}
+
+func (t *sseResponseTransport) Receive() ([]byte, error) { return nil, ErrTransportClosed }
+
+func (t *sseResponseTransport) Close() error {
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
+	return nil
 }
 
 // authorized compares in CONSTANT TIME.

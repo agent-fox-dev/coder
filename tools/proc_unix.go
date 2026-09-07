@@ -30,6 +30,18 @@ func killGroup(cmd *exec.Cmd) {
 	}
 }
 
+// signalExitCode reports a signal-killed child as 128+signum, the convention
+// every unix shell uses for $? (NFR-COMPAT-06). Go's ExitCode() returns -1 for
+// the same case, which no shell script, CI matcher or human reads as "killed
+// by SIGKILL".
+func signalExitCode(ee *exec.ExitError) (int, bool) {
+	ws, ok := ee.Sys().(syscall.WaitStatus)
+	if !ok || !ws.Signaled() {
+		return 0, false
+	}
+	return 128 + int(ws.Signal()), true
+}
+
 func resolveShell() (string, []string, error) {
 	// Fixed ladder. $SHELL is deliberately not consulted: it names the user's
 	// INTERACTIVE shell, and a command written for bash is not portable to

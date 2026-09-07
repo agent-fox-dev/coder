@@ -140,7 +140,6 @@ func TestTOMLUnsupportedValueSkipsOnlyItsOwnKey(t *testing.T) {
 	for _, tc := range []struct {
 		name, src, want string
 	}{
-		{"float", `weight = 0.5`, "floats"},
 		{"datetime", `built = 1979-05-27T07:32:00Z`, "dates"},
 		{"inline table", `t = { a = "b" }`, "inline tables"},
 		{"multi-line string", "s = \"\"\"a\nb\"\"\"", "multi-line"},
@@ -163,6 +162,29 @@ func TestTOMLUnsupportedValueSkipsOnlyItsOwnKey(t *testing.T) {
 				t.Fatalf("severity = %q, want warning", diags[0].Severity)
 			}
 		})
+	}
+}
+
+// TestTOMLParsesFloats: REQ-MCP-CLIENT-07 writes its default as `30.0`, and a
+// reader that rejected floats dropped the requirement's own example.
+func TestTOMLParsesFloats(t *testing.T) {
+	tbl, diags := mustParse(t, "a = 30.0\nb = 2.5\nc = 6.626e-34\nd = 1_000.5\ne = -inf\nf = 1e3\n")
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %v", diags)
+	}
+	for key, want := range map[string]float64{"a": 30, "b": 2.5, "c": 6.626e-34, "d": 1000.5, "f": 1000} {
+		v, ok := tbl.Get(key)
+		if !ok || v.Kind != KindFloat || v.Float != want {
+			t.Fatalf("%s = %+v, want float %v", key, v, want)
+		}
+	}
+	if v, _ := tbl.Get("e"); v.Kind != KindFloat || v.Float > -1e308 {
+		t.Fatalf("e = %+v, want -inf", v)
+	}
+	// An integer is still an integer: nothing here widens `30` to a float.
+	tbl, _ = mustParse(t, "n = 30\n")
+	if v, _ := tbl.Get("n"); v.Kind != KindInt {
+		t.Fatalf("n = %+v, want int", v)
 	}
 }
 

@@ -39,8 +39,14 @@ const (
 	// on every subsequent load, by design.
 	RepairMalformedInterior RepairKind = "malformed_interior_line"
 
-	// RepairMissingHeader: line 1 is not a session header. A header is
-	// synthesized and line 1 is reconsidered as an entry.
+	// RepairMissingHeader: line 1 is not a session header. A default header
+	// is synthesized IN MEMORY and line 1 is reconsidered as an entry. The
+	// file is not given a header: a header is line 1 by definition
+	// (REQ-SESS-01), an append-only log is not rewritten in place, and a
+	// "session" line appended after existing entries would load as an
+	// unknown entry type rather than as the header. So, like
+	// RepairMalformedInterior, this repair is reported on every subsequent
+	// load, by design.
 	RepairMissingHeader RepairKind = "missing_header"
 
 	// RepairUnknownEntryType: an entry type this build does not model

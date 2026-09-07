@@ -17,7 +17,7 @@ func toolNamed(t *testing.T, root, name string) coreTool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	all, err := tools.All(tools.Options{Workspace: ws, Env: os.Environ()})
+	all, err := tools.All(tools.Options{Workspace: ws, Env: os.Environ(), Ignore: tools.NoGlobalExcludes()})
 	if err != nil {
 		t.Fatal(err)
 	}

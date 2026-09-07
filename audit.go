@@ -72,6 +72,20 @@ func (a *Agent) audit(e core.AuditEvent) {
 		e.SessionID = a.sessionID()
 	}
 
+	// REQ-OBS-03: session start and end fire for ALL registered hooks — the
+	// config's own and every EventHookPlugin in the registry. The plugins
+	// are read under the lock alongside the hooks and invoked outside it,
+	// each through its own recovering wrapper: a plugin is third-party code,
+	// and one that panics on session start must not take the run — or the
+	// other plugins' notifications — with it.
+	a.mu.Lock()
+	reg := a.cfg.Plugins
+	a.mu.Unlock()
+	var plugins []core.EventHookPlugin
+	if reg != nil {
+		plugins = reg.EventHooks()
+	}
+
 	switch e.Kind {
 	case core.AuditSessionStart:
 		safely(h.OnError, "OnSessionStart", func() {
@@ -79,12 +93,20 @@ func (a *Agent) audit(e core.AuditEvent) {
 				h.OnSessionStart(e)
 			}
 		})
+		for _, p := range plugins {
+			p := p
+			safely(h.OnError, "plugin "+p.PluginName()+" OnSessionStart", func() { p.OnSessionStart(e) })
+		}
 	case core.AuditSessionEnd:
 		safely(h.OnError, "OnSessionEnd", func() {
 			if h.OnSessionEnd != nil {
 				h.OnSessionEnd(e)
 			}
 		})
+		for _, p := range plugins {
+			p := p
+			safely(h.OnError, "plugin "+p.PluginName()+" OnSessionEnd", func() { p.OnSessionEnd(e) })
+		}
 	}
 	safely(h.OnError, "OnAudit", func() {
 		if h.OnAudit != nil {

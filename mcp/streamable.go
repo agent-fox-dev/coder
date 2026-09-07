@@ -37,17 +37,52 @@ func StartStreamableHTTP(ctx context.Context, opts HTTPTransportOptions) (*Strea
 	return &StreamableHTTPTransport{httpCommon: c}, nil
 }
 
-var _ Transport = (*StreamableHTTPTransport)(nil)
+var (
+	_ Transport     = (*StreamableHTTPTransport)(nil)
+	_ ContextSender = (*StreamableHTTPTransport)(nil)
+)
 
+// Send posts under the transport's own lifetime. The client does not use it —
+// it calls SendContext — but a caller driving the transport directly gets the
+// same behaviour with no deadline.
 func (t *StreamableHTTPTransport) Send(frame []byte) error {
+	return t.SendContext(t.ctx, frame)
+}
+
+// SendContext posts one frame and reads its answer under ctx.
+//
+// The request context is ctx joined with the transport's: a call's deadline
+// cancels the POST, the body read and — for an SSE-answered request — the
+// stream, and closing the transport cancels all of them too. Before this the
+// body was read under the transport context alone, so REQ-MCP-CLIENT-07's
+// timeout_s expired on a context nothing here was watching.
+func (t *StreamableHTTPTransport) SendContext(ctx context.Context, frame []byte) error {
 	if err := t.ctx.Err(); err != nil {
 		return ErrTransportClosed
 	}
-	resp, err := t.post(t.ctx, frame)
+	reqCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(t.ctx, cancel)
+	release := func() { stop(); cancel() }
+
+	resp, err := t.post(reqCtx, frame)
 	if err != nil {
+		release()
+		if t.ctx.Err() != nil {
+			return ErrTransportClosed
+		}
 		return err
 	}
-	return t.consume(resp)
+	return t.consume(reqCtx, release, resp, frameID(frame))
+}
+
+// frameID reads the id of a frame WE built, so the stream reader knows which
+// request it is answering. The bytes are ours, hence encoding/json.
+func frameID(frame []byte) ID {
+	var probe struct {
+		ID ID `json:"id"`
+	}
+	_ = json.Unmarshal(frame, &probe)
+	return probe.ID
 }
 
 // routingHeaders derives the required headers FROM THE BODY.
@@ -162,16 +197,20 @@ func (t *StreamableHTTPTransport) post(ctx context.Context, frame []byte) (*http
 	return t.hc.Do(req)
 }
 
-// consume handles one POST response.
-func (t *StreamableHTTPTransport) consume(resp *http.Response) error {
+// consume handles one POST response. release ends the request context and is
+// called once the response has been fully consumed, whichever goroutine that
+// happens on.
+func (t *StreamableHTTPTransport) consume(ctx context.Context, release func(), resp *http.Response, id ID) error {
 	switch {
 	case resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusNoContent:
+		defer release()
 		// A notification. There is nothing to read, and reading anyway would
 		// hold the connection open.
 		drainAndClose(resp.Body, 4<<10)
 		return nil
 
 	case resp.StatusCode >= 400:
+		defer release()
 		body := drainAndClose(resp.Body, 8<<10)
 		// A 400 may carry a JSON-RPC error the caller needs to act on —
 		// -32022 names the versions the server speaks, -32020 says the
@@ -194,10 +233,15 @@ func (t *StreamableHTTPTransport) consume(resp *http.Response) error {
 		// be after several notifications. Reading it on this goroutine would
 		// block Send until then, and Send is on the caller's request path.
 		t.wg.Add(1)
-		go func() { defer t.wg.Done(); t.readStream(resp.Body, nil) }()
+		go func() {
+			defer t.wg.Done()
+			defer release()
+			t.readStream(ctx, resp.Body, id)
+		}()
 		return nil
 
 	case isJSON(ct):
+		defer release()
 		defer resp.Body.Close()
 		// Bounded before allocating (REQ-SEC-11.2). The extra byte is how an
 		// over-limit body is detected rather than silently truncated into a
@@ -205,6 +249,12 @@ func (t *StreamableHTTPTransport) consume(resp *http.Response) error {
 		max := t.limits.MaxMessageBytes
 		body, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 		if err != nil {
+			if ctx.Err() != nil {
+				// The caller's deadline, not the server's failure: report it
+				// as such so the call surfaces a timeout rather than a
+				// transport error that sends the reader to the wrong place.
+				return ctx.Err()
+			}
 			return fmt.Errorf("mcp: reading the response body: %w", err)
 		}
 		if int64(len(body)) > max {
@@ -217,6 +267,7 @@ func (t *StreamableHTTPTransport) consume(resp *http.Response) error {
 		return nil
 	}
 
+	release()
 	drainAndClose(resp.Body, 4<<10)
 	return fmt.Errorf("mcp: server answered a POST with content-type %q; want "+
 		"application/json or text/event-stream", ct)

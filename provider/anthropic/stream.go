@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
 )
@@ -161,6 +162,11 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 		accs: map[int]*blockAcc{},
 	}
 
+	// caller is the ctx the caller handed to Stream; ctx below may be a
+	// TimeoutMs-derived child of it. The two are kept apart because their
+	// expiries mean different things: the caller's is an abort (REQ-LOOP-09),
+	// the derived one a retryable timeout (REQ-PROV-18).
+	caller := ctx
 	if to := req.Options.TimeoutMs; to != nil && *to > 0 {
 		// A per-request timeout INDEPENDENT of the caller's context deadline
 		// (REQ-PROV-18). It must not outlive this function, hence the defer.
@@ -172,7 +178,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	env := provider.Env{Override: req.Options.Env, Getenv: c.opts.Getenv}
 	auth, err := provider.ResolveAuthWith(ctx, m.Provider, c.opts.Credentials, VendorAuth, env)
 	if err != nil {
-		d.fail(provider.TransportErrorText("anthropic", ctx, err), err)
+		d.fail(provider.TransportErrorText("anthropic", caller, ctx, err), err)
 		return
 	}
 
@@ -196,7 +202,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 
 	resp, err := call.Do(ctx)
 	if err != nil {
-		d.fail(transportError(ctx, err), err)
+		d.fail(transportError(caller, ctx, err), err)
 		return
 	}
 	defer resp.Body.Close()
@@ -216,7 +222,10 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 
 	d.emitStart()
 	if err := d.consume(provider.NewSSEReader(resp.Body, c.opts.MaxSSEEventBytes)); err != nil {
-		d.fail(err.Error(), err)
+		// A cancellation lands here as whatever the body reader reported —
+		// an EOF, a "context canceled" — and only the contexts say which of
+		// REQ-LOOP-09's abort or REQ-PROV-18's timeout it was.
+		d.fail(provider.StreamErrorText("anthropic", caller, ctx, err), err)
 		return
 	}
 	d.finish(m, c.opts.BillingLookup)
@@ -235,11 +244,11 @@ func defaultBase(configured string) string {
 // can classify (REQ-PROV-14). A cancellation is normalized separately by the
 // caller; everything else keeps the underlying text, because that text is
 // where "getaddrinfo", "connection reset" and "EOF" live.
-func transportError(ctx context.Context, err error) string {
+func transportError(caller, req context.Context, err error) string {
 	if errors.Is(err, provider.ErrRetryDelayTooLong) {
 		return err.Error()
 	}
-	return provider.TransportErrorText("anthropic", ctx, err)
+	return provider.TransportErrorText("anthropic", caller, req, err)
 }
 
 // statusError builds the error text for a non-2xx response.
@@ -345,7 +354,10 @@ func (d *decodeState) event(ev provider.SSEEvent) error {
 		if err := json.Unmarshal(ev.Data, &p); err != nil {
 			return fmt.Errorf("anthropic: content_block_start: %w", err)
 		}
-		acc := startFrom(p.Block, false)
+		acc, err := startFrom(p.Block, false)
+		if err != nil {
+			return fmt.Errorf("anthropic: content_block_start: %w", err)
+		}
 		d.accs[p.Index] = acc
 		d.order = append(d.order, p.Index)
 		if e := acc.startEvent(p.Index); e != nil {
@@ -484,6 +496,7 @@ func (d *decodeState) finish(m *core.Model, lookup func(string) *core.Model) {
 // persistence keeps the content, and neither works if the two are separated.
 func (d *decodeState) fail(text string, err error) {
 	final := d.partial
+	final.Content = d.partialContent()
 	final.Usage = d.usage
 	if text == provider.AbortText {
 		final.StopReason = core.StopReasonAborted
@@ -497,6 +510,26 @@ func (d *decodeState) fail(text string, err error) {
 	d.s.Push(core.ErrorEvent{Message: text, Err: err, Terminal: true})
 	d.s.Push(core.MessageEndEvent{Message: final})
 	d.s.End(core.StreamResult{Message: &final, Err: err})
+}
+
+// partialContent is what a failed or aborted stream keeps: every completed
+// block, then every block still open when the stream died, salvaged the same
+// way the other wires' per-chunk snapshots keep theirs. REQ-LOOP-09 appends
+// this message to history verbatim; the half-streamed text is what the UI and
+// the session log display, so dropping an open block loses it twice.
+func (d *decodeState) partialContent() core.Content {
+	out := append(core.Content(nil), d.partial.Content...)
+	for _, i := range d.order {
+		if _, done := d.final[i]; done {
+			continue
+		}
+		if acc := d.accs[i]; acc != nil {
+			if b := acc.block(); b != nil {
+				out = append(out, b)
+			}
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------- whole-response
@@ -521,7 +554,10 @@ func DecodeResponse(m *core.Model, data []byte, lookup func(string) *core.Model)
 		StopReason: MapStopReason(wr.StopReason), RawStopReason: wr.StopReason,
 	}
 	for _, raw := range wr.Content {
-		acc := startFrom(raw, true)
+		acc, err := startFrom(raw, true)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: decoding response: %w", err)
+		}
 		if b := acc.block(); b != nil {
 			msg.Content = append(msg.Content, b)
 		}
@@ -535,41 +571,66 @@ func DecodeResponse(m *core.Model, data []byte, lookup func(string) *core.Model)
 	return msg, nil
 }
 
+// effortBudgets maps an effort token to a thinking budget, for a catalog row
+// whose wire values are effort names rather than numbers.
+//
+// The Messages API's `thinking` object takes a budget: {"type":"enabled"}
+// with no budget_tokens is rejected outright, and an effort token belongs to
+// a different field (output_config.effort) that this adapter does not emit.
+// A row that speaks in effort names therefore has to be priced into a budget
+// here, on the same ladder the budget-style rows in the catalog use, so the
+// two kinds of row produce the same request for the same level.
+var effortBudgets = map[string]int{
+	"minimal": 1024, // the vendor minimum
+	"low":     4096,
+	"medium":  16384,
+	"high":    32768,
+	"xhigh":   65536,
+	"max":     131072,
+}
+
 // applyThinking is REQ-PROV-15's Anthropic arm: a TRI-state where undefined
 // omits the key entirely and an explicit "off" sends {"type":"disabled"}.
 //
-// The level reaching here is expected to be CLAMPED already (REQ-PROV-15:
-// "passing an unclamped level through is prohibited"). An unmapped level is
-// therefore omitted rather than guessed: sending reasoning_effort a model does
-// not know is a 400, and inventing a budget for it is worse than not thinking.
-func applyThinking(r *request, m *core.Model, lvl core.ThinkingLevel) {
-	switch lvl {
+// The requested level is CLAMPED here — upward first, then downward — and the
+// RETURNED wire value is what is priced; an unclamped level never reaches the
+// wire (REQ-PROV-15: "passing an unclamped level through is prohibited").
+// `off` bypasses the clamp: disabling is a capability of the wire, not of a
+// catalog row, and clamping a request for no thinking upward to the model's
+// lowest level would spend the caller's money against their stated wish.
+func applyThinking(r *request, m *core.Model, requested core.ThinkingLevel) {
+	switch requested {
 	case core.ThinkingUnset:
 		return
 	case core.ThinkingOff:
 		r.Thinking = &thinking{Type: "disabled"}
 		return
 	}
-	wire, ok := m.ThinkingLevelMap[lvl]
-	if !ok || wire == nil {
-		return // present-null and absent are runtime-identical
+	_, wire, ok := catalog.ClampThinkingLevel(m, requested)
+	if !ok {
+		return // no reachable level: omit rather than guess
 	}
 
-	t := &thinking{Type: "enabled"}
-	if n, err := strconv.Atoi(*wire); err == nil && n > 0 {
-		// Anthropic rejects a thinking budget that is not strictly below
-		// max_tokens. The budget is the value we may lower; max_tokens has
-		// already been clamped against the context window (REQ-CAT-04) and
-		// lowering it again would silently truncate the answer instead.
-		if n >= r.MaxTokens {
-			n = r.MaxTokens - 1
-		}
-		if n <= 0 {
-			return
-		}
-		t.BudgetTokens = &n
+	n, err := strconv.Atoi(strings.TrimSpace(wire))
+	if err != nil {
+		n = effortBudgets[strings.ToLower(strings.TrimSpace(wire))]
 	}
-	r.Thinking = t
+	if n <= 0 {
+		// Neither a budget nor a known effort token. Omitting is the only
+		// request that is not a 400: `enabled` without budget_tokens is.
+		return
+	}
+	// Anthropic rejects a thinking budget that is not strictly below
+	// max_tokens. The budget is the value we may lower; max_tokens has
+	// already been clamped against the context window (REQ-CAT-04) and
+	// lowering it again would silently truncate the answer instead.
+	if n >= r.MaxTokens {
+		n = r.MaxTokens - 1
+	}
+	if n <= 0 {
+		return
+	}
+	r.Thinking = &thinking{Type: "enabled", BudgetTokens: &n}
 
 	// Extended thinking rejects any explicit temperature or top_p. Dropping
 	// them is the only option that keeps the request valid; the alternative is

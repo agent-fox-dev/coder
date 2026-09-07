@@ -115,8 +115,14 @@ func TestEmbeddedCatalogPopulatesTheREQPROV10Descriptor(t *testing.T) {
 	if err := json.Unmarshal(o3.Compat, &compat); err != nil {
 		t.Fatalf("o3 compat is not an object: %v", err)
 	}
-	if compat["max_tokens_field"] != "max_completion_tokens" {
-		t.Errorf("o3 compat.max_tokens_field = %v, want max_completion_tokens", compat["max_tokens_field"])
+	// The keys are provider/openai.Compat's own json names (REQ-PROV-12);
+	// that profile rejects any other key, so a row written in a vocabulary
+	// it does not read fails the request instead of silently doing nothing.
+	if compat["use_max_tokens"] != false {
+		t.Errorf("o3 compat.use_max_tokens = %v, want false (max_completion_tokens)", compat["use_max_tokens"])
+	}
+	if compat["supports_temperature"] != false {
+		t.Errorf("o3 compat.supports_temperature = %v, want false", compat["supports_temperature"])
 	}
 	// Present-and-null: REQ-PROV-15's "explicitly unsupported".
 	w, present := o3.ThinkingLevelMap[core.ThinkingOff]

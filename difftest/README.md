@@ -42,8 +42,9 @@ misspelled option is a hard error, because otherwise both arms ignore it and
 agree for the wrong reason.
 
 Record the reference implementation, its version, and the exact command that
-produced each file, per NFR-TEST-08.1 — `docs/PROVIDERS.md` (NFR-COMPAT-07) is
-where that ledger belongs and it is not yet written.
+produced each file, per NFR-TEST-08.1 — in the row for that surface in
+`docs/PROVIDERS.md` (NFR-COMPAT-07), whose "Goldens captured against" and
+"Capture date" columns are empty until a capture exists.
 
 ## What is compared
 

@@ -1,9 +1,15 @@
 package tools
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,11 +25,52 @@ import (
 // Options configures the built-in tool set.
 type Options struct {
 	Workspace *Workspace
-	// SpillDir is where oversized execute output is streamed. Empty disables
-	// spilling.
+	// SpillDir is where oversized subprocess output is streamed in full
+	// (REQ-TOOL-09d). Empty means a per-workspace subdirectory of
+	// os.TempDir(), created on first spill. Spill files are the EMBEDDER'S to
+	// clean up: the SDK never deletes one, because the path is handed to the
+	// model and to the audit trail, and either may still need it after the
+	// call that produced it has returned.
 	SpillDir string
-	// Env replaces the subprocess environment. Nil means ReducedEnv(nil).
+	// DisableSpill turns spilling off entirely, for a caller that wants no
+	// file left behind. Without it the requirement's "additionally streamed
+	// to a temp file" is on by default, since a default that silently
+	// dropped the full output would make the marker name a file that does
+	// not exist.
+	DisableSpill bool
+	// Env replaces the subprocess environment. Nil means ReducedEnv(nil)
+	// (REQ-SEC-08) — for every constructor here, not only All(): a tool built
+	// by hand with a nil Env must not inherit the parent's credentials just
+	// because it skipped the aggregate.
 	Env []string
+	// Ignore injects the environment the ignore engine reads. The zero value
+	// reads the real one; NoGlobalExcludes() pins an empty global layer
+	// (NFR-TEST-04).
+	Ignore IgnoreOptions
+}
+
+// withDefaults applies the documented zero-value meanings. Every constructor
+// calls it, so the defaults hold for a tool built outside All() too.
+func (o Options) withDefaults() Options {
+	if o.Env == nil {
+		o.Env = ReducedEnv(nil)
+	}
+	if o.DisableSpill {
+		o.SpillDir = ""
+	} else if o.SpillDir == "" {
+		o.SpillDir = defaultSpillDir(workspaceRoot(o))
+	}
+	return o
+}
+
+// defaultSpillDir names the per-workspace spill directory under os.TempDir().
+// The workspace is identified by a hash rather than its basename so two
+// checkouts called "app" do not share a directory, and so the name is safe on
+// every platform in the NFR-COMPAT-06 matrix.
+func defaultSpillDir(root string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(root))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("agentkit-spill-%08x", h.Sum32()))
 }
 
 // All returns the default built-in tool set.
@@ -47,10 +94,8 @@ func All(opts Options) ([]core.Tool, error) {
 		}
 		opts.Workspace = ws
 	}
-	if opts.Env == nil {
-		opts.Env = ReducedEnv(nil)
-	}
-	fs := &fileTools{ws: opts.Workspace, locks: newPathLocks()}
+	opts = opts.withDefaults()
+	fs := newFileTools(opts)
 	return []core.Tool{
 		fs.readFile(),
 		fs.writeFile(),
@@ -133,15 +178,29 @@ func (p *pathLocks) acquire(path string) func() {
 // resolves the PARENT and rejoins the base, so a not-yet-created file under a
 // symlinked directory still shares a lock with its other spellings (ruling
 // P-48).
-func lockKey(path string) string {
-	if r, err := filepath.EvalSymlinks(path); err == nil {
-		return r
+//
+// Only NOT-EXIST falls back to the absolute path (REQ-LOOP-12). Any other
+// resolution error — permission denied, a link loop, an I/O fault — is
+// returned, because a key computed from a path that could not be resolved is
+// a key two spellings of one file might not share, which is the lost update
+// the lock exists to prevent.
+func lockKey(path string) (string, error) {
+	r, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return r, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("tools: cannot resolve %s for locking: %w", path, err)
 	}
 	dir, base := filepath.Split(path)
-	if r, err := filepath.EvalSymlinks(filepath.Clean(dir)); err == nil {
-		return filepath.Join(r, base)
+	r, err = filepath.EvalSymlinks(filepath.Clean(dir))
+	if err == nil {
+		return filepath.Join(r, base), nil
 	}
-	return path
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("tools: cannot resolve %s for locking: %w", path, err)
+	}
+	return path, nil
 }
 
 // ---------------------------------------------------------------- file tools
@@ -149,6 +208,13 @@ func lockKey(path string) string {
 type fileTools struct {
 	ws    *Workspace
 	locks *pathLocks
+	// ig carries the ignore environment with the `git config` lookup memoized
+	// per workspace, so find_files and search_files do not spawn git per call.
+	ig IgnoreOptions
+}
+
+func newFileTools(opts Options) *fileTools {
+	return &fileTools{ws: opts.Workspace, locks: newPathLocks(), ig: opts.Ignore.cached()}
 }
 
 func (f *fileTools) readFile() core.Tool {
@@ -176,55 +242,199 @@ func (f *fileTools) readFile() core.Tool {
 			if err != nil {
 				return core.ErrResult("path_not_allowed", err.Error())
 			}
-			data, err := os.ReadFile(abs)
+			fh, err := os.Open(abs)
 			if err != nil {
 				return core.ErrResult("read_failed", err.Error())
 			}
+			defer fh.Close()
+			br := bufio.NewReaderSize(fh, 64<<10)
+
 			// REQ-TOOL-14.6: images are detected by MAGIC BYTES, never by
 			// extension. `screenshot.txt` is still a PNG if its first eight
 			// bytes say so, and splitting one into "lines" hands the model
-			// several kilobytes of mojibake.
-			if mime, isImage := imagex.Sniff(data); isImage {
+			// several kilobytes of mojibake. Only the header is peeked; the
+			// whole file is loaded for an image alone, whose size the
+			// normalizer bounds.
+			head, _ := br.Peek(imageSniffBytes)
+			if mime, isImage := imagex.Sniff(head); isImage {
+				data, err := io.ReadAll(br)
+				if err != nil {
+					return core.ErrResult("read_failed", err.Error())
+				}
 				return readImage(abs, a.Path, data, mime)
 			}
 
-			lines := strings.Split(string(data), "\n")
-			total := len(lines)
 			// 1-based, with 0 aliased to 1 (ruling P-21).
 			from := a.Offset
 			if from <= 0 {
 				from = 1
 			}
-			if from > total {
-				return core.ErrResult("offset_past_end",
-					fmt.Sprintf("offset %d is past the end of the file (%d lines)", from, total))
-			}
 			limit := a.Limit
 			if limit <= 0 || limit > ReadLineLimit {
 				limit = ReadLineLimit
 			}
-			to := from + limit - 1
-			if to > total {
-				to = total
+			page, err := readLines(br, from, limit, DefaultByteLimit)
+			if err != nil {
+				return core.ErrResult("read_failed", err.Error())
 			}
-			body := strings.Join(lines[from-1:to], "\n")
+			// An empty file has no lines, and reading it from the start is
+			// not an error: the answer is an empty content, not a rejection.
+			if from > page.total && !(from == 1 && page.total == 0) {
+				return core.ErrResult("offset_past_end",
+					fmt.Sprintf("offset %d is past the end of the file (%d lines)", from, page.total))
+			}
 
-			md := &core.ToolMetadata{TotalLines: int64(total), TotalBytes: int64(len(data))}
-			if to < total {
-				md.Truncated = true
-				md.TruncatedBy = string(TruncatedByLines)
-				body += "\n" + ReadOffsetMarker(from, to, total)
+			shown := f.ws.Rel(abs)
+			body := make([]string, 0, len(page.lines)+2)
+			for _, l := range page.lines {
+				if l.long {
+					// REQ-TOOL-09c: a single line over the byte limit is
+					// replaced IN PLACE by a marker naming the shell
+					// workaround, and the read continues past it. Cutting the
+					// line would hand the model a fragment with no way to tell
+					// where it ended.
+					body = append(body, LongLineMarker(l.n, l.size, DefaultByteLimit, shown))
+					continue
+				}
+				body = append(body, l.text)
 			}
-			if len(body) > DefaultByteLimit {
-				body = body[:DefaultByteLimit] + "\n" +
-					fmt.Sprintf("[truncated at %s]", humanBytes(int64(DefaultByteLimit)))
+			md := &core.ToolMetadata{TotalLines: int64(page.total), TotalBytes: page.totalBytes}
+			if page.truncatedBy != "" {
 				md.Truncated = true
-				md.TruncatedBy = string(TruncatedByBytes)
+				md.TruncatedBy = string(page.truncatedBy)
 			}
-			r := core.OKResult(map[string]any{"content": body, "encoding": "utf-8"})
+			if page.to < page.total {
+				// One marker, carrying the REAL continuation offset, whichever
+				// limit fired (REQ-TOOL-09b). The byte cut is taken on whole
+				// lines, so the offset it names is the next unseen line.
+				body = append(body, ReadOffsetMarker(from, page.to, page.total))
+			}
+			r := core.OKResult(map[string]any{"content": strings.Join(body, "\n"), "encoding": "utf-8"})
 			r.Metadata = md
 			return r
 		},
+	}
+}
+
+// imageSniffBytes is how much of a file's head imagex.Sniff needs. The longest
+// signature it knows (RIFF....WEBP) is twelve bytes.
+const imageSniffBytes = 16
+
+// readPage is what readLines returns: the selected window, and the counts the
+// markers need.
+type readPage struct {
+	lines       []readLine
+	to          int // last line number shown, 0 if none
+	total       int
+	totalBytes  int64
+	truncatedBy TruncatedBy
+}
+
+type readLine struct {
+	n    int
+	text string
+	// long marks a line whose size alone exceeds the byte budget. Its text is
+	// not kept; the caller emits REQ-TOOL-09c's marker in its place.
+	long bool
+	size int64
+}
+
+// readLines STREAMS the file, keeping only the lines in [from, from+limit)
+// that fit within maxBytes, and counting the rest. Memory is bounded by the
+// window plus one buffer, not by the file: the previous implementation loaded
+// the whole file and split it, which made a read of the first ten lines of a
+// gigabyte log a gigabyte allocation.
+//
+// Lines are counted the way an editor counts them: "a\nb\n" is two lines,
+// not three. strings.Split's trailing empty element used to inflate every
+// total by one and reject offset=N for an N-line file (REQ-TOOL-09b's marker
+// named a line that did not exist).
+//
+// The byte budget is applied on WHOLE lines, so no line is ever cut mid-rune
+// and the continuation offset the marker names is exactly the first unseen
+// line. A single line over the budget is reported as `long` rather than
+// shown; the caller replaces it with REQ-TOOL-09c's marker and continues.
+func readLines(br *bufio.Reader, from, limit, maxBytes int) (readPage, error) {
+	var (
+		page readPage
+		used int
+		done bool // the window is closed; only counting continues
+	)
+	for {
+		// Only a line that could be shown needs its bytes retained; a line
+		// before the window or after it is measured, not kept — retaining
+		// even a few bytes of each is an allocation per line, which over a
+		// million-line log is the file all over again.
+		keep := 0
+		if !done && page.total+1 >= from {
+			keep = maxBytes + 1
+		}
+		line, size, terminated, err := readLineBounded(br, keep)
+		if err != nil {
+			return readPage{}, err
+		}
+		if !terminated && size == 0 {
+			break // EOF after a terminated line: no trailing line
+		}
+		page.total++
+		page.totalBytes += size
+		if terminated {
+			page.totalBytes++
+		}
+		n := page.total
+		if !done && n >= from {
+			switch {
+			case n-from >= limit:
+				page.truncatedBy = TruncatedByLines
+				done = true
+			case size > int64(maxBytes):
+				page.lines = append(page.lines, readLine{n: n, long: true, size: size})
+				page.to = n
+				page.truncatedBy = TruncatedByBytes
+			case used+len(line)+1 > maxBytes && len(page.lines) > 0:
+				page.truncatedBy = TruncatedByBytes
+				done = true
+			default:
+				page.lines = append(page.lines, readLine{n: n, text: string(line)})
+				page.to = n
+				used += len(line) + 1
+			}
+		}
+		if !terminated {
+			break
+		}
+	}
+	if page.truncatedBy == TruncatedByLines && page.to >= page.total {
+		page.truncatedBy = "" // the limit landed exactly on the last line
+	}
+	return page, nil
+}
+
+// readLineBounded reads one line, keeping at most keep bytes of it and
+// counting all of them. A line longer than the reader's buffer arrives in
+// ErrBufferFull-terminated slices, which is what lets a multi-megabyte line be
+// measured without being held.
+func readLineBounded(br *bufio.Reader, keep int) (line []byte, size int64, terminated bool, err error) {
+	for {
+		chunk, rerr := br.ReadSlice('\n')
+		size += int64(len(chunk))
+		if room := keep - len(line); room > 0 {
+			line = append(line, chunk[:min(room, len(chunk))]...)
+		}
+		switch {
+		case rerr == nil:
+			size-- // the terminator is not part of the line
+			if len(line) > 0 && line[len(line)-1] == '\n' {
+				line = line[:len(line)-1]
+			}
+			return line, size, true, nil
+		case errors.Is(rerr, bufio.ErrBufferFull):
+			continue
+		case errors.Is(rerr, io.EOF):
+			return line, size, false, nil
+		default:
+			return nil, 0, false, rerr
+		}
 	}
 }
 
@@ -234,6 +444,26 @@ func (f *fileTools) readFile() core.Tool {
 // appear with no statement of what was read, and cannot tell a screenshot it
 // asked for from one a previous turn left in history.
 func readImage(abs, shown string, data []byte, mime string) core.ToolResult {
+	// WebP is forwarded UNTOUCHED (REQ-TOOL-14). Providers accept it, but the
+	// standard library cannot decode it, so the normalizer reports it as
+	// unsupported — and refusing it here would turn "this build cannot
+	// downscale it" into "the model cannot see it". Dimensions are unknown;
+	// the note says so rather than inventing them. The one thing that can be
+	// checked is the byte budget, since an oversized WebP cannot be shrunk.
+	if mime == imagex.MIMEWebP {
+		if !imagex.FitsBudget(len(data)) {
+			return core.ErrResult("unsupported_image", fmt.Sprintf(
+				"%s: WebP image of %d bytes exceeds the provider's inline limit and "+
+					"cannot be downscaled by this build; re-encode it smaller", shown, len(data)))
+		}
+		out := core.OKResult(map[string]any{
+			"note":      fmt.Sprintf("[%s: %s image, dimensions unknown]", shown, mime),
+			"mime_type": mime,
+		})
+		out.Blocks = []core.ContentBlock{core.ImageBlock{
+			Data: base64.StdEncoding.EncodeToString(data), MimeType: mime}}
+		return out
+	}
 	// Formats providers reject are refused HERE, with a message naming the
 	// problem, rather than forwarded. Forwarded, the failure lands on the next
 	// provider request — by which time the image is in history and every
@@ -286,11 +516,21 @@ func (f *fileTools) writeFile() core.Tool {
 			if err != nil {
 				return core.ErrResult("path_not_allowed", err.Error())
 			}
-			release := f.locks.acquire(lockKey(abs))
+			key, err := lockKey(abs)
+			if err != nil {
+				return core.ErrResult("lock_failed", err.Error())
+			}
+			release := f.locks.acquire(key)
 			defer release()
 
 			if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 				return core.ErrResult("write_failed", err.Error())
+			}
+			// Re-checked under the lock, immediately before the open
+			// (REQ-SEC-01): a link planted here since Resolve would be
+			// followed by WriteFile.
+			if err := f.ws.CheckWriteTarget(abs); err != nil {
+				return core.ErrResult("path_not_allowed", err.Error())
 			}
 			if err := os.WriteFile(abs, []byte(a.Content), 0o644); err != nil {
 				return core.ErrResult("write_failed", err.Error())
@@ -333,7 +573,11 @@ func (f *fileTools) editFile() core.Tool {
 			if err != nil {
 				return core.ErrResult("path_not_allowed", err.Error())
 			}
-			release := f.locks.acquire(lockKey(abs))
+			key, err := lockKey(abs)
+			if err != nil {
+				return core.ErrResult("lock_failed", err.Error())
+			}
+			release := f.locks.acquire(key)
 			defer release()
 
 			raw, err := os.ReadFile(abs)
@@ -349,6 +593,10 @@ func (f *fileTools) editFile() core.Tool {
 					return core.ErrResult("edit_"+ee.Phase, ee.Text)
 				}
 				return core.ErrResult("edit_failed", err.Error())
+			}
+			// Same re-check as write_file, for the same reason (REQ-SEC-01).
+			if err := f.ws.CheckWriteTarget(abs); err != nil {
+				return core.ErrResult("path_not_allowed", err.Error())
 			}
 			if err := os.WriteFile(abs, []byte(Restore(out, bom, ending)), 0o644); err != nil {
 				return core.ErrResult("write_failed", err.Error())
@@ -450,12 +698,14 @@ func (f *fileTools) listFiles() core.Tool {
 			}
 			sort.Strings(entries)
 			truncated := len(entries) > limit
-			if truncated {
-				entries = entries[:limit]
-				entries = append(entries, ListMarker(limit))
-			}
 			r := core.OKResult(map[string]any{"entries": entries, "truncated": truncated})
 			if truncated {
+				entries = entries[:limit]
+				r.Data["entries"] = entries
+				// The marker is a separate key, as in find_files. Appended to
+				// `entries` it was indistinguishable from a file called
+				// "[500 entries limit reached...]" (REQ-TOOL-09b).
+				r.Data["note"] = ListMarker(limit)
 				r.Metadata = &core.ToolMetadata{Truncated: true, TruncatedBy: string(TruncatedByLines)}
 			}
 			return r
@@ -471,19 +721,35 @@ func (f *fileTools) findFiles() core.Tool {
 		InputSchema: schema.Object(
 			schema.Prop("pattern", schema.String("Glob pattern, e.g. **/*.go")),
 			schema.Opt("path", schema.String("Directory to search from (default the workspace root)")),
+			schema.Opt("file_type", schema.String("What to match: \"file\" (default), \"dir\" or \"any\"")),
 			schema.Opt("limit", schema.Int("Maximum results")),
 		),
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
-				Pattern string `json:"pattern"`
-				Path    string `json:"path"`
-				Limit   int    `json:"limit"`
+				Pattern  string `json:"pattern"`
+				Path     string `json:"path"`
+				FileType string `json:"file_type"`
+				Limit    int    `json:"limit"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
 				return core.ErrResult("invalid_arguments", err.Error())
 			}
 			if a.Path == "" {
 				a.Path = "."
+			}
+			// REQ-TOOL-04's table: file_type string (default "file").
+			// "directory" is accepted as a spelling of "dir" because models
+			// emit both.
+			wantFiles, wantDirs := true, false
+			switch strings.ToLower(strings.TrimSpace(a.FileType)) {
+			case "", "file":
+			case "dir", "directory":
+				wantFiles, wantDirs = false, true
+			case "any":
+				wantDirs = true
+			default:
+				return core.ErrResult("invalid_arguments",
+					fmt.Sprintf("file_type must be \"file\", \"dir\" or \"any\", not %q", a.FileType))
 			}
 			root, err := f.ws.Resolve(a.Path)
 			if err != nil {
@@ -493,9 +759,17 @@ func (f *fileTools) findFiles() core.Tool {
 			if limit <= 0 || limit > FindResultCap {
 				limit = FindResultCap
 			}
-			ig := loadIgnore(root)
+			ig := newIgnoreEngine(root, f.ig)
 			var found []string
 			truncated := false
+			add := func(rel string) error {
+				if len(found) >= limit {
+					truncated = true
+					return filepath.SkipAll
+				}
+				found = append(found, rel)
+				return nil
+			}
 			err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
 					return nil // unreadable entries are skipped, not fatal
@@ -520,14 +794,15 @@ func (f *fileTools) findFiles() core.Tool {
 					// single forward pass sufficient — there is no need to
 					// pre-scan for .gitignore files that may not exist.
 					ig.enter(rel, p)
+					if wantDirs && MatchGlob(a.Pattern, rel) {
+						// Suffixed like list_files, so a directory is
+						// distinguishable from a file under file_type=any.
+						return add(rel + "/")
+					}
 					return nil
 				}
-				if MatchGlob(a.Pattern, rel) {
-					if len(found) >= limit {
-						truncated = true
-						return filepath.SkipAll
-					}
-					found = append(found, rel)
+				if wantFiles && MatchGlob(a.Pattern, rel) {
+					return add(rel)
 				}
 				return nil
 			})
@@ -549,6 +824,7 @@ func (f *fileTools) findFiles() core.Tool {
 // ------------------------------------------------------------------- execute
 
 func executeTool(opts Options) core.Tool {
+	opts = opts.withDefaults()
 	return core.Tool{
 		Name:    "execute",
 		Builtin: true,
@@ -564,7 +840,7 @@ func executeTool(opts Options) core.Tool {
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
 				Command  string `json:"command"`
-				TimeoutS int    `json:"timeout_s"`
+				TimeoutS *int   `json:"timeout_s"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
 				return core.ErrResult("invalid_arguments", err.Error())
@@ -572,13 +848,13 @@ func executeTool(opts Options) core.Tool {
 			if strings.TrimSpace(a.Command) == "" {
 				return core.ErrResult("invalid_arguments", "command is empty")
 			}
-			dir := ""
-			if opts.Workspace != nil {
-				dir = opts.Workspace.Root
+			timeout, err := timeoutArg(a.TimeoutS)
+			if err != nil {
+				return core.ErrResult("invalid_arguments", err.Error())
 			}
 			res, err := Run(ctx, a.Command, ExecOptions{
-				Dir:      dir,
-				Timeout:  time.Duration(a.TimeoutS) * time.Second,
+				Dir:      workspaceRoot(opts),
+				Timeout:  timeout,
 				MaxBytes: DefaultByteLimit,
 				SpillDir: opts.SpillDir,
 				Env:      opts.Env,
@@ -589,6 +865,21 @@ func executeTool(opts Options) core.Tool {
 			return execResultToTool(res)
 		},
 	}
+}
+
+// timeoutArg validates REQ-TOOL-06's timeout_s: optional with NO default, and
+// when supplied it must be POSITIVE. The argument is a pointer so that a
+// supplied 0 is distinguishable from an absent one; with a plain int a model
+// that sent timeout_s=0 — or a negative number — silently got "no timeout",
+// which is the one thing a caller who typed a timeout did not ask for.
+func timeoutArg(s *int) (time.Duration, error) {
+	if s == nil {
+		return 0, nil
+	}
+	if *s <= 0 {
+		return 0, fmt.Errorf("timeout_s must be positive when supplied, got %d", *s)
+	}
+	return time.Duration(*s) * time.Second, nil
 }
 
 // execResultToTool is the REQ-TOOL-08 envelope for a subprocess result.
@@ -627,6 +918,7 @@ func execResultToTool(res ExecResult) core.ToolResult {
 // silently. Here there is no shell at all, so a path with a space or a
 // semicolon in it is just an argument.
 func runCommandTool(opts Options) core.Tool {
+	opts = opts.withDefaults()
 	return core.Tool{
 		Name:    "run_command",
 		Builtin: true,
@@ -646,7 +938,7 @@ func runCommandTool(opts Options) core.Tool {
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
 				Argv     []string `json:"argv"`
-				TimeoutS int      `json:"timeout_s"`
+				TimeoutS *int     `json:"timeout_s"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
 				return core.ErrResult("invalid_arguments", err.Error())
@@ -655,16 +947,13 @@ func runCommandTool(opts Options) core.Tool {
 				return core.ErrResult("invalid_arguments",
 					"argv must name a program as its first element")
 			}
-			if a.TimeoutS < 0 {
-				return core.ErrResult("invalid_arguments", "timeout_s must be positive")
-			}
-			dir := ""
-			if opts.Workspace != nil {
-				dir = opts.Workspace.Root
+			timeout, err := timeoutArg(a.TimeoutS)
+			if err != nil {
+				return core.ErrResult("invalid_arguments", err.Error())
 			}
 			res, err := RunArgv(ctx, a.Argv, ExecOptions{
-				Dir:      dir,
-				Timeout:  time.Duration(a.TimeoutS) * time.Second,
+				Dir:      workspaceRoot(opts),
+				Timeout:  timeout,
 				MaxBytes: DefaultByteLimit,
 				SpillDir: opts.SpillDir,
 				Env:      opts.Env,

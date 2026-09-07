@@ -99,8 +99,8 @@ REQ-GO-11 holds the root module to the Go standard library. To resolve, pick one
      SBOM. A nested module is the only mechanism in Go that does.
   3. If it genuinely belongs in the root, add it to allowedModules in this
      file with a reason stating what it buys and why hand-rolling is not
-     credible, and record the ruling in docs/DEPS.md. That edit is the review
-     gate — it is meant to be visible in a diff.`, modPath, strings.Join(importers, ", "))
+     credible, and add a numbered ruling under "Rulings" in docs/DEPS.md.
+     That edit is the review gate — it is meant to be visible in a diff.`, modPath, strings.Join(importers, ", "))
 	}
 }
 

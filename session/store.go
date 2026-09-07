@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -95,13 +96,24 @@ type Store struct {
 	// it is empty, because the header is already in the file.
 	headerLine []byte
 
-	f *os.File
+	f logFile
 	// pendingNewline restores a terminator lost to a partial write before the
 	// next entry is appended.
 	pendingNewline bool
 	closed         bool
 
 	t *tree
+}
+
+// logFile is what the store needs from its file. *os.File satisfies it; a
+// test satisfies it with a writer that fails part-way, which is the only way
+// to exercise the partial-write path without a real disk fault.
+type logFile interface {
+	io.Writer
+	Sync() error
+	Close() error
+	Stat() (os.FileInfo, error)
+	Truncate(size int64) error
 }
 
 var _ core.SessionStore = (*Store)(nil)
@@ -268,7 +280,9 @@ func (s *Store) write(line []byte) error {
 	if err := s.ensureFile(); err != nil {
 		return err
 	}
-	if _, err := s.f.Write(buf); err != nil {
+	n, err := s.f.Write(buf)
+	if err != nil {
+		s.resync(n)
 		return err
 	}
 	s.pendingNewline = false
@@ -277,6 +291,43 @@ func (s *Store) write(line []byte) error {
 		return s.f.Sync()
 	}
 	return nil
+}
+
+// resync repairs the store's own state after a write that failed part-way.
+// REQ-SESS-08 covers reporting the failure; this is about what the NEXT
+// append does.
+//
+// n bytes of buf reached the file with no terminator. Left alone, the next
+// successful append concatenates onto them and BOTH entries are lost — the
+// in-process twin of the crash P-3 repairs in Open, and just as invisible
+// until a later load reports a malformed line where a turn should be. Two
+// steps, the clean one first:
+//
+//  1. Truncate the partial bytes away. That restores the file to exactly
+//     its state before the failed write: a still-pending header stays
+//     pending (headerLine is never cleared on failure), and the next load
+//     needs no repair. It is the policy Open applies to a damaged tail —
+//     only bytes that never formed a complete line are removed — so it is
+//     append-only-safe in the same sense.
+//  2. If truncation fails too, remember that the tail is unterminated so the
+//     next write leads with '\n'. The partial bytes then load as a malformed
+//     interior line — reported, not silent (REQ-SESS-05.4) — and the next
+//     entry lands on its own line rather than inside it.
+//
+// n is trusted, and that is deliberate: os.File.Write reports the bytes the
+// kernel accepted, and a spurious leading newline in a file whose header is
+// still pending would make line 1 blank and cost the header on every later
+// load.
+func (s *Store) resync(n int) {
+	if n <= 0 {
+		return
+	}
+	if info, err := s.f.Stat(); err == nil && int64(n) <= info.Size() {
+		if s.f.Truncate(info.Size()-int64(n)) == nil {
+			return
+		}
+	}
+	s.pendingNewline = true
 }
 
 // ensureFile performs REQ-SESS-09's first flush: O_CREATE|O_EXCL, which never
@@ -331,6 +382,14 @@ func (s *Store) Head() core.EntryID {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.t.head
+}
+
+// Has reports whether id names an entry in the log. It is what a compaction
+// anchor is validated against before the entry that carries it is written.
+func (s *Store) Has(id core.EntryID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.t.has(id)
 }
 
 // ForkFrom repoints Head so the next Append becomes a second child of id.

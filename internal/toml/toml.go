@@ -40,6 +40,8 @@ const bomPrefix = diag.BOMPrefix
 //   - literal strings '...' (no escape processing, per TOML)
 //   - booleans true and false
 //   - decimal integers with an optional sign and '_' digit separators
+//   - floats: fractional, exponent, inf and nan, with '_' separators
+//     (REQ-MCP-CLIENT-07 writes its default timeout as `30.0`)
 //   - arrays of strings, single- or multi-line, trailing comma allowed
 //   - a leading UTF-8 BOM
 //
@@ -47,7 +49,7 @@ const bomPrefix = diag.BOMPrefix
 // failure of the file. REQ-SKILL-10: a manifest is authored content whose
 // consumer is a language model, and a value form we do not read must not
 // delete the whole skill.
-//   - floats, dates, times and datetimes
+//   - dates, times and datetimes
 //   - multi-line strings (""" and ''')
 //   - inline tables { }
 //   - arrays that are not arrays of strings (numbers, nested arrays, tables)
@@ -70,6 +72,7 @@ const (
 	KindBool
 	KindInt
 	KindStringArray
+	KindFloat
 )
 
 // Value is one parsed TOML scalar or string array. It is a tagged struct
@@ -80,6 +83,7 @@ type Value struct {
 	Str   string
 	Bool  bool
 	Int   int64
+	Float float64
 	Array []string
 	// Line is the 1-based line the value was written on, so a diagnostic can
 	// point the manifest author at it.
@@ -548,11 +552,21 @@ func (p *tomlParser) parseBareToken() (Value, bool, string, error) {
 	}
 
 	body := strings.TrimPrefix(strings.TrimPrefix(tok, "+"), "-")
+	// A date is recognised by SHAPE before the float test runs: an exponent
+	// float such as 6.626e-34 carries a '-' too, and testing for that byte
+	// alone would file every negative exponent under "dates".
+	isDate := strings.Contains(tok, ":") ||
+		(len(body) >= 10 && body[4] == '-' && body[7] == '-')
 	switch {
-	case strings.ContainsAny(tok, ".eE") && !strings.HasPrefix(body, "0x"):
-		return Value{}, false, "floats are not supported", nil
-	case strings.Contains(tok, ":") || strings.ContainsAny(body, "-") || strings.ContainsAny(body, "Zz"):
+	case isDate:
 		return Value{}, false, "dates and times are not supported", nil
+	case body == "inf" || body == "nan" ||
+		(strings.ContainsAny(tok, ".eE") && !strings.HasPrefix(body, "0x")):
+		f, err := strconv.ParseFloat(strings.ReplaceAll(tok, "_", ""), 64)
+		if err != nil {
+			return Value{}, false, fmt.Sprintf("unrecognized value %q", tok), nil
+		}
+		return Value{Kind: KindFloat, Float: f}, true, "", nil
 	case strings.HasPrefix(body, "0x"), strings.HasPrefix(body, "0o"), strings.HasPrefix(body, "0b"):
 		return Value{}, false, "only decimal integers are supported", nil
 	}

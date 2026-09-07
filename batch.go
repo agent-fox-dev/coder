@@ -51,6 +51,26 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 	}
 	auditSession := cfg.SessionID
 
+	// report surfaces an error from INSIDE the batch-scoped critical section
+	// without touching a.mu. The hooks are taken from the cfg copy above, so
+	// the documented lock order (a.mu is never acquired under batchMu) is a
+	// fact rather than a comment: fireError re-reads the hooks under a.mu,
+	// and calling it from the finalize block took the agent lock inside the
+	// batch lock on every tool result.
+	hooks := cfg.Hooks
+	report := func(err error) {
+		safely(nil, "OnError", func() {
+			if hooks.OnError != nil {
+				hooks.OnError(err)
+			}
+		})
+	}
+
+	// started marks calls whose ToolExecutionStartEvent has been pushed, so
+	// the abort path can open the calls the prepare loop never reached and
+	// every call closes exactly once (REQ-LOOP-11.3).
+	started := make([]bool, len(calls))
+
 	byName := make(map[string]core.Tool, len(tools))
 	for _, t := range tools {
 		byName[t.Name] = t
@@ -72,29 +92,69 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 	var batchMu sync.Mutex
 
 	// ---- Phase 1: prepare, strictly sequential.
+	// finalizeInline closes a call that never reaches a handler — unknown
+	// tool, bad arguments, a block, a plugin veto. It still emits the
+	// execution end event and the result, so every call opens and closes
+	// exactly once on the stream whichever way it ended (REQ-LOOP-11.3), and
+	// a UI keyed on the start event never waits for an end that will not come.
+	finalizeInline := func(i int, m core.ToolResultMessage) {
+		results[i] = m
+		s.Push(core.ToolExecutionEndEvent{ToolUseID: m.ToolUseID, Name: m.ToolName, IsError: m.IsError})
+		s.Push(core.ToolResultEvent{Message: m})
+	}
+
 	for i, c := range calls {
 		i, c := i, c
+		// REQ-LOOP-11.2: once the context is cancelled the prepare loop stops
+		// enqueuing further calls. The calls already prepared are still
+		// covered by the single decision below, and the ones never reached
+		// are closed there as aborted.
+		if ctx.Err() != nil {
+			break
+		}
+
 		// No ToolCallStart/ToolCallEnd here. Those describe the MODEL emitting
 		// a tool call and are the provider's to push as it streams; the loop
 		// owns the EXECUTION triple (ToolExecutionStart/Update/End) and the
 		// finalized ToolResultEvent. REQ-LOOP-05 names the call events and
 		// REQ-OBS-06 names the execution ones — emitting both duplicates every
 		// call in any UI driven by the stream (ruling C19).
+		//
+		// The execution START is emitted HERE, in the sequential prepare
+		// phase, not inside the thunk: REQ-LOOP-05 phase 1 emits the start
+		// event for each call in order, and a call finalized inline (blocked,
+		// invalid) or aborted before its handler ran must still have opened.
+		s.Push(core.ToolExecutionStartEvent{ToolUseID: c.ID, Name: c.Name})
+		started[i] = true
 
 		tool, known := byName[c.Name]
 		if !known {
-			results[i] = errorResult(c, "unknown_tool",
-				fmt.Sprintf("no tool named %q is available in this run", c.Name))
-			s.Push(core.ToolResultEvent{Message: results[i]})
+			finalizeInline(i, errorResult(c, "unknown_tool",
+				fmt.Sprintf("no tool named %q is available in this run", c.Name)))
 			continue
 		}
 
-		prepared, perr := PrepareArguments(tool, c)
+		// REQ-TOOL-11: the whole pipeline — the per-tool shim included — runs
+		// inside the panic-recover boundary of REQ-LOOP-03. Tool.PrepareArguments
+		// is user code; a panic in it is an invalid-arguments result, not a
+		// crashed process.
+		var (
+			prepared Prepared
+			perr     error
+		)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					perr = fmt.Errorf("argument preparation for %q panicked: %v", c.Name, r)
+					report(fmt.Errorf("agentkit: panic in PrepareArguments for %q: %v", c.Name, r))
+				}
+			}()
+			prepared, perr = PrepareArguments(tool, c)
+		}()
 		if perr != nil {
 			// The error text re-serializes the model's OWN key order, so the
 			// message is self-correcting (REQ-TOOL-11.4, REQ-TOOL-12.3).
-			results[i] = errorResult(c, "invalid_arguments", perr.Error())
-			s.Push(core.ToolResultEvent{Message: results[i]})
+			finalizeInline(i, errorResult(c, "invalid_arguments", perr.Error()))
 			continue
 		}
 
@@ -115,13 +175,12 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 				if reason == "" {
 					reason = "blocked by policy"
 				}
-				results[i] = errorResult(c, core.BlockErrorCode, reason)
 				// A blocked call casts the same termination vote, which is
 				// what lets a permission denial end the run instead of looping
 				// the model into retrying (REQ-TOOL-13.2). Honoured only when
 				// Block is set.
 				votes[i] = dec.Terminate
-				s.Push(core.ToolResultEvent{Message: results[i]})
+				finalizeInline(i, errorResult(c, core.BlockErrorCode, reason))
 				continue
 			}
 			if dec.Arguments != nil {
@@ -137,36 +196,54 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 		// — is gone, and with it any notion of the SDK running something
 		// before the interceptor that the interceptor cannot override.
 		if d, by := pluginVeto(ctx, cfg.Plugins, c.Name, prepared.Raw); d == core.PluginBlock {
-			results[i] = toolResultMessage(c, core.ErrResult("blocked_by_plugin",
-				fmt.Sprintf("plugin %q blocked this call", by.PluginName())))
-			s.Push(core.ToolResultEvent{Message: results[i]})
+			finalizeInline(i, toolResultMessage(c, core.ErrResult("blocked_by_plugin",
+				fmt.Sprintf("plugin %q blocked this call", by.PluginName()))))
 			continue
 		}
 
 		thunks = append(thunks, func() {
 			start := time.Now()
-			s.Push(core.ToolExecutionStartEvent{ToolUseID: c.ID, Name: c.Name})
 
 			// REQ-OBS-02: a span around the HANDLER, wrapping only the part
 			// that does work. Wrapping the finalize block as well would put
 			// every peer's span duration inside every other peer's, because
 			// finalization is serialized under the batch mutex — so a parallel
 			// batch would trace as though it were sequential.
-			var out core.ToolResult
-			_ = tracer.StartSpan("agentkit.tool_call", func(sp core.Span) error {
-				defer sp.End()
-				out = invokeHandler(ctx, tool, prepared)
-				sp.SetAttributes(map[string]any{
-					"tool_name":   c.Name,
-					"tool_use_id": c.ID,
-					"is_error":    !out.OK,
-					"elapsed_ms":  time.Since(start).Milliseconds(),
+			//
+			// The tracer is third-party code (NFR-REL-02). A panic in it is
+			// contained here, and if it panicked BEFORE handing us the span —
+			// so the handler never ran — the handler runs untraced rather
+			// than not at all: a broken tracer must not turn every tool call
+			// into an error result.
+			var (
+				out    core.ToolResult
+				traced bool
+			)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						report(fmt.Errorf("agentkit: panic in Tracer for %q: %v", c.Name, r))
+					}
+				}()
+				_ = tracer.StartSpan("agentkit.tool_call", func(sp core.Span) error {
+					defer sp.End()
+					traced = true
+					out = invokeHandler(ctx, tool, prepared)
+					sp.SetAttributes(map[string]any{
+						"tool_name":   c.Name,
+						"tool_use_id": c.ID,
+						"is_error":    !out.OK,
+						"elapsed_ms":  time.Since(start).Milliseconds(),
+					})
+					if !out.OK {
+						sp.SetStatus(errors.New(out.Error))
+					}
+					return nil
 				})
-				if !out.OK {
-					sp.SetStatus(errors.New(out.Error))
-				}
-				return nil
-			})
+			}()
+			if !traced {
+				out = invokeHandler(ctx, tool, prepared)
+			}
 			a.audit(core.AuditEvent{
 				Kind: core.AuditToolCall, SessionID: auditSession,
 				ToolName: c.Name, ToolUseID: c.ID,
@@ -186,7 +263,7 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 
 				msg := toolResultMessage(c, out)
 				if cfg.AfterToolCall != nil {
-					dec := a.callAfter(ctx, cfg.AfterToolCall, core.AfterToolCallContext{
+					dec := callAfter(ctx, report, cfg.AfterToolCall, core.AfterToolCallContext{
 						ToolName:  c.Name,
 						ToolUseID: c.ID,
 						Arguments: prepared.Args,
@@ -206,7 +283,7 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 				// MCP-bridged results, custom tools, and images a hook
 				// injected; there is exactly one place every image passes
 				// through, and this is it.
-				a.normalizeImages(&msg)
+				normalizeImages(&msg, report)
 				results[i] = msg
 				votes[i] = out.Terminate
 				s.Push(core.ToolExecutionEndEvent{
@@ -237,10 +314,19 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 			if results[i].ToolUseID != "" {
 				continue // already finalized in prepare (blocked/invalid)
 			}
-			results[i] = abortedResult(c)
-			s.Push(core.ToolExecutionEndEvent{ToolUseID: c.ID, Name: c.Name, IsError: true})
-			s.Push(core.ToolResultEvent{Message: results[i]})
+			// A call the prepare loop never reached still opens, so it can
+			// close (REQ-LOOP-11.3).
+			if !started[i] {
+				s.Push(core.ToolExecutionStartEvent{ToolUseID: c.ID, Name: c.Name})
+				started[i] = true
+			}
+			finalizeInline(i, abortedResult(c))
 		}
+		// The calls that were blocked in prepare keep their termination vote;
+		// an aborted call abstains. The AND over the batch is therefore false
+		// whenever any call was aborted, which is the correct reading of
+		// REQ-TOOL-13.1: an aborted batch did not finish, so it does not
+		// finish the run on a tool's say-so.
 		return results, false
 	}
 
@@ -337,11 +423,15 @@ func (a *Agent) callBefore(ctx context.Context, f core.BeforeToolCall, in core.B
 // panic here yields "no opinion" rather than a vote: unlike BeforeToolCall
 // this is not a security boundary, and inventing a termination vote from a
 // crash would end the run for the wrong reason.
-func (a *Agent) callAfter(ctx context.Context, f core.AfterToolCall, in core.AfterToolCallContext) (dec core.AfterToolCallDecision) {
+//
+// It reports through the batch's lock-free reporter, never a.fireError: it
+// runs inside the batch-scoped critical section, and the agent lock is never
+// taken there.
+func callAfter(ctx context.Context, report func(error), f core.AfterToolCall, in core.AfterToolCallContext) (dec core.AfterToolCallDecision) {
 	defer func() {
 		if r := recover(); r != nil {
 			dec = core.AfterToolCallDecision{}
-			a.fireError(fmt.Errorf("agentkit: panic in AfterToolCall for %q: %v", in.ToolName, r))
+			report(fmt.Errorf("agentkit: panic in AfterToolCall for %q: %v", in.ToolName, r))
 		}
 	}()
 	return f(ctx, in)

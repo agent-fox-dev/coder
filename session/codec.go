@@ -498,3 +498,12 @@ func decodeMessage(v jsonx.OrderedValue) (core.Message, error) {
 	}
 	return nil, errNotAMessage
 }
+
+// EncodeMessage renders one canonical message as JSON, in the session log's
+// own lossless shape — role-discriminated, key order preserved, unknown keys
+// retained (NFR-TEST-03). It is exported so that other encoders that carry
+// messages — the REQ-OBS-06c event union — reuse this codec rather than
+// keeping a second, drifting copy of it.
+func EncodeMessage(m core.Message) (json.RawMessage, error) {
+	return json.Marshal(encodeMessage(m))
+}

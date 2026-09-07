@@ -68,7 +68,7 @@ func TestADeeperGitignoreOverridesAShallowerOne(t *testing.T) {
 	writeFile(t, dir, "logs/important.log", "")
 	writeFile(t, dir, "logs/noise.log", "")
 
-	got := walkAll(t, newIgnoreEngine(dir, ignoreOptions{Getenv: func(string) string { return "" },
+	got := walkAll(t, newIgnoreEngine(dir, IgnoreOptions{Getenv: func(string) string { return "" },
 		Home: func() (string, error) { return dir, nil }, GitConfig: func() string { return "" }}), dir)
 
 	if !got["app.log"] {
@@ -92,7 +92,7 @@ func TestGitInfoExcludeIsHonoured(t *testing.T) {
 	writeFile(t, dir, "scratch/notes.md", "")
 	writeFile(t, dir, "main.go", "")
 
-	got := walkAll(t, newIgnoreEngine(dir, ignoreOptions{Getenv: func(string) string { return "" },
+	got := walkAll(t, newIgnoreEngine(dir, IgnoreOptions{Getenv: func(string) string { return "" },
 		Home: func() (string, error) { return dir, nil }, GitConfig: func() string { return "" }}), dir)
 
 	if !got["scratch"] {
@@ -122,7 +122,7 @@ func TestGlobalExcludesResolutionOrder(t *testing.T) {
 	work := filepath.Join(dir, "work")
 
 	t.Run("core.excludesFile wins", func(t *testing.T) {
-		e := newIgnoreEngine(work, ignoreOptions{
+		e := newIgnoreEngine(work, IgnoreOptions{
 			GitConfig: func() string { return filepath.Join(dir, "cfg", "explicit-ignore") },
 			Getenv:    func(string) string { return filepath.Join(dir, "xdg") },
 			Home:      func() (string, error) { return filepath.Join(dir, "home"), nil },
@@ -136,7 +136,7 @@ func TestGlobalExcludesResolutionOrder(t *testing.T) {
 	})
 
 	t.Run("XDG is second", func(t *testing.T) {
-		e := newIgnoreEngine(work, ignoreOptions{
+		e := newIgnoreEngine(work, IgnoreOptions{
 			GitConfig: func() string { return "" },
 			Getenv: func(k string) string {
 				if k == "XDG_CONFIG_HOME" {
@@ -155,7 +155,7 @@ func TestGlobalExcludesResolutionOrder(t *testing.T) {
 	})
 
 	t.Run("home is third", func(t *testing.T) {
-		e := newIgnoreEngine(work, ignoreOptions{
+		e := newIgnoreEngine(work, IgnoreOptions{
 			GitConfig: func() string { return "" },
 			Getenv:    func(string) string { return "" },
 			Home:      func() (string, error) { return filepath.Join(dir, "home"), nil },
@@ -182,7 +182,7 @@ func TestANestedRepositoryIsItsOwnIgnoreRoot(t *testing.T) {
 	writeFile(t, dir, "vendor/lib/.gitignore", "tmp/\n")
 	writeFile(t, dir, "vendor/lib/tmp/x", "")
 
-	got := walkAll(t, newIgnoreEngine(dir, ignoreOptions{Getenv: func(string) string { return "" },
+	got := walkAll(t, newIgnoreEngine(dir, IgnoreOptions{Getenv: func(string) string { return "" },
 		Home: func() (string, error) { return dir, nil }, GitConfig: func() string { return "" }}), dir)
 
 	if !got["dist"] {
@@ -211,7 +211,7 @@ func TestANestedRepositorysRulesDoNotLeakOutward(t *testing.T) {
 	writeFile(t, dir, "vendor/lib/.gitignore", "zbuild/\n")
 	writeFile(t, dir, "zbuild/app", "") // OUTSIDE the nested repo, and sorts after it
 
-	e := newIgnoreEngine(dir, ignoreOptions{Getenv: func(string) string { return "" },
+	e := newIgnoreEngine(dir, IgnoreOptions{Getenv: func(string) string { return "" },
 		Home: func() (string, error) { return dir, nil }, GitConfig: func() string { return "" }})
 	e.enter("vendor", filepath.Join(dir, "vendor"))
 	e.enter("vendor/lib", filepath.Join(dir, "vendor", "lib"))
@@ -234,7 +234,7 @@ func TestNoRepositoryIsRequired(t *testing.T) {
 	writeFile(t, dir, "a.tmp", "")
 	writeFile(t, dir, "a.go", "")
 
-	e := newIgnoreEngine(dir, ignoreOptions{Getenv: func(string) string { return "" },
+	e := newIgnoreEngine(dir, IgnoreOptions{Getenv: func(string) string { return "" },
 		Home: func() (string, error) { return dir, nil }, GitConfig: func() string { return "" }})
 	if !e.match("a.tmp", false) {
 		t.Error("a .gitignore outside any repository is still honoured")
@@ -278,7 +278,7 @@ func runFindFiles(t *testing.T, dir, pattern string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	all, err := All(Options{Workspace: ws})
+	all, err := All(Options{Workspace: ws, Ignore: NoGlobalExcludes()})
 	if err != nil {
 		t.Fatal(err)
 	}

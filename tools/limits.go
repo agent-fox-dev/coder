@@ -52,14 +52,52 @@ func ReadOffsetMarker(from, to, total int) string {
 }
 
 // FindMarker is emitted when a find hits its result cap.
+//
+// REQ-TOOL-09b: the marker must name a call that WORKS. The tool clamps
+// `limit` to FindResultCap, so "Use limit=2000" at a limit of 1000 names a call
+// the tool would clamp straight back to the same result — a truncation the
+// model cannot act on, which is the thing the requirement exists to prevent.
+// At the cap the marker says so and advises narrowing instead.
 func FindMarker(limit int) string {
-	return fmt.Sprintf("[%d results limit reached. Use limit=%d for more, or refine pattern]",
-		limit, limit*2)
+	return capMarker("results", "limit", limit, FindResultCap,
+		"refine the pattern or search a narrower path")
 }
 
 // ListMarker is emitted when a listing hits its entry cap.
 func ListMarker(limit int) string {
-	return fmt.Sprintf("[%d entries limit reached. Use limit=%d for more]", limit, limit*2)
+	return capMarker("entries", "limit", limit, ListEntryCap,
+		"list a subdirectory, or use find_files with a pattern")
+}
+
+// SearchMarker is emitted when a search hits its match cap. It names the
+// parameter search_files actually takes, `max_matches`, not find_files'
+// `limit` (REQ-TOOL-09b).
+func SearchMarker(limit int) string {
+	return capMarker("matches", "max_matches", limit, SearchMatchCap,
+		"refine the pattern, narrow the path or use file_glob")
+}
+
+// SearchBytesMarker is emitted when a search hits the 50 KB byte cap before
+// its match cap (REQ-TOOL-09). There is no offset to continue from, so the
+// call it names is a narrower one.
+func SearchBytesMarker(shown int, limit int) string {
+	return fmt.Sprintf("[Showing %d matches; %s limit reached. Refine the pattern, "+
+		"narrow the path or file_glob, or reduce context_lines.]", shown, humanBytes(int64(limit)))
+}
+
+// capMarker is the shared shape: below the cap it names a larger call, at the
+// cap it says the cap is the maximum and names the alternative.
+func capMarker(noun, param string, limit, max int, alternative string) string {
+	if limit >= max {
+		return fmt.Sprintf("[%d %s limit reached, which is the maximum %s; %s]",
+			max, noun, param, alternative)
+	}
+	next := limit * 2
+	if next > max {
+		next = max
+	}
+	return fmt.Sprintf("[%d %s limit reached. Use %s=%d for more, or %s]",
+		limit, noun, param, next, alternative)
 }
 
 // LongLineMarker names a shell workaround for a single line too large to

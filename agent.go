@@ -244,9 +244,13 @@ func (a *Agent) Snapshot(ctx context.Context) (core.SessionSnapshot, error) {
 	idle := a.Phase() == core.PhaseIdle && a.holds == 0 && !a.running
 	a.mu.Unlock()
 
+	// Messages and Revision are read under ONE history lock, so the revision
+	// always describes exactly the messages beside it.
+	msgs, rev := a.history.SnapshotBranch()
+
 	return core.SessionSnapshot{
 		ProducerID: a.producerID,
-		Revision:   a.history.Revision(),
+		Revision:   rev,
 		Phase:      a.Phase(),
 		Idle:       idle,
 		SessionID:  cfg.SessionID,
@@ -258,10 +262,20 @@ func (a *Agent) Snapshot(ctx context.Context) (core.SessionSnapshot, error) {
 			ThinkingLevel: cfg.ThinkingLevel,
 			ToolNames:     names,
 		},
-		Messages: a.history.CloneBranch(),
+		Messages: msgs,
 		Usage:    usage,
 		TakenAt:  time.Now(),
 	}, nil
+}
+
+// ResolvedModel exposes the model descriptor the agent is currently
+// configured with (REQ-CAT-07), so a caller can inspect which catalog row —
+// or which sibling clone — a request will be built against. It reflects
+// SetModel immediately.
+func (a *Agent) ResolvedModel() *core.Model {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Model
 }
 
 // History exposes the in-memory active branch. It is a view; the durable

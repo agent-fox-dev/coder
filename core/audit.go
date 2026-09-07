@@ -31,9 +31,10 @@ type AuditEvent struct {
 	ToolName  string
 	ToolUseID string
 	// ServerName is the MCP server a qualified tool came from, empty for a
-	// local tool. It is derived from the REQ-SEC-08 name prefix rather than
-	// plumbed separately, so it is right for any tool that follows the
-	// convention and empty rather than wrong for one that does not.
+	// local tool. It comes from Tool.MCPServer — the layer that opened the
+	// connection is the only one that knows — with the REQ-SEC-08 name
+	// prefix as a fallback for a tool assembled without the field, so it is
+	// empty rather than wrong for a tool that follows neither.
 	ServerName string
 	// ArgumentsHash is a SHA-256 of the argument bytes.
 	//

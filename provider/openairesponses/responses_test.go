@@ -33,8 +33,25 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+// reasoningModel is model() with a priced effort ladder, for the tests that
+// send a thinking level: REQ-PROV-15 omits the level on a row with no map.
+func reasoningModel() *core.Model {
+	m := model()
+	low, medium, high := "low", "medium", "high"
+	m.Reasoning = true
+	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{
+		core.ThinkingLow: &low, core.ThinkingMedium: &medium, core.ThinkingHigh: &high,
+	}
+	return m
+}
+
 // send drives the provider and returns the request body it produced.
 func send(t *testing.T, opts openairesponses.Options, req core.Request, stream string) map[string]any {
+	t.Helper()
+	return sendTo(t, model(), opts, req, stream)
+}
+
+func sendTo(t *testing.T, m *core.Model, opts openairesponses.Options, req core.Request, stream string) map[string]any {
 	t.Helper()
 	var raw []byte
 	req.Options.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -43,7 +60,7 @@ func send(t *testing.T, opts openairesponses.Options, req core.Request, stream s
 			Body: io.NopCloser(strings.NewReader(stream))}, nil
 	})
 	req.Options.Env = map[string]string{"OPENAI_API_KEY": "test-key"}
-	openairesponses.Provider(opts).Stream(context.Background(), model(), req,
+	openairesponses.Provider(opts).Stream(context.Background(), m, req,
 		core.ProviderStreamOptions{}).Result()
 	if len(raw) == 0 {
 		t.Fatal("no request body was sent")
@@ -283,7 +300,9 @@ func TestReasoningIsReplayedWithItsItemIDAndEncryptedContent(t *testing.T) {
 // unless `include` asks for it, and a stateless caller then has nothing to
 // replay — silently, since the turn otherwise succeeds.
 func TestEncryptedReasoningIsRequested(t *testing.T) {
-	body := send(t, openairesponses.Options{}, core.Request{
+	// A level is sent only when the row prices it (REQ-PROV-15); a model with
+	// no map gets no reasoning object at all.
+	body := sendTo(t, reasoningModel(), openairesponses.Options{}, core.Request{
 		Messages:      core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
 		ThinkingLevel: core.ThinkingMedium,
 	}, completedStream)
@@ -532,5 +551,120 @@ func TestATruncatedStreamIsReportedRatherThanReturnedAsSuccess(t *testing.T) {
 	// What arrived is still kept (REQ-PROV-04: partial content AND a failure).
 	if msg.Content.Text() != "Hel" {
 		t.Fatalf("content = %q, want the partial text preserved", msg.Content.Text())
+	}
+}
+
+// ---- fixes pinned by the REQ audit
+
+// TestTheServedTierIsBilledNotTheConfiguredOne is REQ-PROV-05.6 read
+// carefully: the multiplier belongs to the tier that SERVED the request, which
+// the response names and which can differ from the one asked for. A flex
+// request served at standard was charged in full; halving it here is a bill
+// that is silently wrong.
+func TestTheServedTierIsBilledNotTheConfiguredOne(t *testing.T) {
+	served := func(tier string) string {
+		return ev("response.output_item.added",
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`) +
+			ev("response.output_text.delta",
+				`{"type":"response.output_text.delta","output_index":0,"delta":"Hello"}`) +
+			ev("response.completed",
+				`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-resp","status":"completed","service_tier":"`+tier+`","usage":{"input_tokens":1000,"output_tokens":42,"total_tokens":1042}}}`)
+	}
+	base := driveWith(t, openairesponses.Options{}, served("default"))
+	if base.Usage.CostUSD <= 0 {
+		t.Fatalf("no cost was computed: %+v", base.Usage)
+	}
+
+	flexAskedStandardServed := driveWith(t, openairesponses.Options{
+		ServiceTier: provider.ServiceTier{Name: "flex", Multiplier: 0.5},
+	}, served("default"))
+	if !closeEnough(flexAskedStandardServed.Usage.CostUSD, base.Usage.CostUSD) {
+		t.Fatalf("cost = %v, want the full %v: the response says it was served at "+
+			"the standard tier, and the configured flex multiplier does not apply",
+			flexAskedStandardServed.Usage.CostUSD, base.Usage.CostUSD)
+	}
+
+	nothingAskedFlexServed := driveWith(t, openairesponses.Options{}, served("flex"))
+	if !closeEnough(nothingAskedFlexServed.Usage.CostUSD, base.Usage.CostUSD*0.5) {
+		t.Fatalf("cost = %v, want half of %v: the response names the flex tier",
+			nothingAskedFlexServed.Usage.CostUSD, base.Usage.CostUSD)
+	}
+}
+
+// TestAFailedStreamCarriesATerminalErrorEventBeforeMessageEnd aligns this
+// wire with faux's normative sequence and with every other adapter
+// (REQ-PROV-04): a consumer that reacts to ErrorEvent never saw one here.
+func TestAFailedStreamCarriesATerminalErrorEventBeforeMessageEnd(t *testing.T) {
+	truncated := ev("response.output_item.added",
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`)
+	req := core.Request{Options: core.RequestOptions{
+		Env: map[string]string{"OPENAI_API_KEY": "test-key"},
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: http.Header{},
+				Body: io.NopCloser(strings.NewReader(truncated))}, nil
+		}),
+	}}
+	s := openairesponses.Provider(openairesponses.Options{}).Stream(context.Background(), model(), req,
+		core.ProviderStreamOptions{})
+	var seq []string
+	for e := range s.Events() {
+		switch v := e.(type) {
+		case core.ErrorEvent:
+			if v.Terminal {
+				seq = append(seq, "error")
+			}
+		case core.MessageEndEvent:
+			seq = append(seq, "message_end")
+		}
+	}
+	if strings.Join(seq, ",") != "error,message_end" {
+		t.Fatalf("terminal sequence = %v, want a terminal ErrorEvent immediately before MessageEnd", seq)
+	}
+	if s.Result().StopReason != core.StopReasonError {
+		t.Fatalf("stop reason = %q, want error", s.Result().StopReason)
+	}
+}
+
+// TestStrictRidesOnlyOnTheRewrittenSchema is REQ-TOOL-03 on this wire: the
+// schema is probed through the strict subset before anything is sent. An
+// optional property is widened and required; a $ref cannot be rewritten, so
+// `prefer` falls back to unconstrained and `require` fails the request
+// before the first byte (REQ-PROV-04).
+func TestStrictRidesOnlyOnTheRewrittenSchema(t *testing.T) {
+	strict := func(mode core.StrictMode, s *schema.Schema) core.Request {
+		return core.Request{
+			Messages: core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+			Tools: []core.ToolWire{{Name: "find", InputSchema: s,
+				ConstrainedSampling: &core.ConstrainedSampling{Type: core.ConstrainJSONSchema, Strict: mode}}},
+		}
+	}
+	optional := schema.Object(schema.Prop("pattern", schema.String()), schema.Opt("limit", schema.Int()))
+	body := send(t, openairesponses.Options{}, strict(core.StrictPrefer, optional), completedStream)
+	tool := body["tools"].([]any)[0].(map[string]any)
+	if tool["strict"] != true {
+		t.Fatalf("tool = %v, want strict:true on a schema the rewrite accepts", tool)
+	}
+	params := tool["parameters"].(map[string]any)
+	if params["additionalProperties"] != false {
+		t.Fatalf("parameters = %v, want additionalProperties:false", params)
+	}
+	req, _ := params["required"].([]any)
+	if len(req) != 2 {
+		t.Fatalf("required = %v, want every property listed, the optional one widened to nullable", req)
+	}
+
+	withRef := schema.Object(schema.Prop("q", schema.String().WithExtra("$ref", "#/$defs/q")))
+	body = send(t, openairesponses.Options{}, strict(core.StrictPrefer, withRef), completedStream)
+	tool = body["tools"].([]any)[0].(map[string]any)
+	if _, present := tool["strict"]; present {
+		t.Fatalf("tool = %v: a $ref cannot be rewritten, and prefer must fall back to unconstrained", tool)
+	}
+
+	s := openairesponses.Provider(openairesponses.Options{}).Stream(context.Background(), model(),
+		strict(core.StrictRequire, withRef), core.ProviderStreamOptions{})
+	msg := s.Result()
+	if msg.StopReason != core.StopReasonError || !strings.Contains(msg.ErrorMessage, "$ref") {
+		t.Fatalf("require on a $ref schema: stop=%q err=%q, want a pre-closed error stream naming $ref",
+			msg.StopReason, msg.ErrorMessage)
 	}
 }
