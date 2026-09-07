@@ -667,6 +667,98 @@ func TestAnEmptyToolResultOmitsContent(t *testing.T) {
 	}
 }
 
+// TestASignedThinkingBlockWithNoTextStillCarriesItsThinkingKey is the same
+// class of bug as TestAnEmptyToolResultOmitsContent, on the other required
+// field of this wire.
+//
+// The model really does send a thinking block whose text is empty and whose
+// signature is not: the summarizer produces nothing for a short thought, and
+// the block still arrives signed and still has to be replayed — REQ-PROV-11
+// rule 4 keeps it precisely because it is signed. Thinking was omitzero, so
+// the replay serialized as {"type":"thinking","signature":"…"} and the
+// Messages API answered `messages.1.content.0.thinking.thinking: Field
+// required`, killing the run on the turn AFTER the first tool call.
+func TestASignedThinkingBlockWithNoTextStillCarriesItsThinkingKey(t *testing.T) {
+	body := sseBody(
+		[2]string{"message_start", `{"message":{"id":"m","model":"claude-test","usage":{"input_tokens":5}}}`},
+		[2]string{"content_block_start", `{"index":0,"content_block":{"type":"thinking","thinking":""}}`},
+		[2]string{"content_block_delta", `{"index":0,"delta":{"type":"signature_delta","signature":"SIGBYTES"}}`},
+		[2]string{"content_block_stop", `{"index":0}`},
+		[2]string{"content_block_start", `{"index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"search_files","input":{}}}`},
+		[2]string{"content_block_delta", `{"index":1,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"x\"}"}}`},
+		[2]string{"content_block_stop", `{"index":1}`},
+		[2]string{"message_delta", `{"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}`},
+		[2]string{"message_stop", `{}`},
+	)
+	turn, _, _ := run(t, testModel(), core.Request{}, anthropic.Options{}, 200, body)
+
+	tb, ok := turn.Content[0].(core.ThinkingBlock)
+	if !ok || tb.Thinking != "" || tb.Signature != "SIGBYTES" {
+		t.Fatalf("block 0 = %#v, want an empty but SIGNED thinking block", turn.Content[0])
+	}
+
+	// The next request replays that turn. This is the request that used to be
+	// a 400.
+	req := core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "which files?"}}},
+		*turn,
+		core.ToolResultMessage{ToolUseID: "toolu_1", ToolName: "search_files",
+			Content: core.Content{core.TextBlock{Text: "policy.go"}}},
+	}}
+	out, rep, err := anthropic.BuildRequest(testModel(), req, core.CacheRetentionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.DowngradedThinking != 0 {
+		t.Fatalf("repair downgraded %d thinking blocks; a SIGNED block replayed to its "+
+			"own model must survive rule 4 intact", rep.DowngradedThinking)
+	}
+	raw, _ := json.Marshal(out)
+	var got struct {
+		Messages []struct {
+			Content []map[string]any `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	think := got.Messages[1].Content[0]
+	if think["type"] != "thinking" {
+		t.Fatalf("first assistant block = %v, want the thinking block", think)
+	}
+	if _, present := think["thinking"]; !present {
+		t.Fatalf("thinking block = %v; the thinking key is REQUIRED even when empty: %s",
+			think, raw)
+	}
+	if think["signature"] != "SIGBYTES" {
+		t.Fatalf("thinking block = %v, want the signature replayed verbatim", think)
+	}
+}
+
+// TestARedactedThinkingBlockAlwaysCarriesItsDataKey is the redacted arm of the
+// same required-field rule: `data` is what the block IS, so a redacted block
+// that lost it is both a 400 and unverifiable state the model expected back.
+func TestARedactedThinkingBlockAlwaysCarriesItsDataKey(t *testing.T) {
+	req := core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}},
+		core.AssistantMessage{
+			Provider: "anthropic", API: anthropic.API, Model: "claude-test",
+			Content: core.Content{
+				core.ThinkingBlock{Redacted: true, Signature: "OPAQUE"},
+				core.TextBlock{Text: "done"},
+			},
+		},
+	}}
+	out, _, err := anthropic.BuildRequest(testModel(), req, core.CacheRetentionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(out)
+	if !strings.Contains(string(raw), `{"type":"redacted_thinking","data":"OPAQUE"}`) {
+		t.Fatalf("body = %s, want the redacted block replayed with its data", raw)
+	}
+}
+
 // TestMaxTokensIsNeverZeroAndMessagesNeverNull: both are hard 400s on this
 // wire, and both used to be reachable — max_tokens from a Model with no cap
 // and no window, messages from a request with no history.
