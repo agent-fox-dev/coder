@@ -12,6 +12,12 @@ go test ./...          # everything, offline, no API key
 go run ./examples/agentdemo
 ```
 
+[`examples/`](examples/) has five runnable programs — chat, streaming, a
+coding agent, durable sessions and multi-agent delegation — and
+[`examples/README.md`](examples/README.md) is the configuration reference:
+which environment variable each vendor reads, what a base URL does and does
+not buy you, and the three decisions every embedding application has to make.
+
 To talk to a real model, register a wire API on the config. Nothing is
 registered by import side effect, so the root package never drags `net/http`
 into a consumer that only wants the loop:
