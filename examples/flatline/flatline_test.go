@@ -309,8 +309,19 @@ func TestLoadPackRefusesDependenciesAndSealedSpecs(t *testing.T) {
 	withDep := strings.Replace(string(b), `"dependencies": []`,
 		`"dependencies": [{"depends_on_spec": "02", "from_group": 1, "to_group": 1, "relationship": "x", "sentinel": false}]`, 1)
 	write(t, tasksPath, withDep)
-	if _, _, err := LoadPack(root, specDir); err == nil || !strings.Contains(err.Error(), "dependenc") {
-		t.Errorf("a pack with dependencies must be refused, got %v", err)
+	if _, _, err := LoadPack(root, specDir); err == nil || !strings.Contains(err.Error(), "--assume-deps") {
+		t.Errorf("a pack with dependencies must be refused and name the flag, got %v", err)
+	}
+	pack, warnings, err := LoadPackWith(root, specDir, true)
+	if err != nil {
+		t.Fatalf("--assume-deps must load the pack: %v", err)
+	}
+	if !strings.Contains(strings.Join(warnings, "\n"), "assumed in place: spec 02 group 1, needed from task group 1 (x)") {
+		t.Errorf("the assumption must be reported, got %v", warnings)
+	}
+	ctx := pack.AssembleContext(Coder, 1, nil)
+	if !strings.Contains(ctx, "## Dependencies") || !strings.Contains(ctx, "| 02 | 1 | 1 | x |") || !strings.Contains(ctx, "assumed to be in place") {
+		t.Errorf("the coder must see the assumed dependencies:\n%s", ctx)
 	}
 	write(t, tasksPath, string(b))
 

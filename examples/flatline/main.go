@@ -71,6 +71,7 @@ func run() int {
 	sessionTimeout := flag.Duration("session-timeout", 45*time.Minute, "wall-clock ceiling per session (agent-fox session_timeout)")
 	checkTimeout := flag.Duration("check-timeout", 10*time.Minute, "timeout for one test command")
 	noVerifier := flag.Bool("no-verifier", false, "skip the informational verifier session after the last group")
+	assumeDeps := flag.Bool("assume-deps", false, "treat the pack's cross-spec dependencies as already implemented instead of refusing the run")
 	journal := flag.String("journal", "", "append a JSONL record of every step to this file")
 	allow := flag.String("allow", "", "extra programs the coder's shell may run, comma-separated")
 	showText := flag.Bool("show-text", false, "print the model's prose as well as its tool calls")
@@ -110,7 +111,7 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return exitUsage
 	}
-	pack, warnings, err := LoadPack(ws.Root, specDir)
+	pack, warnings, err := LoadPackWith(ws.Root, specDir, *assumeDeps)
 	for _, w := range warnings {
 		fmt.Fprintf(os.Stderr, "  ! spec warning: %s\n", w)
 	}
