@@ -481,7 +481,7 @@ func (r *runner) step(ctx context.Context, name string, fn func() (string, error
 	}
 
 	r.outMu.Lock()
-	fmt.Fprintf(r.o.Out, "(%s)\n", FormatTokenTiming(elapsed, inTokens, outTokens))
+	fmt.Fprintf(r.o.Out, "%s\n", FormatTokenTiming(elapsed, inTokens, outTokens))
 	if err != nil {
 		fmt.Fprintf(r.o.Out, "  ✗ %s\n", indent(err.Error()))
 	}

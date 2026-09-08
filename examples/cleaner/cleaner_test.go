@@ -600,8 +600,23 @@ func keys(m map[string]string) []string {
 
 func TestTokenTimingFormatting(t *testing.T) {
 	formatted := FormatTokenTiming(1500*time.Millisecond, 100, 50)
-	if formatted != "1.5s · 100 sent / 50 received tokens" {
-		t.Errorf("FormatTokenTiming = %q, want %q", formatted, "1.5s · 100 sent / 50 received tokens")
+	if formatted != "(2s) · 100↑ 50↓" {
+		t.Errorf("FormatTokenTiming = %q, want %q", formatted, "(2s) · 100↑ 50↓")
+	}
+
+	// Sub-second duration (< 1s) formatted in milliseconds
+	if subSec := FormatTokenTiming(500*time.Millisecond, 100, 50); subSec != "(500ms) · 100↑ 50↓" {
+		t.Errorf("FormatTokenTiming (sub-second) = %q, want %q", subSec, "(500ms) · 100↑ 50↓")
+	}
+
+	// Minutes duration with spaced units and k-scale tokens
+	if minTiming := FormatTokenTiming(28*time.Minute+16*time.Second, 153, 60600); minTiming != "(28m 16s) · 153↑ 60.6k↓" {
+		t.Errorf("FormatTokenTiming (minute + k) = %q, want %q", minTiming, "(28m 16s) · 153↑ 60.6k↓")
+	}
+
+	// Seconds rounded and M-scale tokens
+	if mTiming := FormatTokenTiming(65*time.Second, 1_200_000, 2_500_000); mTiming != "(1m 5s) · 1.2M↑ 2.5M↓" {
+		t.Errorf("FormatTokenTiming (M tokens) = %q, want %q", mTiming, "(1m 5s) · 1.2M↑ 2.5M↓")
 	}
 
 	stats := RunStats{
@@ -616,15 +631,15 @@ func TestTokenTimingFormatting(t *testing.T) {
 		Elapsed: 1200 * time.Millisecond,
 	}
 
-	if got := stats.TokenTiming(); got != "1.2s · 120 sent / 80 received tokens" {
-		t.Errorf("TokenTiming() = %q, want %q", got, "1.2s · 120 sent / 80 received tokens")
+	if got := stats.TokenTiming(); got != "(1s) · 120↑ 80↓" {
+		t.Errorf("TokenTiming() = %q, want %q", got, "(1s) · 120↑ 80↓")
 	}
 
 	costFree := stats.TimingWithoutCost()
 	if strings.Contains(costFree, "$") {
 		t.Errorf("TimingWithoutCost() contains dollar sign: %q", costFree)
 	}
-	if !strings.Contains(costFree, "analyze") || !strings.Contains(costFree, "2 turns") || !strings.Contains(costFree, "1.2s · 120 sent / 80 received tokens") || !strings.Contains(costFree, "tool_terminate") {
+	if !strings.Contains(costFree, "analyze") || !strings.Contains(costFree, "2 turns") || !strings.Contains(costFree, "(1s) · 120↑ 80↓") || !strings.Contains(costFree, "tool_terminate") {
 		t.Errorf("TimingWithoutCost() missing expected metrics: %q", costFree)
 	}
 
@@ -663,10 +678,10 @@ func TestSpinnerAndPhaseTimingNonVerbose(t *testing.T) {
 	}
 
 	// 2. Completion timing line with tokens should appear
-	if !strings.Contains(out, "[cleaner] preflight") || !strings.Contains(out, "sent / 0 received tokens)") {
+	if !strings.Contains(out, "[cleaner] preflight") || !strings.Contains(out, "0↑ 0↓") {
 		t.Errorf("missing preflight timing line in output: %q", out)
 	}
-	if !strings.Contains(out, "[cleaner] analyze") || !strings.Contains(out, "tokens)") {
+	if !strings.Contains(out, "[cleaner] analyze") || !strings.Contains(out, "↑") || !strings.Contains(out, "↓") {
 		t.Errorf("missing analyze timing line in output: %q", out)
 	}
 
@@ -864,7 +879,7 @@ func TestSummaryVerboseVsNonVerbose(t *testing.T) {
 	if strings.Contains(nonVerboseOut, "cost:") {
 		t.Errorf("non-verbose summary should omit cost line, got: %q", nonVerboseOut)
 	}
-	if !strings.Contains(nonVerboseOut, "100 sent / 50 received tokens") {
+	if !strings.Contains(nonVerboseOut, "100↑ 50↓") {
 		t.Errorf("non-verbose summary missing tokens: %q", nonVerboseOut)
 	}
 

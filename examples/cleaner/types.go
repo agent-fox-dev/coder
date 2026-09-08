@@ -137,9 +137,44 @@ func (s RunStats) String() string {
 		s.CostUSD, s.Elapsed.Round(time.Millisecond))
 }
 
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+
+	var parts []string
+	if h > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", h))
+	}
+	if m > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", m))
+	}
+	if s > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", s))
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatTokens(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
+}
+
 // FormatTokenTiming formats elapsed duration and tokens sent/received without dollar figures.
 func FormatTokenTiming(elapsed time.Duration, sent, received int) string {
-	return fmt.Sprintf("%s · %d sent / %d received tokens", elapsed.Round(time.Millisecond), sent, received)
+	return fmt.Sprintf("(%s) · %s↑ %s↓", formatDuration(elapsed), formatTokens(sent), formatTokens(received))
 }
 
 // TokenTiming returns the elapsed duration and token counts without dollar figures.
