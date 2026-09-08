@@ -37,7 +37,7 @@ kill-and-resume across two "processes" and three concurrent delegations.
 
 ## Status
 
-This implements [`agent-kit-prd.md`](agent-kit-prd.md) v0.4.2. It is a
+This implements [`agent-kit-prd.md`](docs/prd/agent-kit-prd.md) v0.4.2. It is a
 working library with a thorough test suite; it is not a finished product.
 [What is not built](#what-is-not-built) is stated below rather than left to
 be discovered, and the requirement-by-requirement audit that produced 0.4.1

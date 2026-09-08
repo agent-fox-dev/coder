@@ -148,7 +148,7 @@ them; if one seems wrong, cite the requirement it implements and mark it
 
 This prompt restates nothing it can point to. The sources of truth are:
 
-- Requirement ids: `agent-kit-prd.md` at the repository root. Quote the id,
+- Requirement ids: `agent-kit-prd.md` at "docs/prd/". Quote the id,
   not a paraphrase of the requirement.
 - Dependency rulings: `docs/DEPS.md`, backed by `internal/policy/deps_test.go`.
 - Provider and protocol pins: `docs/PROVIDERS.md`.

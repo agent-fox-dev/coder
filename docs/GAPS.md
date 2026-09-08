@@ -1,6 +1,6 @@
 # Requirement audit — PRD 0.4.2
 
-A requirement-by-requirement comparison of `agent-kit-prd.md` against the
+A requirement-by-requirement comparison of `docs/prd/docs/prd/agent-kit-prd.md` against the
 code. The first pass (0.4.1) was made on 2026-09-06; 0.4.2 closed every item
 that pass had recorded as deferred, and each of those rows now names what
 shipped and the test that pins it. Every row is one finding: what the requirement
