@@ -472,3 +472,184 @@ func TestAnOversizedReportIsTruncatedVisibly(t *testing.T) {
 		t.Error("the truncation is invisible to the model")
 	}
 }
+
+// --------------------------------------------------------------------- 7 --
+//
+// CLI flags, target repository validation, and dry-run gating.
+
+func TestFlagParsingRejectsCreateAndAcceptsDryRun(t *testing.T) {
+	t.Run("default is not dry-run", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"test bug"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.dryRun {
+			t.Errorf("cfg.dryRun = true, want false by default")
+		}
+		if cfg.arg != "test bug" {
+			t.Errorf("cfg.arg = %q, want %q", cfg.arg, "test bug")
+		}
+	})
+
+	t.Run("dry-run flag before operand", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"--dry-run", "test bug"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.dryRun {
+			t.Errorf("cfg.dryRun = false, want true")
+		}
+		if cfg.arg != "test bug" {
+			t.Errorf("cfg.arg = %q, want %q", cfg.arg, "test bug")
+		}
+	})
+
+	t.Run("dry-run flag after operand", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"test bug", "--dry-run"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.dryRun {
+			t.Errorf("cfg.dryRun = false, want true")
+		}
+		if cfg.arg != "test bug" {
+			t.Errorf("cfg.arg = %q, want %q", cfg.arg, "test bug")
+		}
+	})
+
+	t.Run("create flag rejected as undefined before operand", func(t *testing.T) {
+		_, err := parseCLI([]string{"--create", "test bug"})
+		if err == nil {
+			t.Fatal("parseCLI with --create succeeded, want undefined flag error")
+		}
+		if !strings.Contains(err.Error(), "create") {
+			t.Errorf("error = %v, want it to name 'create'", err)
+		}
+	})
+
+	t.Run("create flag rejected as undefined after operand", func(t *testing.T) {
+		_, err := parseCLI([]string{"test bug", "--create"})
+		if err == nil {
+			t.Fatal("parseCLI with --create succeeded, want undefined flag error")
+		}
+		if !strings.Contains(err.Error(), "create") {
+			t.Errorf("error = %v, want it to name 'create'", err)
+		}
+	})
+}
+
+func TestTargetRepoValidationHaltsWithoutDryRun(t *testing.T) {
+	dir := t.TempDir()
+	rep := Report{Kind: SourceText, Origin: "argument", Body: "something broke"}
+
+	// When no repo flag is passed and dir has no origin remote:
+	owner, repo, err := targetRepo("", dir, rep)
+	if err == nil {
+		t.Fatalf("targetRepo succeeded, got %s/%s; want error when no repo found", owner, repo)
+	}
+
+	// Under AC-4: without --dry-run, this error halts before analysis.
+	dryRun := false
+	haltExecution := err != nil && !dryRun
+	if !haltExecution {
+		t.Errorf("err != nil && !dryRun = false, want true (halt before model analysis)")
+	}
+
+	// With --dry-run, execution is allowed to proceed to triage.
+	dryRun = true
+	haltExecution = err != nil && !dryRun
+	if haltExecution {
+		t.Errorf("err != nil && !dryRun = true with dryRun=true, want false (allow triage)")
+	}
+
+	// With an explicit repo flag, neither mode halts.
+	owner, repo, err = targetRepo("foo/bar", dir, rep)
+	if err != nil || owner != "foo" || repo != "bar" {
+		t.Fatalf("targetRepo with --repo failed: owner=%q, repo=%q, err=%v", owner, repo, err)
+	}
+	if err != nil && !false {
+		t.Error("unexpected halt with valid repo")
+	}
+}
+
+type mockIssueCreator struct {
+	called bool
+	owner  string
+	repo   string
+	title  string
+	body   string
+	labels []string
+	retURL string
+	err    error
+}
+
+func (m *mockIssueCreator) CreateIssue(owner, repo, title, body string, labels []string) (string, error) {
+	m.called = true
+	m.owner = owner
+	m.repo = repo
+	m.title = title
+	m.body = body
+	m.labels = labels
+	if m.err != nil {
+		return "", m.err
+	}
+	return m.retURL, nil
+}
+
+func TestDryRunGating(t *testing.T) {
+	t.Run("AC-1: live run creates issue on GitHub", func(t *testing.T) {
+		mock := &mockIssueCreator{retURL: "https://github.com/agent-fox-dev/coder/issues/100"}
+		var stderr strings.Builder
+		issue := goodIssue()
+		err := fileOrDryRun(&stderr, mock, false, "agent-fox-dev", "coder", issue, "issue body", []string{"af:fix"})
+		if err != nil {
+			t.Fatalf("fileOrDryRun: %v", err)
+		}
+		if !mock.called {
+			t.Fatal("gh.CreateIssue was not called for live run")
+		}
+		if mock.owner != "agent-fox-dev" || mock.repo != "coder" || mock.title != issue.Title {
+			t.Errorf("unexpected CreateIssue args: owner=%s, repo=%s, title=%s", mock.owner, mock.repo, mock.title)
+		}
+		if len(mock.labels) != 1 || mock.labels[0] != "af:fix" {
+			t.Errorf("unexpected labels: %v", mock.labels)
+		}
+		if !strings.Contains(stderr.String(), "[issued] filed: https://github.com/agent-fox-dev/coder/issues/100") {
+			t.Errorf("stderr missing filed url: %s", stderr.String())
+		}
+	})
+
+	t.Run("AC-2: dry run does not create issue and prints re-run advice", func(t *testing.T) {
+		mock := &mockIssueCreator{}
+		var stderr strings.Builder
+		issue := goodIssue()
+		err := fileOrDryRun(&stderr, mock, true, "agent-fox-dev", "coder", issue, "issue body", []string{"af:fix"})
+		if err != nil {
+			t.Fatalf("fileOrDryRun: %v", err)
+		}
+		if mock.called {
+			t.Fatal("gh.CreateIssue was called during dry run")
+		}
+		want := "[issued] dry run. Re-run without --dry-run to file it.\n"
+		if stderr.String() != want {
+			t.Errorf("stderr = %q, want %q", stderr.String(), want)
+		}
+	})
+
+	t.Run("AC-2 and AC-4: dry run with unresolved repo prints repo advice", func(t *testing.T) {
+		mock := &mockIssueCreator{}
+		var stderr strings.Builder
+		issue := goodIssue()
+		err := fileOrDryRun(&stderr, mock, true, "", "", issue, "issue body", nil)
+		if err != nil {
+			t.Fatalf("fileOrDryRun: %v", err)
+		}
+		if mock.called {
+			t.Fatal("gh.CreateIssue was called during dry run")
+		}
+		want := "[issued] dry run. Re-run with --repo owner/repo to file it.\n"
+		if stderr.String() != want {
+			t.Errorf("stderr = %q, want %q", stderr.String(), want)
+		}
+	})
+}

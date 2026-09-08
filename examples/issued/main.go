@@ -12,10 +12,10 @@
 //
 //	go run ./examples/issued "panic: nil map write in loop.go when a tool result arrives after abort"
 //	go run ./examples/issued ./crash.log --dir .
-//	go run ./examples/issued https://github.com/owner/repo/issues/42 --create --label af:fix
+//	go run ./examples/issued https://github.com/owner/repo/issues/42 --label af:fix
 //	kubectl logs deploy/api | go run ./examples/issued -
 //
-// It prints the rendered issue and files nothing unless you pass --create.
+// It creates the issue on GitHub unless you pass --dry-run.
 //
 //	AGENTKIT_MODEL=openai/gpt-5.6-terra go run ./examples/issued ./crash.log
 //
@@ -51,27 +51,54 @@ func main() {
 	}
 }
 
+type cliConfig struct {
+	dir     string
+	repo    string
+	dryRun  bool
+	labels  string
+	outFile string
+	verbose bool
+	arg     string
+}
+
+func newFlagSet() (*flag.FlagSet, *cliConfig) {
+	var cfg cliConfig
+	fs := flag.NewFlagSet("issued", flag.ContinueOnError)
+	fs.StringVar(&cfg.dir, "dir", ".", "workspace root; the analysis cannot read outside it")
+	fs.StringVar(&cfg.repo, "repo", "", "target repository as owner/repo (default: the origin remote of --dir)")
+	fs.BoolVar(&cfg.dryRun, "dry-run", false, "make no changes to GitHub; only print the rendered issue")
+	fs.StringVar(&cfg.labels, "label", "", "comma-separated labels for the created issue, e.g. af:fix,bug")
+	fs.StringVar(&cfg.outFile, "out", "", "also write the rendered issue to this file")
+	fs.BoolVar(&cfg.verbose, "verbose", false, "stream the model's reasoning text to stderr")
+	fs.Usage = func() {
+		printUsage(fs.Output(), fs)
+	}
+	return fs, &cfg
+}
+
+func parseCLI(argv []string) (*cliConfig, error) {
+	fs, cfg := newFlagSet()
+	operands, err := parseArgs(fs, argv)
+	if err != nil {
+		return nil, err
+	}
+	cfg.arg = strings.Join(operands, " ")
+	return cfg, nil
+}
+
 func run() error {
-	var (
-		dir     = flag.String("dir", ".", "workspace root; the analysis cannot read outside it")
-		repoFl  = flag.String("repo", "", "target repository as owner/repo (default: the origin remote of --dir)")
-		create  = flag.Bool("create", false, "actually file the issue on GitHub; without it, nothing is written anywhere")
-		labels  = flag.String("label", "", "comma-separated labels for the created issue, e.g. af:fix,bug")
-		outFile = flag.String("out", "", "also write the rendered issue to this file")
-		verbose = flag.Bool("verbose", false, "stream the model's reasoning text to stderr")
-	)
-	flag.Usage = usage
-	// parseArgs, not flag.Parse: the standard parser stops at the first
-	// non-flag argument, which would make `issued ./crash.log --dir .` read
-	// as a single three-word problem report. Every CLI a person actually
-	// types accepts flags after the operand.
-	arg := strings.Join(parseArgs(os.Args[1:]), " ")
+	cfg, err := parseCLI(os.Args[1:])
+	if errors.Is(err, flag.ErrHelp) {
+		return nil
+	} else if err != nil {
+		return err
+	}
 
 	// 1. Classify the input before anything expensive happens. An empty
 	//    argument is usage, not a run: the skill's "halt until input is
 	//    received" is a program that exits 2.
 	gh := NewGitHub()
-	report, err := ResolveInput(arg, os.Stdin, gh)
+	report, err := ResolveInput(cfg.arg, os.Stdin, gh)
 	if errors.Is(err, ErrNoInput) {
 		usage()
 		return errors.New("nothing to triage")
@@ -85,15 +112,15 @@ func run() error {
 	//    Every path the read tools are handed is resolved against this root,
 	//    symlinks included, and so is every path the model later cites in the
 	//    issue.
-	ws, err := tools.NewWorkspace(*dir)
+	ws, err := tools.NewWorkspace(cfg.dir)
 	if err != nil {
 		return err
 	}
 
 	// 3. Resolve the target repository now, so a run that cannot be filed
 	//    fails before it is paid for rather than after.
-	owner, repo, err := targetRepo(*repoFl, *dir, report)
-	if err != nil && *create {
+	owner, repo, err := targetRepo(cfg.repo, cfg.dir, report)
+	if err != nil && !cfg.dryRun {
 		return err
 	}
 
@@ -105,8 +132,8 @@ func run() error {
 		return err
 	}
 
-	cfg := core.AgentConfig{Model: model}
-	agentkit.RegisterDefaults(&cfg,
+	agentCfg := core.AgentConfig{Model: model}
+	agentkit.RegisterDefaults(&agentCfg,
 		anthropic.Provider(anthropic.Options{}),
 		openai.Provider(openai.Options{}),
 		openairesponses.Provider(openairesponses.Options{}),
@@ -114,7 +141,7 @@ func run() error {
 		ollama.Provider(ollama.Options{}),
 	)
 
-	triager, err := NewTriager(cfg, ws, *verbose)
+	triager, err := NewTriager(agentCfg, ws, cfg.verbose)
 	if err != nil {
 		return err
 	}
@@ -136,27 +163,39 @@ func run() error {
 	fmt.Printf("%s\n\n%s", issue.Title, body)
 	summarize(os.Stderr, triager, res, model.ID)
 
-	if *outFile != "" {
-		if err := os.WriteFile(*outFile, []byte(issue.Title+"\n\n"+body), 0o644); err != nil {
+	if cfg.outFile != "" {
+		if err := os.WriteFile(cfg.outFile, []byte(issue.Title+"\n\n"+body), 0o644); err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "[issued] wrote %s\n", *outFile)
+		fmt.Fprintf(os.Stderr, "[issued] wrote %s\n", cfg.outFile)
 	}
 
 	// 5. The side effect, gated on a flag rather than on the model's judgement.
 	//    Reaching GitHub is not something the agent can do — there is no tool
 	//    for it — so this is the only line in the program that writes anything
 	//    to anyone, and it runs after the run has ended.
-	if !*create {
-		fmt.Fprintf(os.Stderr, "[issued] dry run. Re-run with --create --repo %s to file it.\n",
-			repoLabel(owner, repo))
+	return fileOrDryRun(os.Stderr, gh, cfg.dryRun, owner, repo, issue, body, splitLabels(cfg.labels))
+}
+
+type issueCreator interface {
+	CreateIssue(owner, repo, title, body string, labels []string) (string, error)
+}
+
+func fileOrDryRun(w io.Writer, gh issueCreator, dryRun bool, owner, repo string, issue Issue, body string, labels []string) error {
+	if dryRun {
+		if owner == "" {
+			fmt.Fprintf(w, "[issued] dry run. Re-run with --repo %s to file it.\n",
+				repoLabel(owner, repo))
+		} else {
+			fmt.Fprintln(w, "[issued] dry run. Re-run without --dry-run to file it.")
+		}
 		return nil
 	}
-	url, err := gh.CreateIssue(owner, repo, issue.Title, body, splitLabels(*labels))
+	url, err := gh.CreateIssue(owner, repo, issue.Title, body, labels)
 	if err != nil {
 		return fmt.Errorf("%w\n\n(the issue body is above; you can file it by hand)", err)
 	}
-	fmt.Fprintf(os.Stderr, "[issued] filed: %s\n", url)
+	fmt.Fprintf(w, "[issued] filed: %s\n", url)
 	return nil
 }
 
@@ -216,18 +255,27 @@ func summarize(w io.Writer, t *Triager, res core.RunResult, modelID string) {
 // parse again from what follows it. A lone "-" is an operand, because the flag
 // package stops on any argument shorter than two characters — which is what
 // makes `issued -` mean stdin rather than an unknown flag.
-func parseArgs(argv []string) []string {
+func parseArgs(fs *flag.FlagSet, argv []string) ([]string, error) {
 	var operands []string
-	_ = flag.CommandLine.Parse(argv)
-	for rest := flag.Args(); len(rest) > 0; rest = flag.Args() {
-		operands = append(operands, rest[0])
-		_ = flag.CommandLine.Parse(rest[1:])
+	if err := fs.Parse(argv); err != nil {
+		return nil, err
 	}
-	return operands
+	for rest := fs.Args(); len(rest) > 0; rest = fs.Args() {
+		operands = append(operands, rest[0])
+		if err := fs.Parse(rest[1:]); err != nil {
+			return nil, err
+		}
+	}
+	return operands, nil
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `issued — triage a problem report into a structured GitHub issue.
+	fs, _ := newFlagSet()
+	printUsage(os.Stderr, fs)
+}
+
+func printUsage(w io.Writer, fs *flag.FlagSet) {
+	fmt.Fprint(w, `issued — triage a problem report into a structured GitHub issue.
 
 Usage:
   issued [flags] <text | file.md | file.txt | github-issue-url | ->
@@ -235,14 +283,16 @@ Usage:
 Examples:
   issued "TestResume hangs on a session whose last entry is a tool call"
   issued ./crash.log --dir ./service
-  issued https://github.com/owner/repo/issues/42 --create --label af:fix
+  issued https://github.com/owner/repo/issues/42 --label af:fix
+  issued ./crash.log --dry-run
   kubectl logs deploy/api | issued -
 
-Nothing is written to GitHub unless --create is passed.
+Files an issue to GitHub by default; pass --dry-run to only print the diagnosis.
 
 Flags:
 `)
-	flag.PrintDefaults()
+	fs.SetOutput(w)
+	fs.PrintDefaults()
 }
 
 // modelSpec is "vendor/model-id", or a bare id when it is unambiguous.

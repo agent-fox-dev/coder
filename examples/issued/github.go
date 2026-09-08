@@ -21,8 +21,8 @@ import (
 // the model has no network reach of any kind: `fetch_url` is deliberately not
 // in tools.All(), and this client is called by main() before and after the
 // run, never during it. The consequence is worth stating plainly — no sequence
-// of model outputs can cause this program to write to GitHub. The `--create`
-// flag can, and only a human sets that.
+// of model outputs can cause this program to write to GitHub. The human
+// suppresses the write with `--dry-run` rather than enabling it with `--create`.
 type GitHub struct {
 	Token   string
 	BaseURL string // https://api.github.com, or a GitHub Enterprise host
