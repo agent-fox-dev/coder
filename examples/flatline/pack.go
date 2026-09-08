@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +23,9 @@ type Pack struct {
 	Root     string // the repository root
 	Steering string // .specs/steering.md, empty when absent or placeholder-only
 	Project  string // AGENTS.md or CLAUDE.md, empty when absent
+	// tasksHadSchema records whether tasks.json carried a "$schema" key when
+	// it was read, so it is written back the way it was found.
+	tasksHadSchema bool
 }
 
 // ResolveSpecDir turns the positional argument into a spec directory, the way
@@ -66,7 +71,7 @@ func ResolveSpecDir(specsDir, arg string) (string, error) {
 // agent-fox's planner refuses a pack afspec cannot load, and a pack whose
 // tasks.json cannot be saved back is one this program cannot finish.
 func LoadPack(root, specDir string) (*Pack, []string, error) {
-	spec, err := afspec.LoadSpec(specDir)
+	spec, hadSchema, err := loadSpecTolerant(specDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -93,12 +98,98 @@ func LoadPack(root, specDir string) (*Pack, []string, error) {
 			spec.SpecName, n, plural(n, "y", "ies"))
 	}
 	return &Pack{
-		Spec:     spec,
-		Dir:      specDir,
-		Root:     root,
-		Steering: LoadSteering(root),
-		Project:  loadProjectInstructions(root),
+		Spec:           spec,
+		Dir:            specDir,
+		Root:           root,
+		Steering:       LoadSteering(root),
+		Project:        loadProjectInstructions(root),
+		tasksHadSchema: hadSchema["tasks.json"],
 	}, warnings, nil
+}
+
+// jsonArtifacts are the three JSON files and the "$schema" URI each declares.
+var jsonArtifacts = map[string]string{
+	"requirements.json": "https://agent-fox.dev/schemas/requirements.v1.json",
+	"test_spec.json":    "https://agent-fox.dev/schemas/test_spec.v1.json",
+	"tasks.json":        "https://agent-fox.dev/schemas/tasks.v1.json",
+}
+
+// loadSpecTolerant is afspec.LoadSpec for packs written by the Python
+// library.
+//
+// The format and the JSON Schemas say "$schema" is required, and the Go
+// decoder enforces that at load time. The Python afspec — the implementation
+// agent-fox runs and the one that wrote most packs in the wild — models the
+// key as optional and OMITS it when unset, so a pack straight out of `spec
+// generate` fails to load here with "field $schema in RequirementsV1Json:
+// required". The key carries no information beyond which schema the file
+// follows, and that is fixed per file name; so when it is missing the file is
+// loaded as if it declared the canonical URI, from a temporary copy, and the
+// original is left exactly as it was. The returned map says which files had
+// it, so a write-back can match.
+func loadSpecTolerant(specDir string) (*afspec.Spec, map[string]bool, error) {
+	had := map[string]bool{}
+	patched := map[string][]byte{}
+	for name, uri := range jsonArtifacts {
+		raw, err := os.ReadFile(filepath.Join(specDir, name))
+		if err != nil {
+			continue // LoadSpec reports missing files with its own error
+		}
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &top); err != nil {
+			continue // likewise for malformed JSON
+		}
+		if _, ok := top["$schema"]; ok {
+			had[name] = true
+			continue
+		}
+		top["$schema"] = json.RawMessage(fmt.Sprintf("%q", uri))
+		b, err := json.Marshal(top)
+		if err != nil {
+			return nil, nil, err
+		}
+		patched[name] = b
+	}
+	if len(patched) == 0 {
+		spec, err := afspec.LoadSpec(specDir)
+		return spec, had, err
+	}
+
+	// The copy keeps the directory's basename: the cross-file check compares
+	// it with spec_id and spec_name.
+	tmp, err := os.MkdirTemp("", "flatline-load-")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer os.RemoveAll(tmp)
+	copyDir := filepath.Join(tmp, filepath.Base(specDir))
+	if err := os.Mkdir(copyDir, 0o755); err != nil {
+		return nil, nil, err
+	}
+	entries, err := os.ReadDir(specDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		data, ok := patched[e.Name()]
+		if !ok {
+			if data, err = os.ReadFile(filepath.Join(specDir, e.Name())); err != nil {
+				return nil, nil, err
+			}
+		}
+		if err := os.WriteFile(filepath.Join(copyDir, e.Name()), data, 0o644); err != nil {
+			return nil, nil, err
+		}
+	}
+	spec, err := afspec.LoadSpec(copyDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	spec.Dir = specDir
+	return spec, had, nil
 }
 
 // warningText renders a validation warning with whatever context it carries.
@@ -215,6 +306,13 @@ func (p *Pack) WriteTasks() error {
 	if err != nil {
 		return fmt.Errorf("encoding tasks.json: %w", err)
 	}
+	if !p.tasksHadSchema {
+		// The file did not declare "$schema" when it was read (the Python
+		// library omits it); a state update is not the place to add it. The
+		// encoder writes the key first, on its own line, and omits it only
+		// when nil — which a string field never is — so it is removed here.
+		data = schemaLine.ReplaceAll(data, []byte("{\n"))
+	}
 	path := filepath.Join(p.Dir, "tasks.json")
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
@@ -222,6 +320,9 @@ func (p *Pack) WriteTasks() error {
 	}
 	return os.Rename(tmp, path)
 }
+
+// schemaLine matches the "$schema" property at the top of a canonical file.
+var schemaLine = regexp.MustCompile(`^\{\n  "\$schema": "[^"\n]*",\n`)
 
 // TasksRelPath is tasks.json relative to the repository root, for `git add`.
 func (p *Pack) TasksRelPath() (string, error) {

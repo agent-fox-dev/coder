@@ -114,7 +114,14 @@ Each of these is a choice, not an omission.
    no such implicit behaviour, so the file is a `## Project Instructions`
    section instead.
 
-### Two things the library port made necessary
+### Three things the library port made necessary
+
+- The format says `$schema` is required and the Go decoder enforces it, but
+  the Python `afspec` — the one agent-fox runs — treats it as optional and
+  omits it on write, so a pack straight out of `spec generate` fails to load
+  in Go. flatline loads such a pack as if each file declared its canonical
+  URI (from a temporary copy; the originals are untouched) and writes
+  `tasks.json` back without the key when it was absent.
 
 - The Go `TasksV1Json.Render()` omits the `## Test Commands` block that the
   Python renderer emits, and the profiles refer to it by name. flatline
