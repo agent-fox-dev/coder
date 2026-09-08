@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/core"
@@ -123,13 +127,16 @@ type Triager struct {
 	rejected  int      // file_issue calls refused for citing a path that does not exist
 	badPaths  []string // the paths that were refused, for the run summary
 	verbose   bool
+	debug     bool
+	out       io.Writer
+	outMu     sync.Mutex
 	toolNames []string
 }
 
 // NewTriager wires the agent: a workspace, the read-only slice of the built-in
 // tools, the file_issue terminator, and bounds on how long the run may go.
-func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose bool) (*Triager, error) {
-	t := &Triager{ws: ws, verbose: verbose}
+func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose, debug bool) (*Triager, error) {
+	t := &Triager{ws: ws, verbose: verbose, debug: debug, out: os.Stderr}
 
 	built, err := tools.All(tools.Options{Workspace: ws})
 	if err != nil {
@@ -173,6 +180,20 @@ func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose bool) (*Triag
 // asserts nothing mutating survived.
 func (t *Triager) ToolNames() []string { return t.toolNames }
 
+// SetOutput redirects diagnostic and progress output from stderr.
+func (t *Triager) SetOutput(w io.Writer) {
+	t.outMu.Lock()
+	defer t.outMu.Unlock()
+	t.out = w
+}
+
+func (t *Triager) getOutput() io.Writer {
+	if t.out != nil {
+		return t.out
+	}
+	return os.Stderr
+}
+
 // Triage runs the analysis and returns the structured issue.
 //
 // The (Issue, RunResult) pair is the honest return: a run can end without an
@@ -181,14 +202,47 @@ func (t *Triager) ToolNames() []string { return t.toolNames }
 // outcome that means "there is an issue here", which is exactly why file_issue
 // terminates rather than the run ending when the model stops talking.
 func (t *Triager) Triage(ctx context.Context, rep Report) (Issue, core.RunResult, error) {
+	var sp *spinner
+	var start time.Time
+	if !t.verbose {
+		start = time.Now()
+		t.outMu.Lock()
+		out := t.getOutput()
+		fmt.Fprintf(out, "[issued] analysing ")
+		t.outMu.Unlock()
+		if isTerminal(out) {
+			sp = startSpinner(out, &t.outMu)
+		}
+	}
+
 	stream, err := t.agent.Stream(ctx, taskPrompt(rep, t.ws.Root))
 	if err != nil {
+		if sp != nil {
+			sp.Stop()
+		}
+		if !t.verbose {
+			elapsed := time.Since(start)
+			t.outMu.Lock()
+			out := t.getOutput()
+			fmt.Fprintf(out, "%s\n", FormatTokenTiming(elapsed, 0, 0))
+			t.outMu.Unlock()
+		}
 		return Issue{}, core.RunResult{}, err
 	}
 	for e := range stream.Events() {
 		t.trace(e)
 	}
 	res, err := stream.RunResult()
+	if sp != nil {
+		sp.Stop()
+	}
+	if !t.verbose {
+		elapsed := time.Since(start)
+		t.outMu.Lock()
+		out := t.getOutput()
+		fmt.Fprintf(out, "%s\n", FormatTokenTiming(elapsed, int(res.Usage.InputTokens), int(res.Usage.OutputTokens)))
+		t.outMu.Unlock()
+	}
 	if err != nil {
 		return Issue{}, res, err
 	}
@@ -205,19 +259,147 @@ func (t *Triager) Triage(ctx context.Context, rep Report) (Issue, core.RunResult
 func (t *Triager) Rejections() (int, []string) { return t.rejected, t.badPaths }
 
 func (t *Triager) trace(e core.Event) {
+	t.outMu.Lock()
+	defer t.outMu.Unlock()
+	out := t.getOutput()
 	switch v := e.(type) {
 	case core.ToolExecutionStartEvent:
-		fmt.Fprintf(os.Stderr, "  read   %s\n", v.Name)
+		if t.verbose {
+			fmt.Fprintf(out, "  read   %s\n", v.Name)
+		}
 	case core.ToolResultEvent:
-		if v.Message.IsError {
-			fmt.Fprintf(os.Stderr, "  error  %s\n", firstLine(v.Message.Content.Text()))
+		if t.verbose && v.Message.IsError {
+			fmt.Fprintf(out, "  error  %s\n", firstLine(v.Message.Content.Text()))
 		}
 	case core.TextDeltaEvent:
-		if t.verbose {
-			fmt.Fprint(os.Stderr, v.Delta)
+		if t.debug {
+			fmt.Fprint(out, v.Delta)
 		}
 	case core.ErrorEvent:
-		fmt.Fprintf(os.Stderr, "  [stream error: %s]\n", v.Message)
+		fmt.Fprintf(out, "  [stream error: %s]\n", v.Message)
+	}
+}
+
+var spinnerFrames = []byte{'|', '/', '-', '\\'}
+
+type spinner struct {
+	w       io.Writer
+	mu      *sync.Mutex
+	ticker  *time.Ticker
+	done    chan struct{}
+	stopped chan struct{}
+}
+
+func startSpinner(w io.Writer, mu *sync.Mutex) *spinner {
+	s := &spinner{
+		w:       w,
+		mu:      mu,
+		ticker:  time.NewTicker(100 * time.Millisecond),
+		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
+	}
+	if s.mu != nil {
+		s.mu.Lock()
+	}
+	_, _ = s.w.Write([]byte{spinnerFrames[0]})
+	if s.mu != nil {
+		s.mu.Unlock()
+	}
+
+	go s.run()
+	return s
+}
+
+func (s *spinner) run() {
+	defer close(s.stopped)
+	frameIdx := 1
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-s.ticker.C:
+			if s.mu != nil {
+				s.mu.Lock()
+			}
+			_, _ = s.w.Write([]byte{'\b', spinnerFrames[frameIdx]})
+			if s.mu != nil {
+				s.mu.Unlock()
+			}
+			frameIdx = (frameIdx + 1) % len(spinnerFrames)
+		}
+	}
+}
+
+func (s *spinner) Stop() {
+	s.ticker.Stop()
+	close(s.done)
+	<-s.stopped
+	if s.mu != nil {
+		s.mu.Lock()
+	}
+	_, _ = s.w.Write([]byte{'\b', ' ', '\b'})
+	if s.mu != nil {
+		s.mu.Unlock()
+	}
+}
+
+func isTerminal(w io.Writer) bool {
+	if w == nil || w == io.Discard {
+		return false
+	}
+	if td, ok := w.(interface{ IsTerminal() bool }); ok {
+		return td.IsTerminal()
+	}
+	if _, ok := w.(*bytes.Buffer); ok {
+		return true
+	}
+	if f, ok := w.(*os.File); ok {
+		stat, err := f.Stat()
+		if err != nil {
+			return false
+		}
+		return (stat.Mode() & os.ModeCharDevice) != 0
+	}
+	return false
+}
+
+// FormatTokenTiming formats elapsed duration and tokens sent/received without dollar figures.
+func FormatTokenTiming(elapsed time.Duration, sent, received int) string {
+	return fmt.Sprintf("(%s) · %s↑ %s↓", formatDuration(elapsed), formatTokens(sent), formatTokens(received))
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+
+	var parts []string
+	if h > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", h))
+	}
+	if m > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", m))
+	}
+	if s > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", s))
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatTokens(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
 	}
 }
 

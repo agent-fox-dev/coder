@@ -57,6 +57,7 @@ type cliConfig struct {
 	dryRun  bool
 	labels  string
 	outFile string
+	debug   bool
 	verbose bool
 	arg     string
 }
@@ -69,7 +70,8 @@ func newFlagSet() (*flag.FlagSet, *cliConfig) {
 	fs.BoolVar(&cfg.dryRun, "dry-run", false, "make no changes to GitHub; only print the rendered issue")
 	fs.StringVar(&cfg.labels, "label", "", "comma-separated labels for the created issue, e.g. af:fix,bug")
 	fs.StringVar(&cfg.outFile, "out", "", "also write the rendered issue to this file")
-	fs.BoolVar(&cfg.verbose, "verbose", false, "stream the model's reasoning text to stderr")
+	fs.BoolVar(&cfg.debug, "debug", false, "stream the model's reasoning text to stderr")
+	fs.BoolVar(&cfg.verbose, "verbose", false, "verbose output: input details, tools, execution traces and cost summary")
 	fs.Usage = func() {
 		printUsage(fs.Output(), fs)
 	}
@@ -105,8 +107,10 @@ func run() error {
 	} else if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "[issued] input: %s (%s, %d bytes)\n",
-		report.Kind, report.Origin, len(report.Body))
+	if cfg.verbose {
+		fmt.Fprintf(os.Stderr, "[issued] input: %s (%s, %d bytes)\n",
+			report.Kind, report.Origin, len(report.Body))
+	}
 
 	// 2. The workspace is the containment boundary for the whole analysis.
 	//    Every path the read tools are handed is resolved against this root,
@@ -141,12 +145,14 @@ func run() error {
 		ollama.Provider(ollama.Options{}),
 	)
 
-	triager, err := NewTriager(agentCfg, ws, cfg.verbose)
+	triager, err := NewTriager(agentCfg, ws, cfg.verbose, cfg.debug)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "[issued] workspace: %s\n[issued] tools: %s\n[issued] analysing…\n",
-		ws.Root, strings.Join(triager.ToolNames(), ", "))
+	if cfg.verbose {
+		fmt.Fprintf(os.Stderr, "[issued] workspace: %s\n[issued] tools: %s\n[issued] analysing…\n",
+			ws.Root, strings.Join(triager.ToolNames(), ", "))
+	}
 
 	// 4. Run. The issue comes back as a validated struct, not as text to be
 	//    parsed out of a transcript.
@@ -161,7 +167,9 @@ func run() error {
 	}
 
 	fmt.Printf("%s\n\n%s", issue.Title, body)
-	summarize(os.Stderr, triager, res, model.ID)
+	if cfg.verbose {
+		summarize(os.Stderr, triager, res, model.ID)
+	}
 
 	if cfg.outFile != "" {
 		if err := os.WriteFile(cfg.outFile, []byte(issue.Title+"\n\n"+body), 0o644); err != nil {

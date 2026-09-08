@@ -204,7 +204,8 @@ go run ./examples/issued "<report>" [flags]
 | `--dry-run` | Make no changes to GitHub; only print the rendered issue. |
 | `--label a,b` | Labels for the created issue, e.g. `af:fix`. |
 | `--out FILE` | Also write the rendered issue to a file. |
-| `--verbose` | Stream the model's reasoning text to stderr. |
+| `--debug` | Stream the model's reasoning text to stderr. |
+| `--verbose` | Verbose output: input details, tools, execution traces and cost summary. |
 
 Flags may come before or after the report. `AGENTKIT_MODEL` picks the model
 (`AGENTKIT_MODEL=openai/gpt-5.6-terra`); `GITHUB_TOKEN` or `GH_TOKEN`
@@ -216,6 +217,18 @@ A typical session:
 
 ```
 $ go run ./examples/issued ./crash.log --dir . --repo agent-fox-dev/coder --dry-run
+[issued] analysing (3s) · 1.2k↑ 450↓
+session: resume folds a trailing tool call into an empty turn
+
+## Problem
+…
+[issued] dry run. Re-run without --dry-run to file it.
+```
+
+With `--verbose`:
+
+```
+$ go run ./examples/issued ./crash.log --dir . --repo agent-fox-dev/coder --dry-run --verbose
 [issued] input: file (crash.log, 3184 bytes)
 [issued] workspace: /home/you/coder
 [issued] tools: read_file, list_files, find_files, search_files, file_issue
@@ -228,7 +241,7 @@ session: resume folds a trailing tool call into an empty turn
 
 ## Problem
 …
-[issued] anthropic/claude-sonnet-5 · 7 turns · stop tool_terminate · $0.14
+[issued] anthropic/claude-sonnet-5 · 7 turns · stop tool_terminate · in 1200 / out 450 tokens · $0.14000
 [issued] dry run. Re-run without --dry-run to file it.
 ```
 
@@ -255,6 +268,11 @@ three files in it. Every claim this README makes is a test:
 | `TestFlagParsingRejectsCreateAndAcceptsDryRun` | Flags accept `--dry-run` and reject `--create`. |
 | `TestTargetRepoValidationHaltsWithoutDryRun` | Missing repository halts before analysis unless `--dry-run` is passed. |
 | `TestDryRunGating` | Gating prevents issue creation in dry-run mode and allows it by default. |
+| `TestFormatTokenTiming` | Token timing format renders duration and token counts correctly. |
+| `TestFlagParsingDebugAndVerbose` | Flags parse `--debug` and `--verbose`. |
+| `TestAC1DebugStreamsReasoningDeltas` | `--debug` streams reasoning text deltas, suppressed otherwise. |
+| `TestAC2AndAC3NonVerbosePhaseProgressAndSummary` | Non-verbose mode displays progress spinner and token timing without cost figures. |
+| `TestAC4VerbosePreservesTracesAndCost` | Verbose mode prints tool traces and full summary with USD cost. |
 
 ## What it does not do
 
