@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	agentkit "github.com/agentfox/agentkit-go"
@@ -46,11 +47,12 @@ type ImplementInput struct {
 
 // agentBrain runs both phases as AgentKit agents against the configured model.
 type agentBrain struct {
-	base      core.AgentConfig // Model and Providers are already set
-	workspace *tools.Workspace
-	progress  io.Writer
-	maxTurns  int
-	budgetUSD float64
+	base       core.AgentConfig // Model and Providers are already set
+	workspace  *tools.Workspace
+	progress   io.Writer
+	progressMu sync.Mutex
+	maxTurns   int
+	budgetUSD  float64
 	// extraPrograms widens the implementation phase's shell allowlist — the
 	// verify command's program lands here, plus whatever the operator adds.
 	extraPrograms []string
@@ -181,7 +183,7 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	})
 	cfg.BeforeToolCall = toolGuard(base, spec.readOnly, func(msg string) {
 		if b.verbose {
-			fmt.Fprintf(b.progress, "  blocked %s\n", msg)
+			b.printf("  blocked %s\n", msg)
 		}
 	})
 
@@ -214,19 +216,19 @@ func (b *agentBrain) drive(ctx context.Context, agent *agentkit.Agent, phase, pr
 		switch e := event.(type) {
 		case core.TextDeltaEvent:
 			if b.showText {
-				fmt.Fprint(b.progress, e.Delta)
+				b.print(e.Delta)
 			}
 		case core.TextEndEvent:
 			if b.showText {
-				fmt.Fprintln(b.progress)
+				b.println()
 			}
 		case core.ToolCallStartEvent:
 			if b.verbose {
-				fmt.Fprintf(b.progress, "  → %s", e.Name)
+				b.printf("  → %s", e.Name)
 			}
 		case core.ToolCallEndEvent:
 			if b.verbose {
-				fmt.Fprintf(b.progress, " %s\n", firstLine(string(e.Block.Input), 90))
+				b.printf(" %s\n", firstLine(string(e.Block.Input), 90))
 			}
 		case core.ToolExecutionEndEvent:
 			if b.verbose {
@@ -234,10 +236,10 @@ func (b *agentBrain) drive(ctx context.Context, agent *agentkit.Agent, phase, pr
 				if e.IsError {
 					status = "ERROR"
 				}
-				fmt.Fprintf(b.progress, "  ← %s: %s (%dms)\n", e.Name, status, e.ElapsedMS)
+				b.printf("  ← %s: %s (%dms)\n", e.Name, status, e.ElapsedMS)
 			}
 		case core.ErrorEvent:
-			fmt.Fprintf(b.progress, "  [stream error] %s\n", e.Message)
+			b.printf("  [stream error] %s\n", e.Message)
 		}
 	}
 
@@ -277,6 +279,24 @@ var mutatingGit = map[string]bool{
 	"revert": true, "stash": true, "clean": true, "tag": true, "am": true,
 	"apply": true, "restore": true, "mv": true, "rm": true, "worktree": true,
 	"remote": true, "config": true, "gc": true, "update-ref": true, "filter-branch": true,
+}
+
+func (b *agentBrain) print(args ...any) {
+	b.progressMu.Lock()
+	defer b.progressMu.Unlock()
+	fmt.Fprint(b.progress, args...)
+}
+
+func (b *agentBrain) println(args ...any) {
+	b.progressMu.Lock()
+	defer b.progressMu.Unlock()
+	fmt.Fprintln(b.progress, args...)
+}
+
+func (b *agentBrain) printf(format string, args ...any) {
+	b.progressMu.Lock()
+	defer b.progressMu.Unlock()
+	fmt.Fprintf(b.progress, format, args...)
 }
 
 // toolGuard is the second half of the authorization boundary: the policy that
