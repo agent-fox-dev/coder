@@ -1,4 +1,4 @@
-// Command mcp-server is REQ-MCP-SERVER-02's reference driver.
+// Command mcpserver is REQ-MCP-SERVER-02's reference driver.
 //
 // The requirement names `nightshift --mcp-server`; nightshift is a daemon
 // built ON this SDK, so the SDK ships the mechanism (mcp.Server, Server.Run)
@@ -9,9 +9,9 @@
 // The tools registered below exist to make the binary runnable end to end
 // against a real MCP client; they are not part of the SDK's surface.
 //
-//	mcp-server                                # stdio
-//	mcp-server -config agentkit.toml          # whatever [mcp_server] selects
-//	mcp-server -transport http -port 8722 -api-key-env MCP_API_KEY
+//	go run ./examples/mcpserver                                # stdio
+//	go run ./examples/mcpserver -config agentkit.toml          # whatever [mcp_server] selects
+//	go run ./examples/mcpserver -transport http -port 8722 -api-key-env MCP_API_KEY
 //
 // Exit 0 on a clean shutdown, 1 on a startup or transport failure.
 package main

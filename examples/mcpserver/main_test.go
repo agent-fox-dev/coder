@@ -12,7 +12,7 @@ import (
 	"github.com/agentfox/agentkit-go/mcp"
 )
 
-// TestTheReferenceBinaryServesOverRealStdio drives the SHIPPED binary as a
+// TestTheReferenceBinaryServesOverRealStdio drives the demonstration binary as a
 // subprocess with the SHIPPED client.
 //
 // Everything else exercises Serve over in-memory pipes, which cannot catch the
@@ -77,7 +77,7 @@ func TestTheReferenceBinaryServesOverRealStdio(t *testing.T) {
 
 func build(t *testing.T) string {
 	t.Helper()
-	out := filepath.Join(t.TempDir(), "mcp-server")
+	out := filepath.Join(t.TempDir(), "mcpserver")
 	if runtime.GOOS == "windows" {
 		out += ".exe"
 	}

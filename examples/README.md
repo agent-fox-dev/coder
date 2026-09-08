@@ -1,6 +1,6 @@
 # AgentKit examples
 
-Thirteen examples, smallest first. Each of the first eleven is a single
+Fourteen examples, smallest first. Each of the first twelve is a single
 self-contained `main.go` you can read top to bottom and copy into your own
 project — they deliberately repeat their setup rather than sharing a helper
 package, so nothing you need is in a file you have not opened. The last two,
@@ -8,8 +8,8 @@ package, so nothing you need is in a file you have not opened. The last two,
 finished applications, which is what the others look like once they stop being
 examples.
 
-**Five of them need no API key at all**: `agentdemo`, `testing`, `plugins`,
-`mcp` and `skills` do their real work before any model call, so you can run
+**Six of them need no API key at all**: `agentdemo`, `testing`, `plugins`,
+`mcp`, `mcpserver` and `skills` do their real work before any model call, so you can run
 them right now.
 
 | Example | Run it | What it teaches |
@@ -20,7 +20,7 @@ them right now.
 | [`session`](session) | `go run ./examples/session "pick a number"` then `go run ./examples/session "which number?"` | Durable append-only sessions. The second run answers from the first one's transcript, on disk. |
 | [`delegation`](delegation) | `go run ./examples/delegation "which files define the agent loop?"` | Named specialists, per-child tool scoping, budget propagation. |
 
-Then the ones that go deeper. `testing`, `plugins`, `mcp` and `skills` run
+Then the ones that go deeper. `testing`, `plugins`, `mcp`, `mcpserver` and `skills` run
 fully without a key:
 
 | Example | Run it | What it teaches |
@@ -29,6 +29,7 @@ fully without a key:
 | [`customtools`](customtools) | `go run ./examples/customtools` | Writing tools well: the schema combinators, `Handler` vs `Execute`, argument repair, sequential execution, per-tool prompt guidelines, and a tool that ends the run. |
 | [`plugins`](plugins) | `go run ./examples/plugins` | The four plugin categories, manifest discovery, load ordering, the `disabled` list, and why a plugin hook can only narrow what the host already allowed. |
 | [`mcp`](mcp) | `go run ./examples/mcp` · `--serve` | Model Context Protocol both ways: consuming a server's tools under qualified names, and exposing your own over stdio. |
+| [`mcpserver`](mcpserver) | `go run ./examples/mcpserver` · `-transport http -port 8722 -api-key-env MCP_API_KEY` · `-config agentkit.toml` | Standalone reference MCP server host: stdio and HTTP transports, API key authentication, and TOML configuration. |
 | [`interactive`](interactive) | `go run ./examples/interactive` | Typing *while* the agent works: steering a running turn, queued follow-ups, out-of-band abort, phase and snapshot. |
 | [`skills`](skills) | `go run ./examples/skills` | Repository- and user-authored prompt material: the three discovery tiers, the project trust gate, progressive disclosure and its escaping, context files, the tool-merge and mid-session activation seams, the subagent step. |
 
