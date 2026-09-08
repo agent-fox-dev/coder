@@ -266,8 +266,10 @@ Stated rather than left to be discovered:
 
 ## Related
 
-- [`examples/issued`](../issued) — the `af-issue` skill prompt: the same
-  workflow one step earlier, filing the issue this program consumes.
+- [`examples/issued`](../issued) — the other half of the workflow, one step
+  earlier: the `af-issue` skill rebuilt as a program, which files the issue
+  this one consumes. Same split (a read-only agent, a schema for its output,
+  the side effects in Go), applied to triage instead of repair.
 - [`examples/codingagent`](../codingagent) — the smallest version of the
   agent-with-tools setup used here.
 - [`examples/customtools`](../customtools) — the schema combinators and the
