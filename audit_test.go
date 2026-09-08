@@ -206,7 +206,7 @@ func TestSessionStartAndEndFireOnEveryExit(t *testing.T) {
 			c.Hooks.OnSessionStart = log.add
 			c.Hooks.OnSessionEnd = log.add
 		})
-		a.Run(ctx, "go")
+		_, _ = a.Run(ctx, "go")
 		assertOneEach(t, log)
 	})
 }

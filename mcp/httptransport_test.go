@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agentfox/agentkit-go/internal/diag"
 	"github.com/agentfox/agentkit-go/mcp"
 	"github.com/agentfox/agentkit-go/wire"
 )
@@ -199,12 +198,6 @@ func readRPC(t *testing.T, r *http.Request) (mcp.ID, string, json.RawMessage) {
 	return m.ID, m.Method, m.Params
 }
 
-func readID(t *testing.T, r *http.Request) mcp.ID {
-	t.Helper()
-	id, _, _ := readRPC(t, r)
-	return id
-}
-
 func writeJSONRPC(t *testing.T, w http.ResponseWriter, id mcp.ID, result any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
@@ -289,15 +282,6 @@ func TestAHeaderCarryingAControlByteIsRefused(t *testing.T) {
 	if got.Get("X-Smuggled") != "" {
 		t.Fatal("a smuggled header reached the server")
 	}
-}
-
-func hasError(diags []mcp.Diagnostic) bool {
-	for _, d := range diags {
-		if d.Severity == diag.SeverityError {
-			return true
-		}
-	}
-	return false
 }
 
 // recordingHandler is a minimal streamable-HTTP server that keeps the headers

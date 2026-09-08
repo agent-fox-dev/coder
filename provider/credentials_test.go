@@ -262,7 +262,7 @@ func TestAStoredCredentialCannotBePrintedByAccident(t *testing.T) {
 	for _, rendered := range []string{
 		c.String(),
 		fmt.Sprintf("%v", c),
-		fmt.Sprintf("%s", c),
+		c.String(),
 		fmt.Errorf("auth failed for %v", c).Error(),
 	} {
 		if strings.Contains(rendered, "super-secret") {

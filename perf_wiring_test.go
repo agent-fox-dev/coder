@@ -145,7 +145,7 @@ func TestParallelToolsUseTrueConcurrency(t *testing.T) {
 	}()
 
 	done := make(chan struct{})
-	go func() { defer close(done); a.Run(context.Background(), "go") }()
+	go func() { defer close(done); _, _ = a.Run(context.Background(), "go") }()
 
 	select {
 	case <-done:
@@ -201,7 +201,7 @@ func TestFirstTokenIsEmittedBeforeTheStreamEnds(t *testing.T) {
 		fmt.Fprint(pw, "event: message_delta\ndata: "+
 			`{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`+"\n\n")
 		fmt.Fprint(pw, "event: message_stop\ndata: {}\n\n")
-		pw.Close()
+		_ = pw.Close()
 	}()
 
 	p := anthropic.Provider(anthropic.Options{Getenv: func(string) string { return "k" }})

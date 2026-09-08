@@ -511,7 +511,7 @@ func startSpinner(w io.Writer, mu *sync.Mutex) *spinner {
 	if s.mu != nil {
 		s.mu.Lock()
 	}
-	s.w.Write([]byte{spinnerFrames[0]})
+	_, _ = s.w.Write([]byte{spinnerFrames[0]})
 	if s.mu != nil {
 		s.mu.Unlock()
 	}
@@ -531,7 +531,7 @@ func (s *spinner) run() {
 			if s.mu != nil {
 				s.mu.Lock()
 			}
-			s.w.Write([]byte{'\b', spinnerFrames[frameIdx]})
+			_, _ = s.w.Write([]byte{'\b', spinnerFrames[frameIdx]})
 			if s.mu != nil {
 				s.mu.Unlock()
 			}
@@ -547,7 +547,7 @@ func (s *spinner) Stop() {
 	if s.mu != nil {
 		s.mu.Lock()
 	}
-	s.w.Write([]byte{'\b', ' ', '\b'})
+	_, _ = s.w.Write([]byte{'\b', ' ', '\b'})
 	if s.mu != nil {
 		s.mu.Unlock()
 	}

@@ -99,9 +99,7 @@ func ExpandBraces(p string) []string {
 
 	var out []string
 	for _, a := range alts {
-		for _, rest := range ExpandBraces(p[:start] + a + p[end+1:]) {
-			out = append(out, rest)
-		}
+		out = append(out, ExpandBraces(p[:start]+a+p[end+1:])...)
 	}
 	return out
 }

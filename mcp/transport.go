@@ -118,22 +118,22 @@ func StartStdio(ctx context.Context, opts StdioOptions) (*StdioTransport, error)
 	}
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
-		stdoutR.Close()
-		stdoutW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return nil, err
 	}
 	cmd.Stdout, cmd.Stderr = stdoutW, stderrW
 	if err := cmd.Start(); err != nil {
-		stdoutR.Close()
-		stdoutW.Close()
-		stderrR.Close()
-		stderrW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		return nil, fmt.Errorf("mcp: starting %q: %w", opts.Command, err)
 	}
 	// The child holds the write ends now. Ours must go, or the reader never
 	// sees EOF — it would be waiting on a writer that is this very process.
-	stdoutW.Close()
-	stderrW.Close()
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 
 	t := &StdioTransport{
 		cmd:    cmd,

@@ -176,10 +176,10 @@ func TestGoodCatalogNeverPanics(t *testing.T) {
 	// Parsed ONCE, not once per call: the accessor memoizes the value, which
 	// is the same property that makes the corrupt case re-panic with the
 	// stored value rather than re-deriving one (P-15).
-	if get() != get() {
+	if get() != get() { //nolint:staticcheck // intentional: testing memoization
 		t.Error("the catalog was re-parsed; onceCatalog must memoize")
 	}
-	if Default() != Default() {
+	if Default() != Default() { //nolint:staticcheck // intentional: testing memoization
 		t.Error("Default() re-parses the embedded catalog on every call")
 	}
 }

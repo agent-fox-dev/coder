@@ -172,13 +172,13 @@ func Open(path string, opts Options) (*Store, *Loaded, error) {
 	}
 	if l.truncate {
 		if err := f.Truncate(l.truncateTo); err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, l, fmt.Errorf("session: truncating damaged tail: %w", err)
 		}
 		// The truncation must reach the disk before the next append, or a
 		// second crash resurrects exactly the state this call just repaired.
 		if err := f.Sync(); err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, l, fmt.Errorf("session: syncing truncation: %w", err)
 		}
 	}
@@ -195,7 +195,7 @@ func Open(path string, opts Options) (*Store, *Loaded, error) {
 		// next flush must write the header again.
 		line, err := EncodeHeader(l.Header)
 		if err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, l, err
 		}
 		s.headerLine = line

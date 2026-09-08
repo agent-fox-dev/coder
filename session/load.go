@@ -184,7 +184,7 @@ func loadBytes(path string, data []byte) *Loaded {
 	// The complete prefix ends at the last newline. Everything after it was
 	// not terminated, and an entry is written as ONE line-terminated write,
 	// so those bytes are by definition an incomplete write.
-	complete := len(data)
+	var complete int
 	if i := bytes.LastIndexByte(data, '\n'); i >= 0 {
 		complete = i + 1
 	} else {

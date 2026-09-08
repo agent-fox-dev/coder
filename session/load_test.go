@@ -54,7 +54,7 @@ func TestLoaderRepairsEachDamageClassAndReportsIt(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		f.WriteString(`{"id":"e3","parent_id":"e2","ty`)
+		_, _ = f.WriteString(`{"id":"e3","parent_id":"e2","ty`)
 		f.Close()
 
 		l := mustLoad(t, path)

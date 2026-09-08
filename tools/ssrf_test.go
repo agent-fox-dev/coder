@@ -153,7 +153,7 @@ func TestTheGuardPermitsAPublicAddress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a public address must be permitted: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 	if !strings.HasPrefix(dialled, "93.184.216.34:") {
 		t.Fatalf("dialled %q; the guard must dial the address it VALIDATED, not re-resolve "+
 			"the name and open a second rebinding window", dialled)

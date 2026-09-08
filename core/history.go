@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"sync"
 	"time"
-
-	"github.com/agentfox/agentkit-go/jsonx"
 )
 
 type EntryID string
@@ -294,6 +292,3 @@ func (h *ConversationHistory) SetCheckpoint(cp CompactionCheckpoint) {
 	h.cp = &cp
 	h.revision++
 }
-
-// Unknown-key retention helper shared by the message codecs.
-type unknownKeys = jsonx.OrderedObject

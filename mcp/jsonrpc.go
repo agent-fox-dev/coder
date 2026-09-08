@@ -355,9 +355,3 @@ func (c *correlator) fail(err error) {
 		delete(c.pending, key)
 	}
 }
-
-func (c *correlator) inFlight() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.pending)
-}

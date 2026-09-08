@@ -22,10 +22,11 @@ import (
 )
 
 // API is the registry key and DefaultBaseURL/Path the endpoint.
+const API core.API = "openai-responses"
+
 const (
-	API            core.API = "openai-responses"
-	DefaultBaseURL          = "https://api.openai.com/v1"
-	Path                    = "/responses"
+	DefaultBaseURL = "https://api.openai.com/v1"
+	Path           = "/responses"
 )
 
 // ---------------------------------------------------------------- request

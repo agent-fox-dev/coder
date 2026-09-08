@@ -221,7 +221,6 @@ type toolCall struct {
 	Enabled   bool            `json:"enabled"`
 	Raw       json.RawMessage `json:"raw"`
 	Hidden    string          `json:"-"`
-	unexpo    string
 }
 
 // TestAnUnknownPropertyIsARejection is REQ-SEC-12.1.

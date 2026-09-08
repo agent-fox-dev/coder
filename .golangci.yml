@@ -1,0 +1,24 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - os.RemoveAll
+    staticcheck:
+      checks:
+        - "all"
+        - "-QF*"
+        - "-ST*"
+
+  exclusions:
+    rules:
+      - linters: [errcheck]
+        source: "defer "
+      - linters: [errcheck]
+        path: "_test\\.go"
+        source: "\\.Close\\(\\)"

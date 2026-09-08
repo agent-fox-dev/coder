@@ -744,10 +744,6 @@ func (a *Agent) addUsage(u core.Usage) {
 	a.meter.ObserveTurn(model, u)
 }
 
-// entryFor is the session-log id a message is recorded under. v1 records
-// messages into history without a store-assigned id when no store is attached.
-func (a *Agent) entryFor(core.Message) core.EntryID { return core.NullLeaf }
-
 // ------------------------------------------------------------------- hooks
 //
 // Hooks are Axis 2: observation, never interception (REQ-OBS-07). Each is

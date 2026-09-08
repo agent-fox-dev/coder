@@ -218,10 +218,10 @@ func summarize(w io.Writer, t *Triager, res core.RunResult, modelID string) {
 // makes `issued -` mean stdin rather than an unknown flag.
 func parseArgs(argv []string) []string {
 	var operands []string
-	flag.CommandLine.Parse(argv)
+	_ = flag.CommandLine.Parse(argv)
 	for rest := flag.Args(); len(rest) > 0; rest = flag.Args() {
 		operands = append(operands, rest[0])
-		flag.CommandLine.Parse(rest[1:])
+		_ = flag.CommandLine.Parse(rest[1:])
 	}
 	return operands
 }
