@@ -704,6 +704,48 @@ func TestSpinnerAndPhaseTimingNonVerbose(t *testing.T) {
 	}
 }
 
+func TestAgentBrainRetriesOnTransient503Error(t *testing.T) {
+	dir := newRepo(t)
+
+	// Analyze phase retries on transient 503 error.
+	brainAnalyze := scriptedBrain(t, dir,
+		faux.Turn{Err: errors.New("google: HTTP 503: UNAVAILABLE: The service is currently unavailable.")},
+		toolTurn("c1", "submit_analysis", analysisArgs),
+	)
+	analysis, stats, err := brainAnalyze.Analyze(context.Background(), AnalysisInput{
+		Ref:   IssueRef{"acme", "widgets", 42},
+		Issue: fixtureIssue(),
+	})
+	if err != nil {
+		t.Fatalf("Analyze failed: %v", err)
+	}
+	if analysis.Summary == "" {
+		t.Error("expected non-empty analysis summary")
+	}
+	if stats.StopReason != core.RunStopToolTerminate {
+		t.Errorf("StopReason = %s, want %s", stats.StopReason, core.RunStopToolTerminate)
+	}
+
+	// Implement phase retries on transient 503 error.
+	brainImplement := scriptedBrain(t, dir,
+		faux.Turn{Err: errors.New("google: HTTP 503: UNAVAILABLE: The service is currently unavailable.")},
+		toolTurn("c1", "submit_implementation", implementationArgs),
+	)
+	imp, statsImp, err := brainImplement.Implement(context.Background(), ImplementInput{
+		Ref:   IssueRef{"acme", "widgets", 42},
+		Issue: fixtureIssue(),
+	})
+	if err != nil {
+		t.Fatalf("Implement failed: %v", err)
+	}
+	if imp.Summary == "" {
+		t.Error("expected non-empty implementation summary")
+	}
+	if statsImp.StopReason != core.RunStopToolTerminate {
+		t.Errorf("StopReason = %s, want %s", statsImp.StopReason, core.RunStopToolTerminate)
+	}
+}
+
 func TestAgentBrainVerboseVsNonVerbose(t *testing.T) {
 	dir := newRepo(t)
 	ws, err := tools.NewWorkspace(dir)

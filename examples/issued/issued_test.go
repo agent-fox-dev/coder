@@ -265,6 +265,30 @@ func TestARunThatNeverCallsFileIssueReturnsNoIssue(t *testing.T) {
 	}
 }
 
+func TestTriageRetriesOnTransient503Error(t *testing.T) {
+	p := faux.New(
+		faux.Turn{Err: errors.New("google: HTTP 503: UNAVAILABLE: The service is currently unavailable.")},
+		turn(fileIssueCall("call_1", goodIssue())),
+	)
+	tr := newTriager(t, p, fakeRepo(t))
+
+	issue, res, err := tr.Triage(context.Background(), Report{
+		Kind: SourceText, Origin: "argument", Body: "Load returns nothing",
+	})
+	if err != nil {
+		t.Fatalf("Triage: %v", err)
+	}
+	if res.StopReason != core.RunStopToolTerminate {
+		t.Errorf("StopReason = %s, want %s", res.StopReason, core.RunStopToolTerminate)
+	}
+	if issue.Title != goodIssue().Title {
+		t.Errorf("captured the wrong issue: %q", issue.Title)
+	}
+	if len(p.Requests()) != 2 {
+		t.Errorf("expected 2 requests (1 retry), got %d", len(p.Requests()))
+	}
+}
+
 // --------------------------------------------------------------------- 4 --
 //
 // What was actually sent.
