@@ -1,8 +1,4 @@
 # Binaries
-*.exe
-*.dll
-*.so
-*.dylib
 /agentkit
 /agentdemo
 # `go build ./examples/<name>` drops the binary in the working directory.
@@ -25,3 +21,7 @@ testdata/fuzz/
 *.swp
 .idea/
 .vscode/
+
+.nightshift/
+prompts.md
+
