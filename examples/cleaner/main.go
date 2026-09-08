@@ -64,7 +64,7 @@ func run() int {
 	land := flag.String("land", "pr", "how to land the fix: pr, branch, merge or none")
 	dryRun := flag.Bool("dry-run", false, "make no remote changes: no push, no pull request, no comments. The branch and the commit are still made locally, because the implementation phase edits real files")
 	modelSpec := flag.String("model", "", "model spec, e.g. anthropic/claude-sonnet-5 (default $AGENTKIT_MODEL)")
-	maxTurns := flag.Int("max-turns", 40, "per-phase turn ceiling")
+	maxTurns := flag.Int("max-turns", 100, "per-phase turn ceiling")
 	budget := flag.Float64("budget", 5.0, "per-phase spend ceiling in dollars")
 	verifyCmd := flag.String("verify", "", "the command that decides success (default: detected from the repository)")
 	noVerify := flag.Bool("no-verify", false, "do not run any verification command (the result is reported as unverified)")
