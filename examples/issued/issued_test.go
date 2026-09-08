@@ -13,13 +13,16 @@ package main
 //	go test ./examples/issued/ -v
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/core"
@@ -57,13 +60,21 @@ func fakeRepo(t *testing.T) *tools.Workspace {
 // newTriager wires a Triager to a scripted provider. The three lines that
 // matter are Model, Providers and the workspace; everything else about the
 // program is unchanged from what main() builds.
-func newTriager(t *testing.T, p *faux.Provider, ws *tools.Workspace) *Triager {
+func newTriager(t *testing.T, p *faux.Provider, ws *tools.Workspace, verboseAndDebug ...bool) *Triager {
 	t.Helper()
+	verbose := false
+	debug := false
+	if len(verboseAndDebug) > 0 {
+		verbose = verboseAndDebug[0]
+	}
+	if len(verboseAndDebug) > 1 {
+		debug = verboseAndDebug[1]
+	}
 	cfg := core.AgentConfig{
 		Model:     faux.Model(),
 		Providers: core.ProviderRegistry{faux.API: p.APIProvider()},
 	}
-	tr, err := NewTriager(cfg, ws, false)
+	tr, err := NewTriager(cfg, ws, verbose, debug)
 	if err != nil {
 		t.Fatalf("NewTriager: %v", err)
 	}
@@ -652,4 +663,211 @@ func TestDryRunGating(t *testing.T) {
 			t.Errorf("stderr = %q, want %q", stderr.String(), want)
 		}
 	})
+}
+
+// --------------------------------------------------------------------- 8 --
+//
+// Output verbosity tiers, debug streaming, spinner and completion timing.
+
+func TestFormatTokenTiming(t *testing.T) {
+	if formatted := FormatTokenTiming(1500*time.Millisecond, 100, 50); formatted != "(2s) · 100↑ 50↓" {
+		t.Errorf("FormatTokenTiming = %q, want %q", formatted, "(2s) · 100↑ 50↓")
+	}
+	if subSec := FormatTokenTiming(500*time.Millisecond, 100, 50); subSec != "(500ms) · 100↑ 50↓" {
+		t.Errorf("FormatTokenTiming (sub-second) = %q, want %q", subSec, "(500ms) · 100↑ 50↓")
+	}
+	if minTiming := FormatTokenTiming(28*time.Minute+16*time.Second, 153, 60600); minTiming != "(28m 16s) · 153↑ 60.6k↓" {
+		t.Errorf("FormatTokenTiming (minute + k) = %q, want %q", minTiming, "(28m 16s) · 153↑ 60.6k↓")
+	}
+	if mTiming := FormatTokenTiming(65*time.Second, 1_200_000, 2_500_000); mTiming != "(1m 5s) · 1.2M↑ 2.5M↓" {
+		t.Errorf("FormatTokenTiming (M tokens) = %q, want %q", mTiming, "(1m 5s) · 1.2M↑ 2.5M↓")
+	}
+}
+
+func TestFlagParsingDebugAndVerbose(t *testing.T) {
+	t.Run("defaults are false", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"test bug"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.debug {
+			t.Errorf("cfg.debug = true, want false by default")
+		}
+		if cfg.verbose {
+			t.Errorf("cfg.verbose = true, want false by default")
+		}
+	})
+
+	t.Run("debug flag before and after operand", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"--debug", "test bug"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.debug {
+			t.Errorf("cfg.debug = false, want true")
+		}
+		cfg, err = parseCLI([]string{"test bug", "--debug"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.debug {
+			t.Errorf("cfg.debug = false, want true")
+		}
+	})
+
+	t.Run("verbose flag before and after operand", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"--verbose", "test bug"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.verbose {
+			t.Errorf("cfg.verbose = false, want true")
+		}
+		cfg, err = parseCLI([]string{"test bug", "--verbose"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.verbose {
+			t.Errorf("cfg.verbose = false, want true")
+		}
+	})
+
+	t.Run("both flags", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"--verbose", "--debug", "test bug"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.debug || !cfg.verbose {
+			t.Errorf("got debug=%v verbose=%v, want both true", cfg.debug, cfg.verbose)
+		}
+	})
+}
+
+func TestAC1DebugStreamsReasoningDeltas(t *testing.T) {
+	pWithDelta := func() *faux.Provider {
+		return faux.New(
+			turn(faux.FauxText("thinking about the problem..."), fileIssueCall("c1", goodIssue())),
+		)
+	}
+
+	t.Run("with debug, deltas are streamed", func(t *testing.T) {
+		var buf bytes.Buffer
+		tr := newTriager(t, pWithDelta(), fakeRepo(t), false, true)
+		tr.SetOutput(&buf)
+		_, _, err := tr.Triage(context.Background(), Report{Kind: SourceText, Origin: "test", Body: "bug"})
+		if err != nil {
+			t.Fatalf("Triage: %v", err)
+		}
+		if !strings.Contains(buf.String(), "thinking about the problem...") {
+			t.Errorf("expected deltas in output with -debug, got: %q", buf.String())
+		}
+	})
+
+	t.Run("without debug, deltas are suppressed", func(t *testing.T) {
+		var buf bytes.Buffer
+		tr := newTriager(t, pWithDelta(), fakeRepo(t), false, false)
+		tr.SetOutput(&buf)
+		_, _, err := tr.Triage(context.Background(), Report{Kind: SourceText, Origin: "test", Body: "bug"})
+		if err != nil {
+			t.Fatalf("Triage: %v", err)
+		}
+		if strings.Contains(buf.String(), "thinking about the problem...") {
+			t.Errorf("reasoning deltas should be suppressed without -debug, got: %q", buf.String())
+		}
+	})
+}
+
+func TestAC2AndAC3NonVerbosePhaseProgressAndSummary(t *testing.T) {
+	t.Run("non-verbose terminal displays spinner frames and timing without cost", func(t *testing.T) {
+		p := faux.New(
+			turn(fileIssueCall("c1", goodIssue())),
+		)
+		var buf bytes.Buffer // *bytes.Buffer is identified as terminal
+		tr := newTriager(t, p, fakeRepo(t), false, false)
+		tr.SetOutput(&buf)
+
+		_, _, err := tr.Triage(context.Background(), Report{Kind: SourceText, Origin: "test", Body: "bug"})
+		if err != nil {
+			t.Fatalf("Triage: %v", err)
+		}
+
+		out := buf.String()
+		// AC-2: phase indicator and spinner frames with cleanup
+		if !strings.Contains(out, "[issued] analysing") {
+			t.Errorf("expected [issued] analysing in output, got: %q", out)
+		}
+		if !strings.Contains(out, "|") || !strings.Contains(out, "\b \b") {
+			t.Errorf("expected spinner frames and cleanup in output, got: %q", out)
+		}
+		// AC-2: tool execution traces suppressed
+		if strings.Contains(out, "read   file_issue") {
+			t.Errorf("tool traces should be suppressed in non-verbose mode, got: %q", out)
+		}
+
+		// AC-3: elapsed time and token counts (↑ and ↓) printed without dollar cost ($)
+		if !strings.Contains(out, "↑") || !strings.Contains(out, "↓") {
+			t.Errorf("timing line missing token counts (↑/↓), got: %q", out)
+		}
+		if strings.Contains(out, "$") {
+			t.Errorf("cost ($) should not appear in non-verbose output, got: %q", out)
+		}
+	})
+
+	t.Run("non-terminal suppresses spinner characters but keeps timing", func(t *testing.T) {
+		p := faux.New(
+			turn(fileIssueCall("c1", goodIssue())),
+		)
+		var nonTermBuf bytes.Buffer
+		nonTermWriter := struct{ io.Writer }{&nonTermBuf}
+		tr := newTriager(t, p, fakeRepo(t), false, false)
+		tr.SetOutput(nonTermWriter)
+
+		_, _, err := tr.Triage(context.Background(), Report{Kind: SourceText, Origin: "test", Body: "bug"})
+		if err != nil {
+			t.Fatalf("Triage: %v", err)
+		}
+
+		out := nonTermBuf.String()
+		if strings.Contains(out, "|") || strings.Contains(out, "\b") {
+			t.Errorf("non-terminal output should not contain spinner characters, got: %q", out)
+		}
+		if !strings.Contains(out, "[issued] analysing") || !strings.Contains(out, "↑") {
+			t.Errorf("non-terminal output should still include phase timing line, got: %q", out)
+		}
+	})
+}
+
+func TestAC4VerbosePreservesTracesAndCost(t *testing.T) {
+	p := faux.New(
+		turn(fileIssueCall("c1", goodIssue())),
+	)
+	var buf bytes.Buffer
+	tr := newTriager(t, p, fakeRepo(t), true, false)
+	tr.SetOutput(&buf)
+
+	_, res, err := tr.Triage(context.Background(), Report{Kind: SourceText, Origin: "test", Body: "bug"})
+	if err != nil {
+		t.Fatalf("Triage: %v", err)
+	}
+
+	out := buf.String()
+	// Tool trace should appear in verbose mode
+	if !strings.Contains(out, "read   file_issue") {
+		t.Errorf("expected tool trace in verbose output, got: %q", out)
+	}
+	// Spinner characters should NOT appear
+	if strings.Contains(out, "\b \b") {
+		t.Errorf("verbose output should not contain spinner, got: %q", out)
+	}
+
+	// Full summary includes dollar cost ($%.5f)
+	var summaryBuf bytes.Buffer
+	summarize(&summaryBuf, tr, res, "test-model")
+	summary := summaryBuf.String()
+	if !strings.Contains(summary, "$") {
+		t.Errorf("summarize should include dollar cost, got: %q", summary)
+	}
+	if !strings.Contains(summary, "test-model") || !strings.Contains(summary, "turns") {
+		t.Errorf("summarize missing expected fields, got: %q", summary)
+	}
 }
