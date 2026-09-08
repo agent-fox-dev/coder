@@ -1,9 +1,11 @@
 # AgentKit examples
 
-Eleven examples, smallest first. Each is a single self-contained `main.go` you
-can read top to bottom and copy into your own project — they deliberately
-repeat their setup rather than sharing a helper package, so nothing you need
-is in a file you have not opened.
+Twelve examples, smallest first. Each of the first eleven is a single
+self-contained `main.go` you can read top to bottom and copy into your own
+project — they deliberately repeat their setup rather than sharing a helper
+package, so nothing you need is in a file you have not opened. The last one,
+[`issued`](issued), is the opposite on purpose: a finished application in six
+files, which is what the others look like once they stop being examples.
 
 **Five of them need no API key at all**: `agentdemo`, `testing`, `plugins`,
 `mcp` and `skills` do their real work before any model call, so you can run
@@ -28,6 +30,7 @@ fully without a key:
 | [`mcp`](mcp) | `go run ./examples/mcp` · `--serve` | Model Context Protocol both ways: consuming a server's tools under qualified names, and exposing your own over stdio. |
 | [`interactive`](interactive) | `go run ./examples/interactive` | Typing *while* the agent works: steering a running turn, queued follow-ups, out-of-band abort, phase and snapshot. |
 | [`skills`](skills) | `go run ./examples/skills` | Repository- and user-authored prompt material: the three discovery tiers, the project trust gate, progressive disclosure and its escaping, context files, the tool-merge and mid-session activation seams, the subagent step. |
+| [`issued`](issued) | `go run ./examples/issued "<a bug report>"` · `go test ./examples/issued/ -v` | **A whole application.** A slash-command skill rebuilt as a program: the read-only mandate becomes a tool policy, the issue template becomes a schema, "cite real files" becomes a check in a tool handler, and filing lives where no model output can reach it. Its test suite needs no key. |
 
 There is also [`agentdemo`](agentdemo), which needs **no API key and no
 network**: it drives the real loop against a scripted provider and prints
