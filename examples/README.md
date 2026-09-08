@@ -1,12 +1,12 @@
 # AgentKit examples
 
-Fourteen examples, smallest first. Each of the first twelve is a single
+Fifteen examples, smallest first. Each of the first twelve is a single
 self-contained `main.go` you can read top to bottom and copy into your own
 project — they deliberately repeat their setup rather than sharing a helper
-package, so nothing you need is in a file you have not opened. The last two,
-[`issued`](issued) and [`cleaner`](cleaner), are the opposite on purpose:
-finished applications, which is what the others look like once they stop being
-examples.
+package, so nothing you need is in a file you have not opened. The last three,
+[`issued`](issued), [`cleaner`](cleaner) and [`flatline`](flatline), are the
+opposite on purpose: finished applications, which is what the others look like
+once they stop being examples.
 
 **Six of them need no API key at all**: `agentdemo`, `testing`, `plugins`,
 `mcp`, `mcpserver` and `skills` do their real work before any model call, so you can run
@@ -33,15 +33,16 @@ fully without a key:
 | [`interactive`](interactive) | `go run ./examples/interactive` | Typing *while* the agent works: steering a running turn, queued follow-ups, out-of-band abort, phase and snapshot. |
 | [`skills`](skills) | `go run ./examples/skills` | Repository- and user-authored prompt material: the three discovery tiers, the project trust gate, progressive disclosure and its escaping, context files, the tool-merge and mid-session activation seams, the subagent step. |
 
-And two applications rather than demonstrations of a feature. They are the two
-halves of one workflow — `issued` turns a bug report into an issue, `cleaner`
-turns that issue into a merged fix — and each is a slash-command skill rebuilt
-as a program:
+And three applications rather than demonstrations of a feature. The first two
+are the halves of one workflow — `issued` turns a bug report into an issue,
+`cleaner` turns that issue into a merged fix — and each is a slash-command
+skill rebuilt as a program. The third rebuilds an orchestrator's simplest path:
 
 | Example | Run it | What it teaches |
 |---|---|---|
 | [`issued`](issued) | `go run ./examples/issued "<a bug report>"` · `go test ./examples/issued/ -v` | **A whole application.** The read-only mandate becomes a tool policy, the issue template becomes a schema, "cite real files" becomes a check in a tool handler, and filing lives where no model output can reach it. Its test suite needs no key. |
 | [`cleaner`](cleaner) | `go run ./examples/cleaner https://github.com/{owner}/{repo}/issues/{n}` · `go test ./examples/cleaner/` | **A whole application.** Two model phases with different tool scopes, structured hand-off through terminating tools, an application-specific authorization guard, verification the model cannot fake, and an end-to-end test of all of it against a scripted provider. Its test suite needs no key. |
+| [`flatline`](flatline) | `cd examples/flatline && go run . --dir ~/src/widgets 3` · `go test ./...` | **A whole application, and a nested module.** agent-fox's `af code` for one spec pack with no dependencies: a session per task group with the spec rendered and scoped to it, memory carried from group to group, the pack's own test commands as gates, retries with the failure in the prompt, per-group squash landings, and an informational verifier — driven by the spec library it imports. Needs a sibling checkout of `agent-fox-dev/spec`; its test suite needs no key. |
 
 There is also [`agentdemo`](agentdemo), which needs **no API key and no
 network**: it drives the real loop against a scripted provider and prints

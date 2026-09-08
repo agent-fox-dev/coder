@@ -1,0 +1,161 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v1.json",
+  "spec_id": "01",
+  "spec_name": "widget_counter",
+  "schema_version": 1,
+  "test_commands": {
+    "spec_tests": "go test ./... -run Widget",
+    "all_tests": "go test ./...",
+    "linter": "go vet ./..."
+  },
+  "dependencies": [],
+  "task_groups": [
+    {
+      "id": 1,
+      "kind": "tests",
+      "title": "Write failing spec tests",
+      "subtasks": [
+        {
+          "id": "1.1",
+          "title": "Write counter tests",
+          "details": [
+            "Translate TS-01-1, TS-01-E1 and TS-01-P1 into test functions",
+            "Tests must fail: no implementation exists yet"
+          ],
+          "test_spec_refs": [
+            "TS-01-1",
+            "TS-01-E1",
+            "TS-01-P1"
+          ],
+          "requirement_refs": [
+            "01-REQ-1.1",
+            "01-REQ-1.E1"
+          ],
+          "state": "pending",
+          "optional": false
+        }
+      ],
+      "verification": {
+        "id": "1.V",
+        "checks": [
+          "All spec tests exist and are syntactically valid",
+          "All spec tests FAIL (no implementation yet)"
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "kind": "standard",
+      "title": "Implement the counter",
+      "subtasks": [
+        {
+          "id": "2.1",
+          "title": "Implement Counter.Add and Counter.Total",
+          "details": [
+            "Add rejects negative values with ErrNegative"
+          ],
+          "test_spec_refs": [
+            "TS-01-1",
+            "TS-01-E1"
+          ],
+          "requirement_refs": [
+            "01-REQ-1.1",
+            "01-REQ-1.E1"
+          ],
+          "state": "pending",
+          "optional": false
+        },
+        {
+          "id": "2.2",
+          "title": "Document the counter",
+          "details": [
+            "Add a package doc comment"
+          ],
+          "test_spec_refs": [],
+          "requirement_refs": [
+            "01-REQ-1"
+          ],
+          "state": "pending",
+          "optional": true
+        }
+      ],
+      "verification": {
+        "id": "2.V",
+        "checks": [
+          "Spec tests for this group pass: go test ./... -run Widget",
+          "No linter warnings introduced: go vet ./..."
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "kind": "checkpoint",
+      "title": "Checkpoint: whole suite green",
+      "subtasks": [
+        {
+          "id": "3.1",
+          "title": "Run the full suite",
+          "details": [
+            "Run go test ./... and confirm it passes"
+          ],
+          "test_spec_refs": [],
+          "requirement_refs": [
+            "01-REQ-1"
+          ],
+          "state": "pending",
+          "optional": false
+        }
+      ],
+      "verification": {
+        "id": "3.V",
+        "checks": [
+          "All existing tests still pass: go test ./..."
+        ]
+      }
+    },
+    {
+      "id": 4,
+      "kind": "wiring_verification",
+      "title": "Wiring verification",
+      "subtasks": [
+        {
+          "id": "4.1",
+          "title": "Stub and dead-code audit, trace execution paths end-to-end",
+          "details": [
+            "Trace 01-PATH-1 through production code",
+            "Confirm no stub remains"
+          ],
+          "test_spec_refs": [
+            "TS-01-SMOKE-1"
+          ],
+          "requirement_refs": [
+            "01-REQ-1.1"
+          ],
+          "state": "pending",
+          "optional": false
+        }
+      ],
+      "verification": {
+        "id": "4.V",
+        "checks": [
+          "All smoke tests pass",
+          "No unjustified stubs remain"
+        ]
+      }
+    }
+  ],
+  "traceability": [
+    {
+      "requirement_id": "01-REQ-1.1",
+      "test_spec_id": "TS-01-1",
+      "task_id": "2.1",
+      "test_path": null
+    },
+    {
+      "requirement_id": "01-REQ-1.E1",
+      "test_spec_id": "TS-01-E1",
+      "task_id": "2.1",
+      "test_path": null
+    }
+  ]
+}

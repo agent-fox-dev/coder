@@ -7,6 +7,8 @@
 /codingagent
 /session
 /delegation
+/flatline
+/examples/flatline/flatline
 # `make build-examples` drops binaries here.
 /bin/
 

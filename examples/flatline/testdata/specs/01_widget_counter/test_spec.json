@@ -1,0 +1,78 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v1.json",
+  "spec_id": "01",
+  "spec_name": "widget_counter",
+  "schema_version": 1,
+  "test_cases": [
+    {
+      "id": "TS-01-1",
+      "requirement_id": "01-REQ-1.1",
+      "kind": "unit",
+      "description": "Add increases the total",
+      "preconditions": [],
+      "input": {
+        "adds": [1, 2]
+      },
+      "expected": {
+        "total": 3
+      },
+      "assertion_pseudocode": "c.Add(1); c.Add(2); assert c.Total() == 3"
+    }
+  ],
+  "property_tests": [
+    {
+      "id": "TS-01-P1",
+      "property_id": "01-PROP-1",
+      "validates": [
+        "01-REQ-1.1"
+      ],
+      "description": "Total is the sum of adds",
+      "for_any_strategy": "slice of ints in [0, 1000]",
+      "invariant_check": "Total() == sum(adds)"
+    }
+  ],
+  "edge_case_tests": [
+    {
+      "id": "TS-01-E1",
+      "requirement_id": "01-REQ-1.E1",
+      "kind": "unit",
+      "description": "Negative add is rejected",
+      "preconditions": [],
+      "input": {
+        "n": -1
+      },
+      "expected": {
+        "error": "ErrNegative"
+      },
+      "assertion_pseudocode": "err := c.Add(-1); assert errors.Is(err, ErrNegative)"
+    }
+  ],
+  "smoke_tests": [
+    {
+      "id": "TS-01-SMOKE-1",
+      "execution_path_id": "01-PATH-1",
+      "description": "Add then Total end-to-end",
+      "trigger": "c.Add(3); c.Total()",
+      "real_components": [
+        "counter"
+      ],
+      "mockable": [],
+      "expected_effects": [
+        "Total() returns 3"
+      ]
+    }
+  ],
+  "coverage": {
+    "requirements_covered": [
+      "01-REQ-1.1",
+      "01-REQ-1.E1"
+    ],
+    "properties_covered": [
+      "01-PROP-1"
+    ],
+    "paths_covered": [
+      "01-PATH-1"
+    ],
+    "gaps": []
+  }
+}
