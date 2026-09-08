@@ -13,6 +13,7 @@
 //	go run ./examples/issued "panic: nil map write in loop.go when a tool result arrives after abort"
 //	go run ./examples/issued ./crash.log --dir .
 //	go run ./examples/issued https://github.com/owner/repo/issues/42 --label af:fix
+//	go run ./examples/issued https://github.com/owner/repo/issues/42 -overwrite
 //	kubectl logs deploy/api | go run ./examples/issued -
 //
 // It creates the issue on GitHub unless you pass --dry-run.
@@ -52,14 +53,15 @@ func main() {
 }
 
 type cliConfig struct {
-	dir     string
-	repo    string
-	dryRun  bool
-	labels  string
-	outFile string
-	debug   bool
-	verbose bool
-	arg     string
+	dir       string
+	repo      string
+	dryRun    bool
+	overwrite bool
+	labels    string
+	outFile   string
+	debug     bool
+	verbose   bool
+	arg       string
 }
 
 func newFlagSet() (*flag.FlagSet, *cliConfig) {
@@ -68,6 +70,7 @@ func newFlagSet() (*flag.FlagSet, *cliConfig) {
 	fs.StringVar(&cfg.dir, "dir", ".", "workspace root; the analysis cannot read outside it")
 	fs.StringVar(&cfg.repo, "repo", "", "target repository as owner/repo (default: the origin remote of --dir)")
 	fs.BoolVar(&cfg.dryRun, "dry-run", false, "make no changes to GitHub; only print the rendered issue")
+	fs.BoolVar(&cfg.overwrite, "overwrite", false, "overwrite the input GitHub issue body in place instead of creating a new issue")
 	fs.StringVar(&cfg.labels, "label", "", "comma-separated labels for the created issue, e.g. af:fix,bug")
 	fs.StringVar(&cfg.outFile, "out", "", "also write the rendered issue to this file")
 	fs.BoolVar(&cfg.debug, "debug", false, "stream the model's reasoning text to stderr")
@@ -162,7 +165,7 @@ func run() error {
 	}
 
 	body := issue.Render(report.Kind, report.Origin)
-	if report.Upstream != nil {
+	if report.Upstream != nil && !cfg.overwrite {
 		body = fmt.Sprintf("Triaged from %s.\n\n%s", report.Upstream.URL(), body)
 	}
 
@@ -182,14 +185,15 @@ func run() error {
 	//    Reaching GitHub is not something the agent can do — there is no tool
 	//    for it — so this is the only line in the program that writes anything
 	//    to anyone, and it runs after the run has ended.
-	return fileOrDryRun(os.Stderr, gh, cfg.dryRun, owner, repo, issue, body, splitLabels(cfg.labels))
+	return fileOrDryRun(os.Stderr, gh, cfg.dryRun, cfg.overwrite, report.Upstream, owner, repo, issue, body, splitLabels(cfg.labels))
 }
 
-type issueCreator interface {
+type issueClient interface {
 	CreateIssue(owner, repo, title, body string, labels []string) (string, error)
+	UpdateIssue(owner, repo string, number int, body string) (string, error)
 }
 
-func fileOrDryRun(w io.Writer, gh issueCreator, dryRun bool, owner, repo string, issue Issue, body string, labels []string) error {
+func fileOrDryRun(w io.Writer, gh issueClient, dryRun, overwrite bool, upstream *IssueRef, owner, repo string, issue Issue, body string, labels []string) error {
 	if dryRun {
 		if owner == "" {
 			fmt.Fprintf(w, "[issued] dry run. Re-run with --repo %s to file it.\n",
@@ -197,6 +201,14 @@ func fileOrDryRun(w io.Writer, gh issueCreator, dryRun bool, owner, repo string,
 		} else {
 			fmt.Fprintln(w, "[issued] dry run. Re-run without --dry-run to file it.")
 		}
+		return nil
+	}
+	if overwrite && upstream != nil {
+		url, err := gh.UpdateIssue(upstream.Owner, upstream.Repo, upstream.Number, body)
+		if err != nil {
+			return fmt.Errorf("%w\n\n(the issue body is above; you can file it by hand)", err)
+		}
+		fmt.Fprintf(w, "[issued] updated: %s\n", url)
 		return nil
 	}
 	url, err := gh.CreateIssue(owner, repo, issue.Title, body, labels)
@@ -292,6 +304,7 @@ Examples:
   issued "TestResume hangs on a session whose last entry is a tool call"
   issued ./crash.log --dir ./service
   issued https://github.com/owner/repo/issues/42 --label af:fix
+  issued https://github.com/owner/repo/issues/42 -overwrite
   issued ./crash.log --dry-run
   kubectl logs deploy/api | issued -
 
