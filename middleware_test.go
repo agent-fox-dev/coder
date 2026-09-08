@@ -59,6 +59,8 @@ func TestRetryDenylistIsCheckedFirst(t *testing.T) {
 		{"bare 529 text", "upstream returned 503", true},
 		{"truncated stream", "stream ended before message_stop", true},
 		{"dns failure", "getaddrinfo ENOTFOUND api.example.com", true},
+		{"service unavailable", "upstream service unavailable", true},
+		{"bare unavailable", "upstream unavailable", true},
 		{"quota, worded as a rate limit", "You have hit your rate limit: insufficient_quota", false},
 		{"billing", "Your credit balance is too low", false},
 		{"monthly limit mentioning 429", "429: monthly limit reached", false},

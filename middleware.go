@@ -139,7 +139,8 @@ var retryable = []string{
 	"503", "504", "524", "socket hang up", "getaddrinfo", "eai_again",
 	"econnreset", "connection reset", "stream ended before message_stop",
 	"resourceexhausted", "you can retry your request", "timeout",
-	"temporarily unavailable", "unexpected eof",
+	"temporarily unavailable", "service unavailable", "unavailable",
+	"unexpected eof",
 }
 
 // Retryable classifies a completed assistant message (REQ-PROV-14).

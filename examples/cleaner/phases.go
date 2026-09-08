@@ -186,6 +186,9 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 			b.printf("  blocked %s\n", msg)
 		}
 	})
+	cfg.Middleware = append(append([]core.Middleware(nil), b.base.Middleware...),
+		agentkit.RetryMiddleware(agentkit.RetryOptions{MaxAttempts: 3}),
+	)
 
 	built, err := tools.All(tools.Options{Workspace: b.workspace})
 	if err != nil {

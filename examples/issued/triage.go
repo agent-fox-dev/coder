@@ -143,6 +143,9 @@ func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose bool) (*Triag
 		agentkit.StopAfterTurns(100),  // a wandering read loop
 		agentkit.StopOverBudget(2.00), // dollars, cumulative for the run
 	)
+	cfg.Middleware = append(append([]core.Middleware(nil), cfg.Middleware...),
+		agentkit.RetryMiddleware(agentkit.RetryOptions{MaxAttempts: 3}),
+	)
 
 	registered := append(append([]core.Tool(nil), built...), t.fileIssueTool())
 	resolved := agentkit.ResolveToolPolicy(registered, cfg.ToolPolicy)
