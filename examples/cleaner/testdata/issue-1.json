@@ -1,0 +1,13 @@
+{
+  "title": "read_file truncates the last line when the file has no trailing newline",
+  "body": "## Problem\n\n`read_file` drops the final line of a file that does not end in a newline.\n\n## Reproduction\n\n1. Write `hello` (no trailing newline) to `a.txt`.\n2. Ask the agent to read it.\n3. The tool result comes back empty.\n\n## Expected\n\nThe last line is returned like any other line.\n",
+  "url": "https://github.com/acme/widgets/issues/1",
+  "labels": [{"name": "bug"}],
+  "author": {"login": "reporter"},
+  "comments": [
+    {
+      "author": {"login": "maintainer"},
+      "body": "Probably the line splitter in the read path. Same class of bug may exist in search_files."
+    }
+  ]
+}
