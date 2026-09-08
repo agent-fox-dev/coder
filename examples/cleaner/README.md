@@ -184,6 +184,7 @@ cleaner [flags] https://github.com/{owner}/{repo}/issues/{number}
 | `--journal` | — | Append a JSONL record of every step to this file. |
 | `--allow` | — | Extra programs the implementation phase's shell may run. |
 | `--show-text` | off | Print the model's prose as well as its tool calls. |
+| `--verbose` | off | Verbose output: tool calls, timing and cost diagnostics. |
 | `--push-attempts` | `4` | Push retries, with exponential backoff. |
 
 Exit codes, because this is meant to be run by something other than a human:

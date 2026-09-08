@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -595,4 +596,244 @@ func keys(m map[string]string) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func TestTokenTimingFormatting(t *testing.T) {
+	formatted := FormatTokenTiming(1500*time.Millisecond, 100, 50)
+	if formatted != "1.5s · 100 sent / 50 received tokens" {
+		t.Errorf("FormatTokenTiming = %q, want %q", formatted, "1.5s · 100 sent / 50 received tokens")
+	}
+
+	stats := RunStats{
+		Phase:      "analyze",
+		Turns:      2,
+		StopReason: core.RunStopToolTerminate,
+		Usage: core.Usage{
+			InputTokens:  120,
+			OutputTokens: 80,
+		},
+		CostUSD: 0.0012,
+		Elapsed: 1200 * time.Millisecond,
+	}
+
+	if got := stats.TokenTiming(); got != "1.2s · 120 sent / 80 received tokens" {
+		t.Errorf("TokenTiming() = %q, want %q", got, "1.2s · 120 sent / 80 received tokens")
+	}
+
+	costFree := stats.TimingWithoutCost()
+	if strings.Contains(costFree, "$") {
+		t.Errorf("TimingWithoutCost() contains dollar sign: %q", costFree)
+	}
+	if !strings.Contains(costFree, "analyze") || !strings.Contains(costFree, "2 turns") || !strings.Contains(costFree, "1.2s · 120 sent / 80 received tokens") || !strings.Contains(costFree, "tool_terminate") {
+		t.Errorf("TimingWithoutCost() missing expected metrics: %q", costFree)
+	}
+
+	verboseStr := stats.String()
+	if !strings.Contains(verboseStr, "$") || !strings.Contains(verboseStr, "0.00120") {
+		t.Errorf("String() missing cost figures: %q", verboseStr)
+	}
+}
+
+func TestSpinnerAndPhaseTimingNonVerbose(t *testing.T) {
+	dir := newRepo(t)
+	hub := &recordingHub{issue: fixtureIssue()}
+	brain := scriptedBrain(t, dir,
+		toolTurn("c1", "submit_analysis", analysisArgs),
+		toolTurn("c2", "write_file", `{"path":"session.go","content":"package session\n\n// expiry checked\n"}`),
+		toolTurn("c3", "submit_implementation", implementationArgs),
+	)
+
+	var buf bytes.Buffer
+	opts := baseOptions(t, dir, hub, brain)
+	opts.Out = &buf
+	opts.Verbose = false
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	_ = res
+
+	out := buf.String()
+
+	// In non-verbose terminal mode (buf is *bytes.Buffer, detected as terminal):
+	// 1. Initial spinner frame '|' and stop cleanup '\b \b' should appear
+	if !strings.Contains(out, "|") || !strings.Contains(out, "\b \b") {
+		t.Errorf("expected spinner frames and cleanup in output, got: %q", out)
+	}
+
+	// 2. Completion timing line with tokens should appear
+	if !strings.Contains(out, "[cleaner] preflight") || !strings.Contains(out, "sent / 0 received tokens)") {
+		t.Errorf("missing preflight timing line in output: %q", out)
+	}
+	if !strings.Contains(out, "[cleaner] analyze") || !strings.Contains(out, "tokens)") {
+		t.Errorf("missing analyze timing line in output: %q", out)
+	}
+
+	// 3. No checkmarks (✓) or dollar costs ($) in non-verbose step output
+	if strings.Contains(out, "✓") {
+		t.Errorf("non-verbose step output should suppress checkmark details (✓), got: %q", out)
+	}
+	if strings.Contains(out, "$") {
+		t.Errorf("non-verbose step output should not contain dollar figures ($), got: %q", out)
+	}
+
+	// 4. Non-terminal stream should suppress spinner characters
+	var nonTermBuf bytes.Buffer
+	nonTermWriter := struct{ io.Writer }{&nonTermBuf}
+	dir2 := newRepo(t)
+	hub2 := &recordingHub{issue: fixtureIssue()}
+	brain2 := scriptedBrain(t, dir2,
+		toolTurn("c1", "submit_analysis", analysisArgs),
+		toolTurn("c2", "write_file", `{"path":"session.go","content":"package session\n\n// expiry checked\n"}`),
+		toolTurn("c3", "submit_implementation", implementationArgs),
+	)
+	opts2 := baseOptions(t, dir2, hub2, brain2)
+	opts2.Out = nonTermWriter
+	opts2.Verbose = false
+
+	if _, err := Run(context.Background(), opts2); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	nonTermOut := nonTermBuf.String()
+	if strings.Contains(nonTermOut, "|") || strings.Contains(nonTermOut, "\b") {
+		t.Errorf("non-terminal stream should not contain spinner characters, got: %q", nonTermOut)
+	}
+	if !strings.Contains(nonTermOut, "[cleaner] preflight (") {
+		t.Errorf("non-terminal stream missing phase timing line, got: %q", nonTermOut)
+	}
+}
+
+func TestAgentBrainVerboseVsNonVerbose(t *testing.T) {
+	dir := newRepo(t)
+	ws, err := tools.NewWorkspace(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	makeBrain := func(verbose bool, out *bytes.Buffer) *agentBrain {
+		p := faux.New(
+			toolTurn("c0", "execute", `{"command":"git commit -m wip"}`),
+			toolTurn("c1", "submit_analysis", analysisArgs),
+		)
+		return &agentBrain{
+			base: core.AgentConfig{
+				Model:     faux.Model(),
+				Providers: core.ProviderRegistry{faux.API: p.APIProvider()},
+			},
+			workspace: ws,
+			progress:  out,
+			maxTurns:  6,
+			budgetUSD: 1,
+			verbose:   verbose,
+		}
+	}
+
+	// Non-verbose suppresses tool call logs (→ and ←) and guard blocked logs
+	var nonVerboseBuf bytes.Buffer
+	bNonVerbose := makeBrain(false, &nonVerboseBuf)
+	_, _, err = bNonVerbose.Analyze(context.Background(), AnalysisInput{
+		Ref:   IssueRef{"acme", "widgets", 42},
+		Issue: fixtureIssue(),
+	})
+	if err != nil {
+		t.Fatalf("Analyze failed: %v", err)
+	}
+	if strings.Contains(nonVerboseBuf.String(), "→") || strings.Contains(nonVerboseBuf.String(), "←") || strings.Contains(nonVerboseBuf.String(), "blocked") {
+		t.Errorf("non-verbose brain output should suppress tool calls and blocked notifications, got: %q", nonVerboseBuf.String())
+	}
+
+	// Verbose preserves tool call logs (→ and ←) and guard blocked logs
+	var verboseBuf bytes.Buffer
+	bVerbose := makeBrain(true, &verboseBuf)
+	_, _, err = bVerbose.Analyze(context.Background(), AnalysisInput{
+		Ref:   IssueRef{"acme", "widgets", 42},
+		Issue: fixtureIssue(),
+	})
+	if err != nil {
+		t.Fatalf("Analyze failed: %v", err)
+	}
+	if !strings.Contains(verboseBuf.String(), "→ submit_analysis") || !strings.Contains(verboseBuf.String(), "← submit_analysis") {
+		t.Errorf("verbose brain output should retain tool calls, got: %q", verboseBuf.String())
+	}
+	if !strings.Contains(verboseBuf.String(), "blocked execute") {
+		t.Errorf("verbose brain output should retain blocked notifications, got: %q", verboseBuf.String())
+	}
+}
+
+func TestVerboseFlagOutputRetention(t *testing.T) {
+	dir := newRepo(t)
+	hub := &recordingHub{issue: fixtureIssue()}
+	brain := scriptedBrain(t, dir,
+		toolTurn("c1", "submit_analysis", analysisArgs),
+		toolTurn("c2", "write_file", `{"path":"session.go","content":"package session\n\n// expiry checked\n"}`),
+		toolTurn("c3", "submit_implementation", implementationArgs),
+	)
+
+	var buf bytes.Buffer
+	opts := baseOptions(t, dir, hub, brain)
+	opts.Out = &buf
+	opts.Verbose = true
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	_ = res
+
+	out := buf.String()
+	// In verbose mode, checkmark details are preserved
+	if !strings.Contains(out, "✓") {
+		t.Errorf("verbose output should retain checkmark details (✓), got: %q", out)
+	}
+	// And spinner characters are not printed
+	if strings.Contains(out, "\b \b") {
+		t.Errorf("verbose output should not display spinner, got: %q", out)
+	}
+}
+
+func TestSummaryVerboseVsNonVerbose(t *testing.T) {
+	res := &Result{
+		Ref:    IssueRef{"acme", "widgets", 42},
+		Branch: "fix/issue-42-test",
+		Commit: "abcdef",
+		Stats: []RunStats{
+			{
+				Phase:      "analyze",
+				Turns:      2,
+				StopReason: core.RunStopToolTerminate,
+				Usage: core.Usage{
+					InputTokens:  100,
+					OutputTokens: 50,
+				},
+				CostUSD: 0.005,
+				Elapsed: 1500 * time.Millisecond,
+			},
+		},
+	}
+
+	var nonVerboseBuf bytes.Buffer
+	summaryTo(&nonVerboseBuf, res, nil, false)
+	nonVerboseOut := nonVerboseBuf.String()
+
+	if strings.Contains(nonVerboseOut, "$") {
+		t.Errorf("non-verbose summary should omit dollar cost, got: %q", nonVerboseOut)
+	}
+	if strings.Contains(nonVerboseOut, "cost:") {
+		t.Errorf("non-verbose summary should omit cost line, got: %q", nonVerboseOut)
+	}
+	if !strings.Contains(nonVerboseOut, "100 sent / 50 received tokens") {
+		t.Errorf("non-verbose summary missing tokens: %q", nonVerboseOut)
+	}
+
+	var verboseBuf bytes.Buffer
+	summaryTo(&verboseBuf, res, nil, true)
+	verboseOut := verboseBuf.String()
+
+	if !strings.Contains(verboseOut, "$0.00500") {
+		t.Errorf("verbose summary should include detailed stats with dollar cost, got: %q", verboseOut)
+	}
+	if !strings.Contains(verboseOut, "cost:     $0.0050") {
+		t.Errorf("verbose summary should include cost line, got: %q", verboseOut)
+	}
 }

@@ -137,6 +137,21 @@ func (s RunStats) String() string {
 		s.CostUSD, s.Elapsed.Round(time.Millisecond))
 }
 
+// FormatTokenTiming formats elapsed duration and tokens sent/received without dollar figures.
+func FormatTokenTiming(elapsed time.Duration, sent, received int) string {
+	return fmt.Sprintf("%s · %d sent / %d received tokens", elapsed.Round(time.Millisecond), sent, received)
+}
+
+// TokenTiming returns the elapsed duration and token counts without dollar figures.
+func (s RunStats) TokenTiming() string {
+	return FormatTokenTiming(s.Elapsed, int(s.Usage.InputTokens), int(s.Usage.OutputTokens))
+}
+
+// TimingWithoutCost returns phase execution metrics without dollar cost information.
+func (s RunStats) TimingWithoutCost() string {
+	return fmt.Sprintf("%s: %d turns · stop %s · %s", s.Phase, s.Turns, s.StopReason, s.TokenTiming())
+}
+
 // VerifyResult is one run of the project's own quality command.
 type VerifyResult struct {
 	Command  string        `json:"command"`

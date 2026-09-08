@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,6 +56,7 @@ type Options struct {
 	PushAttempts  int
 	Out           io.Writer
 	JournalPath   string
+	Verbose       bool
 }
 
 // Result is what the run produced, whether or not it finished.
@@ -97,9 +100,10 @@ type JournalEntry struct {
 }
 
 type runner struct {
-	o   Options
-	res *Result
-	log *os.File
+	o     Options
+	res   *Result
+	log   *os.File
+	outMu sync.Mutex
 }
 
 // Run executes the pipeline and returns what happened. A returned error means
@@ -109,6 +113,9 @@ type runner struct {
 // The ORDER here is the part worth reading, and it differs from the af-fix
 // skill in three places, each marked below.
 func Run(ctx context.Context, o Options) (*Result, error) {
+	if o.Out == nil {
+		o.Out = io.Discard
+	}
 	r := &runner{o: o, res: &Result{Ref: o.Ref}}
 	if o.JournalPath != "" {
 		f, err := os.OpenFile(o.JournalPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -356,8 +363,10 @@ func (r *runner) landing(ctx context.Context) error {
 		// contained the way a branch is: undoing it takes a reset. So a dry
 		// run stops at the commit here rather than landing it quietly.
 		if o.DryRun {
+			r.outMu.Lock()
 			fmt.Fprintf(o.Out, "  ~ dry run: would squash-merge %s into %s\n",
 				r.res.Branch, o.Git.BaseBranch(ctx))
+			r.outMu.Unlock()
 			return nil
 		}
 		return r.step(ctx, "merge", func() (string, error) {
@@ -416,29 +425,159 @@ func (r *runner) fail(ctx context.Context, stage string, cause error) error {
 // step runs one pipeline step, prints it, and journals the outcome.
 func (r *runner) step(ctx context.Context, name string, fn func() (string, error)) error {
 	start := time.Now()
-	fmt.Fprintf(r.o.Out, "\n[cleaner] %s\n", name)
+	prevStats := len(r.res.Stats)
+
+	if r.o.Verbose {
+		r.outMu.Lock()
+		fmt.Fprintf(r.o.Out, "\n[cleaner] %s\n", name)
+		r.outMu.Unlock()
+
+		detail, err := fn()
+		entry := JournalEntry{Time: start, Step: name, Status: "ok", Detail: detail, Elapsed: time.Since(start).Milliseconds()}
+		if err != nil {
+			entry.Status, entry.Detail = "fail", err.Error()
+			r.res.Stage = name
+		}
+		r.record(entry)
+
+		r.outMu.Lock()
+		if err != nil {
+			fmt.Fprintf(r.o.Out, "  ✗ %s\n", indent(err.Error()))
+		} else if detail != "" {
+			fmt.Fprintf(r.o.Out, "  ✓ %s\n", indent(detail))
+		}
+		r.outMu.Unlock()
+
+		return err
+	}
+
+	r.outMu.Lock()
+	fmt.Fprintf(r.o.Out, "\n[cleaner] %s ", name)
+	r.outMu.Unlock()
+
+	var sp *spinner
+	if isTerminal(r.o.Out) {
+		sp = startSpinner(r.o.Out, &r.outMu)
+	}
 
 	detail, err := fn()
-	entry := JournalEntry{Time: start, Step: name, Status: "ok", Detail: detail, Elapsed: time.Since(start).Milliseconds()}
+	elapsed := time.Since(start)
+
+	if sp != nil {
+		sp.Stop()
+	}
+
+	entry := JournalEntry{Time: start, Step: name, Status: "ok", Detail: detail, Elapsed: elapsed.Milliseconds()}
 	if err != nil {
 		entry.Status, entry.Detail = "fail", err.Error()
 		r.res.Stage = name
 	}
 	r.record(entry)
 
+	var inTokens, outTokens int
+	for i := prevStats; i < len(r.res.Stats); i++ {
+		inTokens += int(r.res.Stats[i].Usage.InputTokens)
+		outTokens += int(r.res.Stats[i].Usage.OutputTokens)
+	}
+
+	r.outMu.Lock()
+	fmt.Fprintf(r.o.Out, "(%s)\n", FormatTokenTiming(elapsed, inTokens, outTokens))
 	if err != nil {
 		fmt.Fprintf(r.o.Out, "  ✗ %s\n", indent(err.Error()))
-		return err
 	}
-	if detail != "" {
-		fmt.Fprintf(r.o.Out, "  ✓ %s\n", indent(detail))
+	r.outMu.Unlock()
+
+	return err
+}
+
+var spinnerFrames = []byte{'|', '/', '-', '\\'}
+
+type spinner struct {
+	w       io.Writer
+	mu      *sync.Mutex
+	ticker  *time.Ticker
+	done    chan struct{}
+	stopped chan struct{}
+}
+
+func startSpinner(w io.Writer, mu *sync.Mutex) *spinner {
+	s := &spinner{
+		w:       w,
+		mu:      mu,
+		ticker:  time.NewTicker(100 * time.Millisecond),
+		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
-	return nil
+	if s.mu != nil {
+		s.mu.Lock()
+	}
+	s.w.Write([]byte{spinnerFrames[0]})
+	if s.mu != nil {
+		s.mu.Unlock()
+	}
+
+	go s.run()
+	return s
+}
+
+func (s *spinner) run() {
+	defer close(s.stopped)
+	frameIdx := 1
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-s.ticker.C:
+			if s.mu != nil {
+				s.mu.Lock()
+			}
+			s.w.Write([]byte{'\b', spinnerFrames[frameIdx]})
+			if s.mu != nil {
+				s.mu.Unlock()
+			}
+			frameIdx = (frameIdx + 1) % len(spinnerFrames)
+		}
+	}
+}
+
+func (s *spinner) Stop() {
+	s.ticker.Stop()
+	close(s.done)
+	<-s.stopped
+	if s.mu != nil {
+		s.mu.Lock()
+	}
+	s.w.Write([]byte{'\b', ' ', '\b'})
+	if s.mu != nil {
+		s.mu.Unlock()
+	}
+}
+
+func isTerminal(w io.Writer) bool {
+	if w == nil || w == io.Discard {
+		return false
+	}
+	if td, ok := w.(interface{ IsTerminal() bool }); ok {
+		return td.IsTerminal()
+	}
+	if _, ok := w.(*bytes.Buffer); ok {
+		return true
+	}
+	if f, ok := w.(*os.File); ok {
+		stat, err := f.Stat()
+		if err != nil {
+			return false
+		}
+		return (stat.Mode() & os.ModeCharDevice) != 0
+	}
+	return false
 }
 
 func (r *runner) warn(msg string) {
 	r.res.Warnings = append(r.res.Warnings, msg)
+	r.outMu.Lock()
 	fmt.Fprintf(r.o.Out, "  ! %s\n", msg)
+	r.outMu.Unlock()
 	r.record(JournalEntry{Time: time.Now(), Step: "warning", Status: "warn", Detail: msg})
 }
 

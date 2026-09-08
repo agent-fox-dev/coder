@@ -27,6 +27,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -74,6 +75,7 @@ func run() int {
 	allow := flag.String("allow", "", "extra programs the implementation phase may run, comma-separated")
 	showText := flag.Bool("show-text", false, "print the model's prose as well as its tool calls")
 	pushAttempts := flag.Int("push-attempts", 4, "how many times to try pushing before giving up")
+	verbose := flag.Bool("verbose", false, "verbose output: tool calls, timing and cost diagnostics")
 
 	flag.Usage = usage
 	flag.Parse()
@@ -154,18 +156,21 @@ func run() int {
 		budgetUSD:     *budget,
 		extraPrograms: extraPrograms(*allow, verify),
 		showText:      *showText,
+		verbose:       *verbose,
 	}
 
 	opts := Options{
 		Ref: ref, Dir: ws.Root, Hub: hub, Git: NewGit(ws.Root, execRunner), Brain: brain,
 		Run: execRunner, VerifyCommand: verify, VerifyTimeout: *verifyTimeout,
 		Landing: landing, DryRun: *dryRun, PushAttempts: *pushAttempts,
-		Out: os.Stderr, JournalPath: *journal,
+		Out: os.Stderr, JournalPath: *journal, Verbose: *verbose,
 	}
 
-	banner(opts, model.ID)
+	if *verbose {
+		banner(opts, model.ID)
+	}
 	res, runErr := Run(ctx, opts)
-	summary(res, runErr)
+	summary(res, runErr, *verbose)
 
 	switch {
 	case res.NeedsClarification:
@@ -199,20 +204,24 @@ func banner(o Options, modelID string) {
 // what was attempted. af-fix's final banner says "✅ fixed and merged to main"
 // unconditionally, including on the paths where it skipped the push and the
 // pull request.
-func summary(res *Result, err error) {
-	fmt.Fprintln(os.Stderr)
+func summary(res *Result, err error, verbose bool) {
+	summaryTo(os.Stderr, res, err, verbose)
+}
+
+func summaryTo(w io.Writer, res *Result, err error, verbose bool) {
+	fmt.Fprintln(w)
 	switch {
 	case res.NeedsClarification:
-		fmt.Fprintf(os.Stderr, "[cleaner] ? issue #%d is ambiguous — a question was posted and nothing was changed.\n", res.Ref.Number)
+		fmt.Fprintf(w, "[cleaner] ? issue #%d is ambiguous — a question was posted and nothing was changed.\n", res.Ref.Number)
 	case err != nil:
-		fmt.Fprintf(os.Stderr, "[cleaner] ✗ issue #%d NOT fixed (failed during %s).\n", res.Ref.Number, res.Stage)
+		fmt.Fprintf(w, "[cleaner] ✗ issue #%d NOT fixed (failed during %s).\n", res.Ref.Number, res.Stage)
 	default:
-		fmt.Fprintf(os.Stderr, "[cleaner] ✓ issue #%d fixed.\n", res.Ref.Number)
+		fmt.Fprintf(w, "[cleaner] ✓ issue #%d fixed.\n", res.Ref.Number)
 	}
 
 	line := func(k, v string) {
 		if v != "" {
-			fmt.Fprintf(os.Stderr, "  %-9s %s\n", k+":", v)
+			fmt.Fprintf(w, "  %-9s %s\n", k+":", v)
 		}
 	}
 	line("branch", res.Branch)
@@ -225,16 +234,22 @@ func summary(res *Result, err error) {
 		line("files", fmt.Sprintf("%d changed: %s", len(res.Changed), strings.Join(res.Changed, ", ")))
 	}
 	for _, s := range res.Stats {
-		fmt.Fprintf(os.Stderr, "  %s\n", s)
+		if verbose {
+			fmt.Fprintf(w, "  %s\n", s)
+		} else {
+			fmt.Fprintf(w, "  %s\n", s.TimingWithoutCost())
+		}
 	}
-	if c := res.CostUSD(); c > 0 {
-		line("cost", fmt.Sprintf("$%.4f", c))
+	if verbose {
+		if c := res.CostUSD(); c > 0 {
+			line("cost", fmt.Sprintf("$%.4f", c))
+		}
 	}
-	for _, w := range res.Warnings {
-		fmt.Fprintf(os.Stderr, "  ! %s\n", w)
+	for _, wMsg := range res.Warnings {
+		fmt.Fprintf(w, "  ! %s\n", wMsg)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)
+		fmt.Fprintf(w, "\nerror: %v\n", err)
 	}
 }
 

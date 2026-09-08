@@ -55,6 +55,7 @@ type agentBrain struct {
 	// verify command's program lands here, plus whatever the operator adds.
 	extraPrograms []string
 	showText      bool
+	verbose       bool
 }
 
 // readOnlyTools are the tools the analysis phase gets. write_file and
@@ -179,7 +180,9 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 		TerminateOnBlock: false,
 	})
 	cfg.BeforeToolCall = toolGuard(base, spec.readOnly, func(msg string) {
-		fmt.Fprintf(b.progress, "  blocked %s\n", msg)
+		if b.verbose {
+			fmt.Fprintf(b.progress, "  blocked %s\n", msg)
+		}
 	})
 
 	built, err := tools.All(tools.Options{Workspace: b.workspace})
@@ -218,15 +221,21 @@ func (b *agentBrain) drive(ctx context.Context, agent *agentkit.Agent, phase, pr
 				fmt.Fprintln(b.progress)
 			}
 		case core.ToolCallStartEvent:
-			fmt.Fprintf(b.progress, "  → %s", e.Name)
-		case core.ToolCallEndEvent:
-			fmt.Fprintf(b.progress, " %s\n", firstLine(string(e.Block.Input), 90))
-		case core.ToolExecutionEndEvent:
-			status := "ok"
-			if e.IsError {
-				status = "ERROR"
+			if b.verbose {
+				fmt.Fprintf(b.progress, "  → %s", e.Name)
 			}
-			fmt.Fprintf(b.progress, "  ← %s: %s (%dms)\n", e.Name, status, e.ElapsedMS)
+		case core.ToolCallEndEvent:
+			if b.verbose {
+				fmt.Fprintf(b.progress, " %s\n", firstLine(string(e.Block.Input), 90))
+			}
+		case core.ToolExecutionEndEvent:
+			if b.verbose {
+				status := "ok"
+				if e.IsError {
+					status = "ERROR"
+				}
+				fmt.Fprintf(b.progress, "  ← %s: %s (%dms)\n", e.Name, status, e.ElapsedMS)
+			}
 		case core.ErrorEvent:
 			fmt.Fprintf(b.progress, "  [stream error] %s\n", e.Message)
 		}
