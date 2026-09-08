@@ -7,12 +7,13 @@ structured, evidence-cited GitHub issue.
 ```bash
 go run ./examples/issued "panic: assignment to entry in nil map in loop.go, after an abort"
 go run ./examples/issued ./crash.log --dir ./service
-go run ./examples/issued https://github.com/owner/repo/issues/42 --create --label af:fix
+go run ./examples/issued https://github.com/owner/repo/issues/42 --label af:fix
+go run ./examples/issued ./crash.log --dir ./service --dry-run
 kubectl logs deploy/api --since 1h | go run ./examples/issued -
 ```
 
-It prints the issue and files nothing. `--create` is the only thing in the
-program that writes to GitHub, and only a human sets it.
+It creates the issue on GitHub by default. Pass `--dry-run` to print the
+diagnosis without filing it.
 
 ## Why this example exists
 
@@ -42,7 +43,7 @@ the code and work out why* — and turns every other part into a mechanism.
 | "Every file path must come from actually reading the code. Do not guess." | `file_issue` resolves every cited path against the workspace and refuses the call, by name, when one is not there. |
 | The issue-body markdown template | A `schema.Object` with required fields and enums. Go renders the markdown. |
 | "Ask the user how to label the issue (1/2/3)" | `--label`, parsed before the run starts. |
-| `gh issue create --repo …` | A `net/http` call in `main`, after the run, gated on `--create`. The model has no network tool at all. |
+| `gh issue create --repo …` | A `net/http` call in `main`, after the run, suppressed by `--dry-run`. The model has no network tool at all. |
 | "Halt until input is received." | `ErrNoInput` and exit 2, before a token is spent. |
 | "One issue per invocation." | One `Issue` value, one terminating tool call. |
 
@@ -70,7 +71,7 @@ argument ──► ResolveInput ──► Report ─┐
                                       │
                           Render ─────┼──► stdout / --out
                                       │
-                       gh.CreateIssue ┴──► GitHub  (only with --create)
+                       gh.CreateIssue ┴──► GitHub  (unless --dry-run)
 ```
 
 Six files, one `main` package:
@@ -172,7 +173,7 @@ from the code.
 There is no `create_issue` tool. `file_issue` writes a struct into this process
 and votes to end the run; `tools.FetchTool` is never constructed, so the model
 has no outbound network of any kind. The `net/http` call that files the issue
-runs in `main`, after the loop has finished, if and only if `--create` was
+runs in `main`, after the loop has finished, unless `--dry-run` was
 passed.
 
 The consequence is worth stating plainly: **no sequence of model outputs can
@@ -200,7 +201,7 @@ go run ./examples/issued "<report>" [flags]
 |---|---|
 | `--dir` | Workspace root. The analysis cannot read outside it. Default `.` |
 | `--repo owner/repo` | Target repository. Defaults to the issue the report came from, else the `origin` remote of `--dir`. |
-| `--create` | File the issue. Without it nothing is written anywhere. |
+| `--dry-run` | Make no changes to GitHub; only print the rendered issue. |
 | `--label a,b` | Labels for the created issue, e.g. `af:fix`. |
 | `--out FILE` | Also write the rendered issue to a file. |
 | `--verbose` | Stream the model's reasoning text to stderr. |
@@ -208,12 +209,13 @@ go run ./examples/issued "<report>" [flags]
 Flags may come before or after the report. `AGENTKIT_MODEL` picks the model
 (`AGENTKIT_MODEL=openai/gpt-5.6-terra`); `GITHUB_TOKEN` or `GH_TOKEN`
 authenticates GitHub, and `GITHUB_API_URL` points at a GitHub Enterprise host.
-Reading a public issue needs no token; `--create` does.
+Reading a public issue needs no token; creating an issue does (unless
+`--dry-run` is passed).
 
 A typical session:
 
 ```
-$ go run ./examples/issued ./crash.log --dir . --repo agent-fox-dev/coder
+$ go run ./examples/issued ./crash.log --dir . --repo agent-fox-dev/coder --dry-run
 [issued] input: file (crash.log, 3184 bytes)
 [issued] workspace: /home/you/coder
 [issued] tools: read_file, list_files, find_files, search_files, file_issue
@@ -227,7 +229,7 @@ session: resume folds a trailing tool call into an empty turn
 ## Problem
 …
 [issued] anthropic/claude-sonnet-5 · 7 turns · stop tool_terminate · $0.14
-[issued] dry run. Re-run with --create --repo agent-fox-dev/coder to file it.
+[issued] dry run. Re-run without --dry-run to file it.
 ```
 
 ## Testing it
@@ -250,6 +252,9 @@ three files in it. Every claim this README makes is a test:
 | `TestTheRequestDeclaresFileIssueAndNoWriteTools` | What was actually sent on the wire. |
 | `TestRenderProducesEverySectionAndIsStable` | The document is complete and deterministic. |
 | `TestResolveInputClassifiesEverySource`, `TestParseIssueURL`, `TestParseRemote`, `TestAnOversizedReportIsTruncatedVisibly` | The dull decisions, decided in Go. |
+| `TestFlagParsingRejectsCreateAndAcceptsDryRun` | Flags accept `--dry-run` and reject `--create`. |
+| `TestTargetRepoValidationHaltsWithoutDryRun` | Missing repository halts before analysis unless `--dry-run` is passed. |
+| `TestDryRunGating` | Gating prevents issue creation in dry-run mode and allows it by default. |
 
 ## What it does not do
 
