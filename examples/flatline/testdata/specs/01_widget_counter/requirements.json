@@ -1,0 +1,77 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v1.json",
+  "spec_id": "01",
+  "spec_name": "widget_counter",
+  "schema_version": 1,
+  "introduction": "A counter that adds widgets and reports the total.",
+  "glossary": {
+    "counter": "The Counter type that accumulates widget counts.",
+    "system": "The widget_counter package."
+  },
+  "requirements": [
+    {
+      "id": "01-REQ-1",
+      "title": "Counting",
+      "user_story": {
+        "role": "operator",
+        "goal": "add widgets to a counter",
+        "benefit": "the total is always known"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "01-REQ-1.1",
+          "ears_pattern": "event_driven",
+          "trigger": "Add(n) is called on a `counter`",
+          "system": "the `system`",
+          "action": "increase the total by n",
+          "return_contract": "Total() returns the new total"
+        }
+      ],
+      "edge_cases": [
+        {
+          "id": "01-REQ-1.E1",
+          "ears_pattern": "unwanted",
+          "error_condition": "Add is called with a negative n on a `counter`",
+          "system": "the `system`",
+          "action": "return an error and leave the total unchanged",
+          "return_contract": "returns ErrNegative; Total() is unchanged"
+        }
+      ]
+    }
+  ],
+  "correctness_properties": [
+    {
+      "id": "01-PROP-1",
+      "title": "Total is the sum of adds",
+      "for_any": "sequence of non-negative adds to a `counter`",
+      "invariant": "Total() equals the sum of the sequence",
+      "validates": [
+        "01-REQ-1.1"
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "01-PATH-1",
+      "title": "Add then Total",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "call Add(3)"
+        },
+        {
+          "actor": "system",
+          "action": "call Total() and return 3"
+        }
+      ]
+    }
+  ],
+  "error_handling": [
+    {
+      "id": "01-ERR-1",
+      "condition": "Negative add",
+      "behavior": "Return ErrNegative, keep the total",
+      "requirement_id": "01-REQ-1.E1"
+    }
+  ]
+}
