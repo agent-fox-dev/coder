@@ -69,8 +69,21 @@ func ResolveSpecDir(specsDir, arg string) (string, error) {
 
 // LoadPack loads and validates the spec. Validation errors are fatal —
 // agent-fox's planner refuses a pack afspec cannot load, and a pack whose
-// tasks.json cannot be saved back is one this program cannot finish.
+// tasks.json cannot be saved back is one this program cannot finish. A pack
+// that depends on another spec is refused too; see LoadPackWith.
 func LoadPack(root, specDir string) (*Pack, []string, error) {
+	return LoadPackWith(root, specDir, false)
+}
+
+// LoadPackWith is LoadPack with the dependency check loosened.
+//
+// agent-fox schedules a group behind the group of the other spec it depends
+// on. flatline runs one spec and cannot do that, so by default a pack with
+// cross-spec dependencies is refused. With assumeDeps the dependencies are
+// taken to be in place already — the other spec was implemented earlier, by
+// hand or by another run — and each is reported as a warning and rendered
+// into the coder's context, so the assumption is visible rather than silent.
+func LoadPackWith(root, specDir string, assumeDeps bool) (*Pack, []string, error) {
 	spec, hadSchema, err := loadSpecTolerant(specDir)
 	if err != nil {
 		return nil, nil, err
@@ -93,9 +106,16 @@ func LoadPack(root, specDir string) (*Pack, []string, error) {
 		return nil, warnings, fmt.Errorf("spec %s is %s; its tasks.json cannot be updated", spec.SpecName, spec.Status)
 	}
 	if n := len(spec.Tasks.Dependencies); n > 0 {
-		return nil, warnings, fmt.Errorf("spec %s declares %d cross-spec dependenc%s; flatline runs the linear, "+
-			"single-spec case only — use agent-fox for a pack that depends on another",
-			spec.SpecName, n, plural(n, "y", "ies"))
+		if !assumeDeps {
+			return nil, warnings, fmt.Errorf("spec %s declares %d cross-spec dependenc%s; flatline runs the linear, "+
+				"single-spec case only — pass --assume-deps if the spec%s it depends on %s already implemented, "+
+				"or use agent-fox",
+				spec.SpecName, n, plural(n, "y", "ies"), plural(n, "", "s"), plural(n, "is", "are"))
+		}
+		for _, d := range spec.Tasks.Dependencies {
+			warnings = append(warnings, fmt.Sprintf("assumed in place: spec %s group %d, needed from task group %d (%s)",
+				d.DependsOnSpec, d.FromGroup, d.ToGroup, d.Relationship))
+		}
 	}
 	return &Pack{
 		Spec:           spec,
@@ -374,6 +394,9 @@ func (p *Pack) AssembleContext(arch Archetype, group int, memoryFacts []string) 
 		body := strings.TrimSpace(rendered[key])
 		if key == "tasks" {
 			body = TestCommandsBlock(p.Spec.Tasks.TestCommands) + "\n\n" + body
+			if deps := DependenciesBlock(p.Spec.Tasks.Dependencies); deps != "" {
+				body = deps + "\n\n" + body
+			}
 		}
 		if body != "" {
 			// The library's tasks renderer already starts with "## Tasks".
@@ -419,6 +442,23 @@ func (p *Pack) AssembleContext(arch Archetype, group int, memoryFacts []string) 
 func TestCommandsBlock(tc afspec.TestCommands) string {
 	return fmt.Sprintf("## Test Commands\n\n- Spec tests: `%s`\n- All tests: `%s`\n- Linter: `%s`",
 		tc.SpecTests, tc.AllTests, tc.Linter)
+}
+
+// DependenciesBlock is the Python renderer's `## Dependencies` table, with a
+// line saying what flatline assumes about it. Empty when there are none.
+func DependenciesBlock(deps []afspec.TaskDependency) string {
+	if len(deps) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Dependencies\n\n")
+	b.WriteString("| Depends On | From Group | To Group | Relationship |\n|------------|-----------|----------|--------------|\n")
+	for _, d := range deps {
+		fmt.Fprintf(&b, "| %s | %d | %d | %s |\n", d.DependsOnSpec, d.FromGroup, d.ToGroup, strings.ReplaceAll(d.Relationship, "|", "\\|"))
+	}
+	b.WriteString("\nThese dependencies are assumed to be in place: the specs above were implemented before this run. " +
+		"If what they were expected to provide is missing, say so in your summary rather than re-implementing it.")
+	return b.String()
 }
 
 // VerificationChecklist is the verifier's requirement-to-test coverage table,

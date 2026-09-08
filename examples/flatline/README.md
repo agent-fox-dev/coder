@@ -156,7 +156,8 @@ flatline [flags] <spec>
 
 `<spec>` is a spec directory, or a number / `NN_name` resolved under
 `--specs-dir` (default `<dir>/.specs`). The pack must validate, must not be
-sealed, superseded or archived, and must declare no cross-spec dependencies.
+sealed, superseded or archived, and must declare no cross-spec dependencies
+unless `--assume-deps` is given.
 
 | Flag | Default | What it does |
 |---|---|---|
@@ -172,6 +173,7 @@ sealed, superseded or archived, and must declare no cross-spec dependencies.
 | `--session-timeout` | `45m` | Wall-clock ceiling per session. |
 | `--check-timeout` | `10m` | Timeout for one test command. |
 | `--no-verifier` | off | Skip the informational verifier session. |
+| `--assume-deps` | off | Treat the pack's cross-spec `dependencies` as already implemented instead of refusing the run. Each is reported as a warning and rendered into the coder's context as a `## Dependencies` table. |
 | `--journal` | — | Append a JSONL record of every step to this file. |
 | `--allow` | — | Extra programs the coder's shell may run. The pack's own test commands are always allowed. |
 | `--show-text` | off | Print the model's prose as well as its tool calls. |
@@ -232,8 +234,11 @@ seven scripted turns.
 
 ## What it does not do
 
-- **Cross-spec dependencies.** A pack with a non-empty `dependencies` array is
-  refused. That is agent-fox's job.
+- **Cross-spec dependencies.** agent-fox schedules a group behind the group
+  of the other spec it depends on. flatline cannot, so a pack with a
+  non-empty `dependencies` array is refused unless `--assume-deps` says the
+  other specs are already in place — in which case the assumption is printed,
+  journaled and shown to the coder, never silently made.
 - **Parallelism, hot-loading, watch mode.** One spec, one branch, one session
   at a time.
 - **Merge-conflict resolution.** agent-fox hands a conflicting squash to a
