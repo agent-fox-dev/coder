@@ -14,7 +14,7 @@ import (
 )
 
 // GitHub is a four-call REST client: read an issue, read its comments, create
-// an issue. It is ~100 lines of net/http because that is all this program
+// an issue, update an issue. It is ~100 lines of net/http because that is all this program
 // needs, and a dependency-free example should stay dependency-free.
 //
 // It lives OUTSIDE the agent on purpose. There is no `create_issue` tool, and
@@ -98,6 +98,19 @@ func (g *GitHub) CreateIssue(owner, repo, title, body string, labels []string) (
 		return "", err
 	}
 	return created.HTMLURL, nil
+}
+
+// UpdateIssue updates the issue's body and returns its URL.
+func (g *GitHub) UpdateIssue(owner, repo string, number int, body string) (string, error) {
+	if g.Token == "" {
+		return "", fmt.Errorf("updating an issue needs a token: set GITHUB_TOKEN (or GH_TOKEN)")
+	}
+	payload := map[string]any{"body": body}
+	var updated ghIssue
+	if err := g.do(http.MethodPatch, fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repo, number), payload, &updated); err != nil {
+		return "", err
+	}
+	return updated.HTMLURL, nil
 }
 
 func (g *GitHub) do(method, path string, payload any, out any) error {

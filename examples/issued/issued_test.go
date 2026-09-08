@@ -17,7 +17,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -549,6 +552,38 @@ func TestFlagParsingRejectsCreateAndAcceptsDryRun(t *testing.T) {
 	})
 }
 
+func TestFlagParsingOverwrite(t *testing.T) {
+	t.Run("default is false", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"test bug"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.overwrite {
+			t.Errorf("cfg.overwrite = true, want false by default")
+		}
+	})
+
+	t.Run("-overwrite flag before operand", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"-overwrite", "https://github.com/owner/repo/issues/1"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.overwrite {
+			t.Errorf("cfg.overwrite = false, want true")
+		}
+	})
+
+	t.Run("--overwrite flag after operand", func(t *testing.T) {
+		cfg, err := parseCLI([]string{"https://github.com/owner/repo/issues/1", "--overwrite"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.overwrite {
+			t.Errorf("cfg.overwrite = false, want true")
+		}
+	})
+}
+
 func TestTargetRepoValidationHaltsWithoutDryRun(t *testing.T) {
 	dir := t.TempDir()
 	rep := Report{Kind: SourceText, Origin: "argument", Body: "something broke"}
@@ -584,14 +619,16 @@ func TestTargetRepoValidationHaltsWithoutDryRun(t *testing.T) {
 }
 
 type mockIssueCreator struct {
-	called bool
-	owner  string
-	repo   string
-	title  string
-	body   string
-	labels []string
-	retURL string
-	err    error
+	called       bool
+	updateCalled bool
+	owner        string
+	repo         string
+	updateNumber int
+	title        string
+	body         string
+	labels       []string
+	retURL       string
+	err          error
 }
 
 func (m *mockIssueCreator) CreateIssue(owner, repo, title, body string, labels []string) (string, error) {
@@ -607,12 +644,24 @@ func (m *mockIssueCreator) CreateIssue(owner, repo, title, body string, labels [
 	return m.retURL, nil
 }
 
+func (m *mockIssueCreator) UpdateIssue(owner, repo string, number int, body string) (string, error) {
+	m.updateCalled = true
+	m.owner = owner
+	m.repo = repo
+	m.updateNumber = number
+	m.body = body
+	if m.err != nil {
+		return "", m.err
+	}
+	return m.retURL, nil
+}
+
 func TestDryRunGating(t *testing.T) {
 	t.Run("AC-1: live run creates issue on GitHub", func(t *testing.T) {
 		mock := &mockIssueCreator{retURL: "https://github.com/agent-fox-dev/coder/issues/100"}
 		var stderr strings.Builder
 		issue := goodIssue()
-		err := fileOrDryRun(&stderr, mock, false, "agent-fox-dev", "coder", issue, "issue body", []string{"af:fix"})
+		err := fileOrDryRun(&stderr, mock, false, false, nil, "agent-fox-dev", "coder", issue, "issue body", []string{"af:fix"})
 		if err != nil {
 			t.Fatalf("fileOrDryRun: %v", err)
 		}
@@ -634,7 +683,7 @@ func TestDryRunGating(t *testing.T) {
 		mock := &mockIssueCreator{}
 		var stderr strings.Builder
 		issue := goodIssue()
-		err := fileOrDryRun(&stderr, mock, true, "agent-fox-dev", "coder", issue, "issue body", []string{"af:fix"})
+		err := fileOrDryRun(&stderr, mock, true, false, nil, "agent-fox-dev", "coder", issue, "issue body", []string{"af:fix"})
 		if err != nil {
 			t.Fatalf("fileOrDryRun: %v", err)
 		}
@@ -651,7 +700,7 @@ func TestDryRunGating(t *testing.T) {
 		mock := &mockIssueCreator{}
 		var stderr strings.Builder
 		issue := goodIssue()
-		err := fileOrDryRun(&stderr, mock, true, "", "", issue, "issue body", nil)
+		err := fileOrDryRun(&stderr, mock, true, false, nil, "", "", issue, "issue body", nil)
 		if err != nil {
 			t.Fatalf("fileOrDryRun: %v", err)
 		}
@@ -663,6 +712,219 @@ func TestDryRunGating(t *testing.T) {
 			t.Errorf("stderr = %q, want %q", stderr.String(), want)
 		}
 	})
+}
+
+func TestGitHubUpdateIssue(t *testing.T) {
+	t.Run("sends PATCH request with payload and headers", func(t *testing.T) {
+		var (
+			gotMethod      string
+			gotPath        string
+			gotAccept      string
+			gotAPIVersion  string
+			gotAuth        string
+			gotContentType string
+			gotBody        map[string]any
+		)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod = r.Method
+			gotPath = r.URL.Path
+			gotAccept = r.Header.Get("Accept")
+			gotAPIVersion = r.Header.Get("X-GitHub-Api-Version")
+			gotAuth = r.Header.Get("Authorization")
+			gotContentType = r.Header.Get("Content-Type")
+
+			_ = json.NewDecoder(r.Body).Decode(&gotBody)
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"number": 42, "html_url": "https://github.com/owner/repo/issues/42"}`))
+		}))
+		defer srv.Close()
+
+		gh := &GitHub{
+			Token:   "secret-token",
+			BaseURL: srv.URL,
+			client:  srv.Client(),
+		}
+
+		url, err := gh.UpdateIssue("owner", "repo", 42, "updated issue body")
+		if err != nil {
+			t.Fatalf("UpdateIssue: %v", err)
+		}
+		if url != "https://github.com/owner/repo/issues/42" {
+			t.Errorf("url = %q, want %q", url, "https://github.com/owner/repo/issues/42")
+		}
+		if gotMethod != http.MethodPatch {
+			t.Errorf("method = %q, want PATCH", gotMethod)
+		}
+		if gotPath != "/repos/owner/repo/issues/42" {
+			t.Errorf("path = %q, want /repos/owner/repo/issues/42", gotPath)
+		}
+		if gotAccept != "application/vnd.github+json" {
+			t.Errorf("Accept = %q", gotAccept)
+		}
+		if gotAPIVersion != "2022-11-28" {
+			t.Errorf("X-GitHub-Api-Version = %q", gotAPIVersion)
+		}
+		if gotAuth != "Bearer secret-token" {
+			t.Errorf("Authorization = %q", gotAuth)
+		}
+		if gotContentType != "application/json" {
+			t.Errorf("Content-Type = %q", gotContentType)
+		}
+		if gotBody["body"] != "updated issue body" {
+			t.Errorf("payload body = %q, want %q", gotBody["body"], "updated issue body")
+		}
+	})
+
+	t.Run("fails when token is missing", func(t *testing.T) {
+		gh := &GitHub{
+			Token:   "",
+			BaseURL: "https://api.github.com",
+			client:  http.DefaultClient,
+		}
+		_, err := gh.UpdateIssue("owner", "repo", 42, "body")
+		if err == nil {
+			t.Fatal("UpdateIssue succeeded without token, want error")
+		}
+		if !strings.Contains(err.Error(), "token") {
+			t.Errorf("error = %v, want token error", err)
+		}
+	})
+
+	t.Run("returns error on HTTP failure", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"message": "Not Found"}`, http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		gh := &GitHub{
+			Token:   "secret-token",
+			BaseURL: srv.URL,
+			client:  srv.Client(),
+		}
+
+		_, err := gh.UpdateIssue("owner", "repo", 42, "body")
+		if err == nil {
+			t.Fatal("UpdateIssue succeeded on 404, want error")
+		}
+		if !strings.Contains(err.Error(), "404") {
+			t.Errorf("error = %v, want it to mention 404", err)
+		}
+	})
+}
+
+func TestFileOrDryRunOverwrite(t *testing.T) {
+	upstream := &IssueRef{
+		Owner:  "agent-fox-dev",
+		Repo:   "coder",
+		Number: 42,
+	}
+	issue := goodIssue()
+
+	t.Run("AC-1: live run with overwrite and upstream issue calls UpdateIssue", func(t *testing.T) {
+		mock := &mockIssueCreator{retURL: "https://github.com/agent-fox-dev/coder/issues/42"}
+		var stderr strings.Builder
+		err := fileOrDryRun(&stderr, mock, false, true, upstream, "agent-fox-dev", "coder", issue, "new body", []string{"af:fix"})
+		if err != nil {
+			t.Fatalf("fileOrDryRun: %v", err)
+		}
+		if !mock.updateCalled {
+			t.Fatal("gh.UpdateIssue was not called")
+		}
+		if mock.called {
+			t.Fatal("gh.CreateIssue was called unexpectedly")
+		}
+		if mock.owner != "agent-fox-dev" || mock.repo != "coder" || mock.updateNumber != 42 || mock.body != "new body" {
+			t.Errorf("unexpected UpdateIssue args: owner=%s, repo=%s, number=%d, body=%s",
+				mock.owner, mock.repo, mock.updateNumber, mock.body)
+		}
+		if !strings.Contains(stderr.String(), "[issued] updated: https://github.com/agent-fox-dev/coder/issues/42") {
+			t.Errorf("stderr missing updated url: %s", stderr.String())
+		}
+	})
+
+	t.Run("AC-2: live run without overwrite creates new issue linking back", func(t *testing.T) {
+		mock := &mockIssueCreator{retURL: "https://github.com/agent-fox-dev/coder/issues/100"}
+		var stderr strings.Builder
+		err := fileOrDryRun(&stderr, mock, false, false, upstream, "agent-fox-dev", "coder", issue, "issue body", []string{"af:fix"})
+		if err != nil {
+			t.Fatalf("fileOrDryRun: %v", err)
+		}
+		if !mock.called {
+			t.Fatal("gh.CreateIssue was not called")
+		}
+		if mock.updateCalled {
+			t.Fatal("gh.UpdateIssue was called unexpectedly")
+		}
+		if mock.owner != "agent-fox-dev" || mock.repo != "coder" || mock.title != issue.Title {
+			t.Errorf("unexpected CreateIssue args: owner=%s, repo=%s, title=%s", mock.owner, mock.repo, mock.title)
+		}
+		if !strings.Contains(stderr.String(), "[issued] filed: https://github.com/agent-fox-dev/coder/issues/100") {
+			t.Errorf("stderr missing filed url: %s", stderr.String())
+		}
+	})
+
+	t.Run("AC-3: live run with overwrite on file/text input (upstream nil) creates new issue", func(t *testing.T) {
+		mock := &mockIssueCreator{retURL: "https://github.com/agent-fox-dev/coder/issues/101"}
+		var stderr strings.Builder
+		err := fileOrDryRun(&stderr, mock, false, true, nil, "agent-fox-dev", "coder", issue, "issue body", []string{"af:fix"})
+		if err != nil {
+			t.Fatalf("fileOrDryRun: %v", err)
+		}
+		if !mock.called {
+			t.Fatal("gh.CreateIssue was not called")
+		}
+		if mock.updateCalled {
+			t.Fatal("gh.UpdateIssue was called unexpectedly")
+		}
+		if !strings.Contains(stderr.String(), "[issued] filed: https://github.com/agent-fox-dev/coder/issues/101") {
+			t.Errorf("stderr missing filed url: %s", stderr.String())
+		}
+	})
+
+	t.Run("dry run with overwrite does not update or create issue", func(t *testing.T) {
+		mock := &mockIssueCreator{}
+		var stderr strings.Builder
+		err := fileOrDryRun(&stderr, mock, true, true, upstream, "agent-fox-dev", "coder", issue, "issue body", []string{"af:fix"})
+		if err != nil {
+			t.Fatalf("fileOrDryRun: %v", err)
+		}
+		if mock.called || mock.updateCalled {
+			t.Fatal("gh client was called during dry run")
+		}
+		want := "[issued] dry run. Re-run without --dry-run to file it.\n"
+		if stderr.String() != want {
+			t.Errorf("stderr = %q, want %q", stderr.String(), want)
+		}
+	})
+}
+
+func TestUpstreamPreambleOmissionOnOverwrite(t *testing.T) {
+	issue := goodIssue()
+	upstream := &IssueRef{Owner: "agent-fox-dev", Repo: "coder", Number: 42}
+	report := Report{Kind: SourceIssue, Origin: upstream.URL(), Upstream: upstream}
+
+	renderBody := func(overwrite bool) string {
+		body := issue.Render(report.Kind, report.Origin)
+		if report.Upstream != nil && !overwrite {
+			body = fmt.Sprintf("Triaged from %s.\n\n%s", report.Upstream.URL(), body)
+		}
+		return body
+	}
+
+	bodyWithoutOverwrite := renderBody(false)
+	if !strings.HasPrefix(bodyWithoutOverwrite, "Triaged from https://github.com/agent-fox-dev/coder/issues/42.\n\n") {
+		t.Errorf("expected preamble without overwrite, got: %s", bodyWithoutOverwrite[:60])
+	}
+
+	bodyWithOverwrite := renderBody(true)
+	if strings.HasPrefix(bodyWithOverwrite, "Triaged from") {
+		t.Errorf("preamble should be omitted with overwrite, got: %s", bodyWithOverwrite[:60])
+	}
+	if !strings.HasPrefix(bodyWithOverwrite, "## Problem\n") {
+		t.Errorf("expected body to start with Problem section when preamble omitted, got: %s", bodyWithOverwrite[:60])
+	}
 }
 
 // --------------------------------------------------------------------- 8 --

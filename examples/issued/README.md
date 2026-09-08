@@ -8,6 +8,7 @@ structured, evidence-cited GitHub issue.
 go run ./examples/issued "panic: assignment to entry in nil map in loop.go, after an abort"
 go run ./examples/issued ./crash.log --dir ./service
 go run ./examples/issued https://github.com/owner/repo/issues/42 --label af:fix
+go run ./examples/issued https://github.com/owner/repo/issues/42 --overwrite
 go run ./examples/issued ./crash.log --dir ./service --dry-run
 kubectl logs deploy/api --since 1h | go run ./examples/issued -
 ```
@@ -202,6 +203,7 @@ go run ./examples/issued "<report>" [flags]
 | `--dir` | Workspace root. The analysis cannot read outside it. Default `.` |
 | `--repo owner/repo` | Target repository. Defaults to the issue the report came from, else the `origin` remote of `--dir`. |
 | `--dry-run` | Make no changes to GitHub; only print the rendered issue. |
+| `--overwrite` | Overwrite the input GitHub issue body in place instead of creating a new issue. |
 | `--label a,b` | Labels for the created issue, e.g. `af:fix`. |
 | `--out FILE` | Also write the rendered issue to a file. |
 | `--debug` | Stream the model's reasoning text to stderr. |
@@ -266,8 +268,10 @@ three files in it. Every claim this README makes is a test:
 | `TestRenderProducesEverySectionAndIsStable` | The document is complete and deterministic. |
 | `TestResolveInputClassifiesEverySource`, `TestParseIssueURL`, `TestParseRemote`, `TestAnOversizedReportIsTruncatedVisibly` | The dull decisions, decided in Go. |
 | `TestFlagParsingRejectsCreateAndAcceptsDryRun` | Flags accept `--dry-run` and reject `--create`. |
+| `TestFlagParsingOverwrite` | Flags parse `--overwrite`. |
 | `TestTargetRepoValidationHaltsWithoutDryRun` | Missing repository halts before analysis unless `--dry-run` is passed. |
 | `TestDryRunGating` | Gating prevents issue creation in dry-run mode and allows it by default. |
+| `TestGitHubUpdateIssue`, `TestFileOrDryRunOverwrite` | In-place issue body overwrite via GitHub PATCH API. |
 | `TestFormatTokenTiming` | Token timing format renders duration and token counts correctly. |
 | `TestFlagParsingDebugAndVerbose` | Flags parse `--debug` and `--verbose`. |
 | `TestAC1DebugStreamsReasoningDeltas` | `--debug` streams reasoning text deltas, suppressed otherwise. |
