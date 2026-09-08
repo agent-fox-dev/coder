@@ -160,7 +160,10 @@ func TestRepairEditArgsHandlesTheThreeObservedShapes(t *testing.T) {
 // ------------------------------------------------------------------ path guard
 
 func TestNormalizationRunsBeforeCanonicalization(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	ws, err := NewWorkspace(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -623,7 +626,10 @@ func TestConcurrentEditsToOneFileSerialize(t *testing.T) {
 // resolution error propagates rather than being swallowed". Only not-exist
 // may fall back to the absolute path.
 func TestLockKeyPropagatesResolutionErrors(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if k, err := lockKey(filepath.Join(dir, "not-yet.txt")); err != nil || k != filepath.Join(dir, "not-yet.txt") {
 		t.Fatalf("a not-yet-created file must key on its absolute path: %q, %v", k, err)
 	}

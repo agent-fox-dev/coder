@@ -126,22 +126,42 @@ nested module that the cross-target gate does not build.`, importPath, modPath, 
 }
 
 // TestCgoProbeIsArmed guards the guard. If CGO_ENABLED did not reach the child
-// process, TestNoCgoOutsideStdlib would silently pass on a cgo dependency. The
-// standard library always has at least one cgo-carrying package reachable
-// under CGO_ENABLED=1, so observing zero of them means the probe is dark.
+// process, TestNoCgoOutsideStdlib would silently pass on a cgo dependency.
+//
+// Earlier versions checked that at least one cgo-carrying stdlib package
+// appeared in the project's own dep graph. Go 1.27 removed cgo from `net` and
+// other packages this project reaches, so the probe now verifies the mechanism
+// directly: CGO_ENABLED=1 must reach the child, and a known cgo-carrying
+// stdlib package (runtime/cgo) must report cgo files under that setting.
 func TestCgoProbeIsArmed(t *testing.T) {
-	var withCgo int
-	for _, line := range goListDeps(t) {
-		f := strings.Split(line, "|")
-		if len(f) == 3 && f[2] != "0" {
-			withCgo++
-		}
-	}
-	if withCgo == 0 {
-		t.Fatal(`the cgo probe is dark: no package in the build graph reports cgo files.
+	root := repoRoot(t)
 
-Either CGO_ENABLED=1 is not reaching the child process, or the build graph no
-longer reaches a cgo-carrying stdlib package. Until this passes,
-TestNoCgoOutsideStdlib proves nothing.`)
+	envCmd := exec.Command("go", "env", "CGO_ENABLED")
+	envCmd.Dir = root
+	envCmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+	out, err := envCmd.Output()
+	if err != nil {
+		t.Fatalf("go env CGO_ENABLED: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != "1" {
+		t.Fatal("CGO_ENABLED=1 is not reaching the child process")
+	}
+
+	listCmd := exec.Command("go", "list", "-f", "{{len .CgoFiles}}", "runtime/cgo")
+	listCmd.Dir = root
+	listCmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+	out, err = listCmd.Output()
+	if err != nil {
+		var stderr string
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = string(ee.Stderr)
+		}
+		t.Fatalf("go list runtime/cgo: %v\n%s", err, stderr)
+	}
+	if strings.TrimSpace(string(out)) == "0" {
+		t.Fatal(`runtime/cgo reports zero CgoFiles under CGO_ENABLED=1.
+
+The toolchain is not honoring CGO_ENABLED=1, so TestNoCgoOutsideStdlib
+cannot detect cgo dependencies.`)
 	}
 }
