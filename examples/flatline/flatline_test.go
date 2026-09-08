@@ -187,7 +187,7 @@ func gitOut(t *testing.T, dir string, args ...string) string {
 
 func readTasks(t *testing.T, root string) *afspec.TasksV1Json {
 	t.Helper()
-	spec, err := afspec.LoadSpec(filepath.Join(root, ".specs", fixtureSpec))
+	spec, _, err := loadSpecTolerant(filepath.Join(root, ".specs", fixtureSpec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,6 +319,76 @@ func TestLoadPackRefusesDependenciesAndSealedSpecs(t *testing.T) {
 	write(t, prdPath, strings.Replace(string(p), `status: "draft"`, `status: "sealed"`, 1))
 	if _, _, err := LoadPack(root, specDir); err == nil || !strings.Contains(err.Error(), "sealed") {
 		t.Errorf("a sealed pack must be refused, got %v", err)
+	}
+}
+
+func TestLoadPackToleratesAMissingSchemaKey(t *testing.T) {
+	root := newRepo(t)
+	specDir := filepath.Join(root, ".specs", fixtureSpec)
+	strip := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(specDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(b, &top); err != nil {
+			t.Fatal(err)
+		}
+		delete(top, "$schema")
+		out, _ := json.MarshalIndent(top, "", "  ")
+		write(t, filepath.Join(specDir, name), string(out)+"\n")
+		return string(out)
+	}
+	// The Python library omits "$schema" from requirements.json and tasks.json
+	// by default; the Go decoder alone refuses such a pack.
+	strip("requirements.json")
+	strip("tasks.json")
+	if _, err := afspec.LoadSpec(specDir); err == nil || !strings.Contains(err.Error(), "$schema") {
+		t.Fatalf("precondition: the library should refuse the stripped pack, got %v", err)
+	}
+
+	pack, _, err := LoadPack(root, specDir)
+	if err != nil {
+		t.Fatalf("LoadPack must tolerate a missing $schema: %v", err)
+	}
+	if pack.Spec.Dir != specDir || pack.Dir != specDir {
+		t.Errorf("Dir = %q / %q, want %q", pack.Spec.Dir, pack.Dir, specDir)
+	}
+	if !pack.Spec.Validate().Valid {
+		t.Error("the loaded pack must validate")
+	}
+	// The files on disk were not touched by loading.
+	if dirty := gitOut(t, root, "status", "--porcelain"); !strings.Contains(dirty, "requirements.json") || strings.Contains(dirty, "prd.md") {
+		t.Errorf("unexpected working tree state:\n%s", dirty)
+	}
+	gitOut(t, root, "add", "-A")
+	gitOut(t, root, "commit", "-qm", "strip schema keys")
+	if dirty := gitOut(t, root, "status", "--porcelain"); dirty != "" {
+		t.Errorf("loading must not modify the pack:\n%s", dirty)
+	}
+
+	// A write-back keeps the file's shape: no "$schema" appears.
+	if err := pack.MarkGroupDone(1); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(specDir, "tasks.json"))
+	if strings.Contains(string(raw), "$schema") {
+		t.Errorf("tasks.json gained a $schema key it did not have:\n%s", firstLine(string(raw), 80))
+	}
+	if s := subtaskState(readTasks(t, root), "1.1"); s != afspec.SubtaskStateDone {
+		t.Errorf("1.1 = %s", s)
+	}
+
+	// And a pack that declares it keeps it.
+	root2 := newRepo(t)
+	pack2 := loadPack(t, root2)
+	if err := pack2.MarkGroupDone(1); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(filepath.Join(pack2.Dir, "tasks.json"))
+	if !strings.HasPrefix(string(raw), "{\n  \"$schema\"") {
+		t.Errorf("tasks.json lost its $schema key:\n%s", firstLine(string(raw), 80))
 	}
 }
 
