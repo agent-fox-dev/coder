@@ -11,7 +11,7 @@ test: ## Run all Go tests (root module + difftest submodule)
 
 .PHONY: build-examples
 build-examples: ## Install examples/issued and examples/cleaner into ./bin
-	o install ./examples/issued
+	go install ./examples/issued
 	go install ./examples/cleaner
 
 .PHONY: fmt
