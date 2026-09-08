@@ -140,7 +140,7 @@ func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose bool) (*Triag
 	cfg.ToolPolicy = readOnlyPolicy()
 	// BeforeToolCall is intentionally nil. See assertReadOnly.
 	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(50),   // a wandering read loop
+		agentkit.StopAfterTurns(100),  // a wandering read loop
 		agentkit.StopOverBudget(2.00), // dollars, cumulative for the run
 	)
 
