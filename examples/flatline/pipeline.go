@@ -42,11 +42,16 @@ func ParseLanding(s string) (Landing, error) {
 // constructs this with a scripted brain and a temporary repository and runs
 // the real Run below.
 type Options struct {
-	Pack         *Pack
-	Git          *Git
-	Brain        Brain
-	Run          Runner
-	Landing      Landing
+	Pack    *Pack
+	Git     *Git
+	Brain   Brain
+	Run     Runner
+	Landing Landing
+	// FinalBranch is the name to give the branch carrying the finished work
+	// once every task group has landed. Empty leaves the run's branches as
+	// they are. It is only meaningful with LandBranch: LandMerge puts every
+	// group on the base branch, which already has a name.
+	FinalBranch  string
 	Push         bool
 	PushAttempts int
 	MaxRetries   int           // agent-fox orchestrator.max_retries: 2 → three attempts
@@ -181,7 +186,14 @@ func (r *runner) run(ctx context.Context) error {
 		head = next
 	}
 
-	// 3. The final check — agent-fox's post-merge `make check`, here the
+	// 3. Name the finished work. With --land=branch the run leaves one branch
+	//    per task group and the operator would otherwise have to work out
+	//    which of them is the last — so it is named after the spec and
+	//    checked out. This happens BEFORE the final check, so the branch
+	//    exists whether or not the checks come back green.
+	r.nameFinalBranch(ctx, head)
+
+	// 4. The final check — agent-fox's post-merge `make check`, here the
 	//    pack's own three commands. It decides completed vs completed-dirty.
 	if err := r.step(ctx, "final-check", func() (string, error) {
 		r.res.Final = RunChecks(ctx, o.Run, pack.Root, checks, o.CheckTimeout)
@@ -196,7 +208,7 @@ func (r *runner) run(ctx context.Context) error {
 		return err
 	}
 
-	// 4. The verifier. Informational in agent-fox and informational here: it
+	// 5. The verifier. Informational in agent-fox and informational here: it
 	//    runs after everything landed, and its verdicts are printed and
 	//    journaled, never acted on.
 	if o.RunVerifier {
@@ -229,6 +241,61 @@ func (r *runner) run(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// nameFinalBranch points Options.FinalBranch at tip and checks it out.
+//
+// It never fails the run. By the time it is called every task group has
+// landed and been committed; a branch that cannot be named is a labelling
+// problem, and reporting the whole run as failed over one would misdescribe
+// what happened to the work. Each refusal says where the work actually is.
+func (r *runner) nameFinalBranch(ctx context.Context, tip string) {
+	o := r.o
+	if o.FinalBranch == "" {
+		return
+	}
+	_ = r.step(ctx, "final-branch", func() (string, error) {
+		switch {
+		case o.Landing != LandBranch:
+			// Every group was squash-merged as it passed, so the finished
+			// work is the base branch and already has the name it will keep.
+			return "not needed: every task group landed on " + r.res.Base, nil
+		case tip == r.res.Base:
+			return "nothing to name: no task group produced a commit", nil
+		case o.FinalBranch == r.res.Base:
+			r.warn("the final branch may not be the base branch (" + r.res.Base + "): " +
+				"moving it is what --land=branch exists to avoid. The finished work is on " + tip)
+			return "not created", nil
+		}
+		// An existing branch of that name is only moved when the move loses
+		// nothing — a previous run's work is not something to relabel away.
+		if o.Git.LocalBranchExists(ctx, o.FinalBranch) && !o.Git.IsAncestor(ctx, o.FinalBranch, tip) {
+			r.warn(fmt.Sprintf("%s already exists and its commits are not in this run's work, so it is left "+
+				"alone. This run's work is on %s: merge that, or re-run with --final-branch=<other name>.",
+				o.FinalBranch, tip))
+			return "not moved", nil
+		}
+		if err := o.Git.PointBranchAt(ctx, o.FinalBranch, tip); err != nil {
+			r.warn("could not name the finished work " + o.FinalBranch + ": " + err.Error() +
+				". It is on " + tip)
+			return "not created", nil
+		}
+		r.res.FinalBranch = o.FinalBranch
+		detail := o.FinalBranch + " at " + tip
+		if err := o.Git.Checkout(ctx, o.FinalBranch); err != nil {
+			// The branch is the deliverable and it exists; being left on the
+			// group branch instead is cosmetic.
+			r.warn("could not check out " + o.FinalBranch + ": " + err.Error())
+		}
+		if o.Push {
+			if err := o.Git.Push(ctx, o.FinalBranch, o.PushAttempts, r.warn); err != nil {
+				r.warn("could not push " + o.FinalBranch + ": " + err.Error())
+			} else {
+				detail += ", pushed"
+			}
+		}
+		return detail, nil
+	})
 }
 
 // runGroup drives one task group to completed, skipped or blocked, and

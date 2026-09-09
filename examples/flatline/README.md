@@ -44,6 +44,7 @@ is not the thing that did the work.**
    linter red? → fresh branch, retry with the error in the prompt (≤ 3 attempts)
    commit · mark subtasks done in tasks.json · commit that
    squash-merge into the base branch (or keep the branch)
+ name the finished work after the spec (--land=branch)
  final check: all three commands                        ───────►  verifier session (read-only)
  summary · JSONL journal                               ◄───────  submit_verdicts{PASS/FAIL per requirement}
 ```
@@ -100,7 +101,15 @@ Each of these is a choice, not an omission.
    default) each group's branch is squash-merged into the base branch as soon
    as it passes and the next group branches from there; with `--land=branch`
    the branches are kept and each is created from the previous one's tip, so
-   the chain still builds on itself.
+   the chain still builds on itself. In that mode the finished work is also
+   given a branch named after the spec —
+   `feature/{spec_id}_{spec_name}`, the spec's own directory name — and the
+   run ends checked out on it, so the branch to merge into the default branch
+   is not something to work out by counting task groups. It is
+   **not** `feature/{spec_name}`: git keeps branches as files under
+   `refs/heads`, so that name and `feature/{spec_name}/2` cannot coexist.
+   An existing branch of that name is only moved when the move loses nothing;
+   otherwise the run says where the work is and leaves it alone.
 4. **No knowledge store.** agent-fox's `## Memory Facts` come from DuckDB:
    prior session summaries, reviewer findings, drift reports. flatline's come
    from this run: the `summary`, `gotchas`, `assumptions` and
@@ -163,8 +172,9 @@ unless `--assume-deps` is given.
 |---|---|---|
 | `--dir` | `.` | The repository to work in. The file tools cannot reach outside it. |
 | `--specs-dir` | `<dir>/.specs` | Where the `NN_name` directories live. |
-| `--land` | `merge` | `merge`: squash each passing group into the current branch. `branch`: keep `feature/{spec}/{N}`, chained. |
-| `--push` | off | Push the base branch after each merge, with retries. Nothing is pushed otherwise. |
+| `--land` | `merge` | `merge`: squash each passing group into the current branch. `branch`: keep `feature/{spec}/{N}`, chained, and name the result after the spec. |
+| `--final-branch` | `feature/{spec_id}_{spec_name}` | With `--land=branch`, the branch the finished work ends up on and is checked out at. Ignored by `--land=merge`, where the base branch already carries everything. |
+| `--push` | off | Push what the run lands: the base branch after each merge, or the final branch when the groups are kept. With retries. Nothing is pushed otherwise. |
 | `--model` | `$AGENTKIT_MODEL`, else `anthropic/claude-sonnet-5` | Any model in the catalog. |
 | `--max-turns` | `300` | Per-session turn ceiling (agent-fox's coder default). |
 | `--budget` | `20.00` | Per-session spend ceiling, in dollars (`max_budget_usd`). |
@@ -224,7 +234,13 @@ seven scripted turns.
   last attempt is on `stalled/…`, the subtasks are still `pending`.
 - `TestPipelineSkipsACompletedGroup` / `TestPipelineLaunchesADoneGroupWhoseTestsFail`
   — the preflight's two outcomes.
-- `TestPipelineStopsAtTheCostCeiling`, `TestPipelineKeepsBranchesWhenAsked`,
+- `TestPipelineKeepsBranchesWhenAsked` — the chain builds on itself, the work
+  is named `feature/01_widget_counter` and checked out, and the summary says
+  which branch to merge.
+- `TestFinalBranchLeavesAnUnrelatedBranchAlone` / `TestFinalBranchRefusesTheBaseBranch`
+  — naming the work never relabels an earlier run's branch and never moves the
+  base branch; the run completes and says where the work is.
+- `TestPipelineStopsAtTheCostCeiling`,
   `TestGateFailureIsRetriedAndVerifierIsInformational`,
   `TestPipelineRefusesADirtyTree`, `TestLoadPackRefusesDependenciesAndSealedSpecs`.
 - `TestMarkGroupDoneWalksTheStateMachine` — dropped subtasks stay dropped;

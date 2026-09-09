@@ -135,6 +135,9 @@ func Summary(w io.Writer, res *Result, err error, verbose bool) {
 			fmt.Fprintf(w, "  %-4d %-8s %-12s %-8s %s\n", g.ID, g.Archetype, g.Status, tries, where)
 		}
 	}
+	if res.FinalBranch != "" {
+		fmt.Fprintf(w, "  merge:    %s\n", res.FinalBranch)
+	}
 	for _, c := range res.Final {
 		if !c.Skipped {
 			fmt.Fprintf(w, "  final %-10s %s\n", c.Name+":", c.Status())

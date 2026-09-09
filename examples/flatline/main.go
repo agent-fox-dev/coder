@@ -11,8 +11,11 @@
 // commands, commits, marks the group's subtasks done in tasks.json, and
 // squash-merges the branch into the branch it started from. A group whose
 // gates fail is retried with the error in the prompt; one that exhausts its
-// retries stops the pass and keeps its branch under stalled/. After the last
-// group the three test commands run once more (agent-fox's post-merge
+// retries stops the pass and keeps its branch under stalled/. With
+// --land=branch the group branches are kept instead, and the finished work
+// ends up on one named after the spec — feature/{spec_id}_{spec_name} — so
+// the branch to merge is not something to work out by counting. After the
+// last group the three test commands run once more (agent-fox's post-merge
 // `make check`) and an informational verifier session records PASS/FAIL
 // verdicts per requirement.
 //
@@ -62,7 +65,8 @@ func run() int {
 	dir := flag.String("dir", ".", "the repository to work in; the agent's file tools cannot reach outside it")
 	specsDir := flag.String("specs-dir", "", "where NN_name spec directories live (default: <dir>/.specs)")
 	land := flag.String("land", "merge", "what to do with each task group's branch once it passes: merge (squash into the current branch) or branch (keep it)")
-	push := flag.Bool("push", false, "push the base branch after each merge (agent-fox pushes when a remote exists)")
+	push := flag.Bool("push", false, "push what the run lands: the base branch after each merge, or the final branch when the groups are kept")
+	finalBranch := flag.String("final-branch", "", "name for the branch carrying the finished work with --land=branch (default: feature/{spec_id}_{spec_name})")
 	modelSpec := flag.String("model", "", "model spec, e.g. anthropic/claude-sonnet-5 (default $AGENTKIT_MODEL)")
 	maxTurns := flag.Int("max-turns", 300, "per-session turn ceiling (agent-fox coder default)")
 	budget := flag.Float64("budget", 20.0, "per-session spend ceiling in dollars (agent-fox max_budget_usd)")
@@ -151,9 +155,14 @@ func run() int {
 		verbose:       *verbose,
 	}
 
+	final := strings.TrimSpace(*finalBranch)
+	if final == "" {
+		final = FinalBranchName(pack.Spec.SpecID, pack.Spec.SpecName)
+	}
+
 	opts := Options{
 		Pack: pack, Git: NewGit(ws.Root, execRunner), Brain: brain, Run: execRunner,
-		Landing: landing, Push: *push, PushAttempts: *pushAttempts,
+		Landing: landing, FinalBranch: final, Push: *push, PushAttempts: *pushAttempts,
 		MaxRetries: *maxRetries, MaxCostUSD: *maxCost, CheckTimeout: *checkTimeout,
 		RunVerifier: !*noVerifier, Out: os.Stderr, JournalPath: *journal, Verbose: *verbose,
 	}
@@ -188,6 +197,9 @@ func banner(o Options, modelID string) {
 	tc := o.Pack.Spec.Tasks.TestCommands
 	fmt.Fprintf(os.Stderr, "  checks: linter=%q spec_tests=%q all_tests=%q\n", tc.Linter, tc.SpecTests, tc.AllTests)
 	fmt.Fprintf(os.Stderr, "  land:   %s\n", o.Landing)
+	if o.Landing == LandBranch {
+		fmt.Fprintf(os.Stderr, "  final:  %s\n", o.FinalBranch)
+	}
 }
 
 func usage() {
