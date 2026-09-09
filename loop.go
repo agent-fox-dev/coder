@@ -14,6 +14,11 @@ import (
 // (ruling P-43): the PRD renders it across two lines inside a fenced block,
 // and "inherit whatever the implementer typed" is not a specification for text
 // the model reads.
+// DefaultMaxTokens is the output bound sent when AgentConfig.MaxTokens is nil.
+// It is still clamped to the model's cap and the remaining window by
+// REQ-CAT-04; a caller who wants the model's full cap says so explicitly.
+const DefaultMaxTokens = 32768
+
 const maxTokensToolText = "Tool call %q was not executed: the response hit the output token limit,\n" +
 	"so its arguments may be truncated. Re-issue the tool call with complete arguments."
 
@@ -471,7 +476,7 @@ outer:
 			// accepts on resume.
 			if stop, reason := a.consultStopPolicy(assistant, results, newMessages, turnCount, startedAt); stop {
 				runReason = reason
-				if a.cfg.ErrorOnLimit {
+				if startCfg.ErrorOnLimit {
 					switch reason {
 					case core.RunStopMaxTurns:
 						runErr = core.ErrMaxTurns
@@ -536,11 +541,23 @@ func (a *Agent) callModel(ctx context.Context, out *core.EventStream, view core.
 	tools := ResolveToolPolicy(a.tools, cfg.ToolPolicy)
 	a.mu.Unlock()
 
+	// REQ-CAT-04 clamps a stated bound to the model; an UNSTATED bound must
+	// not become the model's whole output cap. Providers size rate-limit
+	// reservations from max_tokens at request start, so a 128K default costs
+	// 128K of output-per-minute budget per turn — a 429 on the first
+	// concurrent delegation on most tiers — and removes the only bound on a
+	// runaway turn. DefaultMaxTokens is generous for tool-call-shaped output
+	// and still an order of magnitude below current caps.
+	maxTokens := cfg.MaxTokens
+	if maxTokens == nil {
+		v := DefaultMaxTokens
+		maxTokens = &v
+	}
 	req := core.Request{
 		Messages:         view,
 		Tools:            core.ToolWires(tools),
 		ToolChoice:       cfg.ToolChoice,
-		MaxTokens:        cfg.MaxTokens,
+		MaxTokens:        maxTokens,
 		Temperature:      cfg.Temperature,
 		TopP:             cfg.TopP,
 		ThinkingLevel:    cfg.ThinkingLevel,

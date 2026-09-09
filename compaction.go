@@ -228,9 +228,19 @@ func modelSummarizer(p core.ProviderClient, m *core.Model, reserveTokens int, tu
 				"than restating it:\n<previous-summary>\n" + previous + "\n</previous-summary>"
 		}
 		maxTokens := summaryMaxTokens(m, reserveTokens)
+		// An extension's delta can begin on an assistant message (the previous
+		// checkpoint's cut was CutNotToolResult, not CutUserOnly), and every
+		// wire requires the first message to be the user's. The summary the
+		// delta continues from is already in the system prompt, so a one-line
+		// user turn pointing at it is enough to make the request valid.
+		msgs := prefix
+		if len(msgs) > 0 && msgs[0].Role() != core.RoleUser {
+			msgs = append(core.Messages{core.UserMessage{Content: core.Content{
+				core.TextBlock{Text: summaryContinuationNote}}}}, msgs...)
+		}
 		req := core.Request{
 			System:   []core.ContentBlock{core.TextBlock{Text: system}},
-			Messages: prefix,
+			Messages: msgs,
 			// An empty tool list plus an explicit "none" is what makes a
 			// tool-free turn reliably forceable (REQ-TOOL-16).
 			ToolChoice: core.ToolChoiceNone,
@@ -246,8 +256,15 @@ func modelSummarizer(p core.ProviderClient, m *core.Model, reserveTokens int, tu
 	}
 }
 
+// summaryContinuationNote is the user turn prepended to an extension delta
+// that begins mid-turn (see modelSummarizer). Model-visible, fixed.
+const summaryContinuationNote = "[The earlier conversation is summarized in the system prompt; the messages that follow continue it.]"
+
 // summaryMaxTokens is REQ-GO-12.3's clamp: min(0.8 × reserve, model.MaxTokens),
-// with each unknown side deferring to the other and a floor of 1.
+// with each unknown side deferring to the other and a floor of 1. With no
+// reserve stated the model's ceiling is further bounded by DefaultMaxTokens: a
+// summary does not need a 128K output budget, and providers size rate-limit
+// reservations from max_tokens.
 func summaryMaxTokens(m *core.Model, reserve int) int {
 	n := 0
 	if reserve > 0 {
@@ -255,6 +272,9 @@ func summaryMaxTokens(m *core.Model, reserve int) int {
 	}
 	if m != nil && m.MaxTokens > 0 && (n <= 0 || n > m.MaxTokens) {
 		n = m.MaxTokens
+	}
+	if reserve <= 0 && n > DefaultMaxTokens {
+		n = DefaultMaxTokens
 	}
 	if n <= 0 {
 		n = 1
@@ -379,7 +399,27 @@ func NewContextTransform(d CompactionDeps) core.ContextTransform {
 			return msgs[cut:]
 		}
 
-		summary, err := summarizeWithSplit(ctx, d, msgs, cut, cp.Summary)
+		// Extending means summarizing what the previous checkpoint did NOT
+		// cover — msgs[cp.PrefixLen:cut] — with the previous summary handed
+		// to the summarizer to build on. Re-summarizing from index 0 re-sent
+		// the whole original prefix on every extension: O(total history)
+		// tokens each time, and once the history outgrew the context window
+		// the summarization request itself failed, every turn, while the
+		// view stayed over the threshold.
+		//
+		// The cut is chosen by a character heuristic and the threshold by a
+		// provider-reported anchor, so the two can disagree; a cut that lands
+		// at or before the existing checkpoint has nothing to extend and must
+		// not shrink the checkpoint (compaction is permanent, REQ-GO-12.2).
+		from := 0
+		if hasCP && cp.Summary != "" {
+			from = cp.PrefixLen
+		}
+		if cut <= from {
+			return view
+		}
+
+		summary, err := summarizeWithSplit(ctx, d, msgs, from, cut, cp.Summary)
 		if err != nil {
 			// REQ-GO-16 governs the CHECKPOINT: never persist a bad summary.
 			// NFR-REL-05 governs the VIEW: never abort the session. Both hold
@@ -423,22 +463,26 @@ func NewContextTransform(d CompactionDeps) core.ContextTransform {
 // previous summary" over half a turn. So the split applies when a
 // TurnSummarizer is installed (ModelTurnSummarizer is the shipped one), and
 // a caller who wires only the main summarizer gets the single-block form.
-func summarizeWithSplit(ctx context.Context, d CompactionDeps, msgs core.Messages, cut int, previous string) (string, error) {
+//
+// from is the first message NOT covered by the previous checkpoint (0 when
+// there is none): only msgs[from:cut] is summarized, and the previous summary
+// stands in for everything before it.
+func summarizeWithSplit(ctx context.Context, d CompactionDeps, msgs core.Messages, from, cut int, previous string) (string, error) {
 	if _, onUser := msgs[cut].(core.UserMessage); onUser || d.TurnSummarizer == nil {
-		return d.Summarizer(ctx, msgs[:cut], previous)
+		return d.Summarizer(ctx, msgs[from:cut], previous)
 	}
 	turnStart := cut - 1
-	for turnStart > 0 {
+	for turnStart > from {
 		if _, ok := msgs[turnStart].(core.UserMessage); ok {
 			break
 		}
 		turnStart--
 	}
-	if turnStart <= 0 {
-		// The whole prefix is one turn; there is nothing to split it from.
-		return d.Summarizer(ctx, msgs[:cut], previous)
+	if turnStart <= from {
+		// The whole delta is one turn; there is nothing to split it from.
+		return d.Summarizer(ctx, msgs[from:cut], previous)
 	}
-	head, err := d.Summarizer(ctx, msgs[:turnStart], previous)
+	head, err := d.Summarizer(ctx, msgs[from:turnStart], previous)
 	if err != nil {
 		return "", err
 	}

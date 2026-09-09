@@ -103,6 +103,15 @@ func RetryMiddleware(opts RetryOptions) core.Middleware {
 					}
 				}
 				s := next(ctx, req)
+				if attempt == o.MaxAttempts-1 {
+					// The final attempt is returned as it streams. Waiting
+					// for its result here — as every attempt that might be
+					// retried must — would hold every event until the
+					// response completed, and with the default MaxAttempts
+					// of 1 that made installing this middleware switch off
+					// incremental streaming for the whole session.
+					return s
+				}
 				msg := s.Result()
 				last = s
 				if msg == nil || !Retryable(msg) {
@@ -131,6 +140,12 @@ var nonRetryable = []string{
 	"insufficient_quota", "quota exceeded", "billing", "out of budget",
 	"available balance", "monthly limit", "usage limit", "credit balance",
 	"payment required", "account is not active",
+	// The transport layer abandoned a request because the server asked for
+	// a delay past the ceiling (REQ-PROV-13). Retrying it here, on this
+	// layer's own backoff, would ignore the hour the server asked for — and
+	// the abandonment text used to carry the status code that the allowlist
+	// below matches.
+	"exceeds the ceiling",
 }
 
 // retryable is checked second.
@@ -262,18 +277,45 @@ func CachingMiddleware(opts CacheOptions) core.Middleware {
 			if n := noteFrom(ctx); n != nil {
 				n.Hit, n.Tier, n.Fingerprint = false, "dedup", fp
 			}
-			s := next(ctx, req)
 			// Store only a successful, complete response. Caching an error
 			// would replay a transient failure for the life of the session.
-			if msg := s.Result(); msg != nil && !msg.StopReason.ShortCircuits() {
-				c.put(fp, msg)
-				// Price it NOW, so a later hit credits the exact amount this
-				// response cost rather than an average over the session.
-				opts.Meter.price(fp, msg.Usage.CostUSD)
-			}
-			return s
+			//
+			// The store happens on the tee, after the provider's stream ends
+			// and BEFORE the returned stream ends, so a caller that has seen
+			// Result() can rely on the entry existing — without blocking the
+			// events on the way through.
+			return teeStream(next(ctx, req), func(msg *core.AssistantMessage) {
+				if msg != nil && !msg.StopReason.ShortCircuits() {
+					c.put(fp, msg)
+					// Price it NOW, so a later hit credits the exact amount
+					// this response cost rather than an average over the
+					// session.
+					opts.Meter.price(fp, msg.Usage.CostUSD)
+				}
+			})
 		}
 	}
+}
+
+// teeStream forwards every event of in onto a new stream as it arrives, and
+// runs onEnd with the terminal message after in ends and before the returned
+// stream ends. It is how a middleware observes a completed response without
+// holding the events back until completion: calling Result() on the inner
+// stream before returning it delays every event to the consumer — and with
+// the loop forwarding the provider stream onto the agent stream, that turned
+// incremental streaming off for the session whenever such a middleware was
+// installed.
+func teeStream(in *core.EventStream, onEnd func(*core.AssistantMessage)) *core.EventStream {
+	out := core.NewEventStream(core.StreamOptions{})
+	go func() {
+		for e := range in.Events() {
+			out.Push(e)
+		}
+		res := in.Wait()
+		onEnd(res.Message)
+		out.End(res)
+	}()
+	return out
 }
 
 // Fingerprint hashes the canonical request in a form that identifies the bytes
@@ -432,31 +474,35 @@ func TracingMiddleware(t Tracer) core.Middleware {
 		return func(ctx context.Context, req core.Request) *core.EventStream {
 			var out *core.EventStream
 			ctx, note := withCacheNote(ctx)
+			// The span opens before the call and closes when the response
+			// completes; the events are not held back for it (see
+			// teeStream). Tracer.StartSpan's callback shape is kept — the
+			// callback returns immediately and the span is ended on the tee.
 			_ = t.StartSpan("agentkit.model_call", func(sp Span) error {
-				defer sp.End()
-				out = next(ctx, req)
-				msg := out.Result()
-				attrs := map[string]any{
-					"tool_count":         len(req.Tools),
-					"est_context_tokens": req.EstContextTokens,
-				}
-				if msg != nil {
-					attrs["model"] = msg.Model
-					attrs["provider"] = msg.Provider
-					attrs["stop_reason"] = string(msg.StopReason)
-					attrs["input_tokens"] = msg.Usage.InputTokens
-					attrs["output_tokens"] = msg.Usage.OutputTokens
-					attrs["cost_usd"] = msg.Usage.CostUSD
-					if msg.StopReason == core.StopReasonError {
-						sp.SetStatus(errors.New(msg.ErrorMessage))
+				out = teeStream(next(ctx, req), func(msg *core.AssistantMessage) {
+					defer sp.End()
+					attrs := map[string]any{
+						"tool_count":         len(req.Tools),
+						"est_context_tokens": req.EstContextTokens,
 					}
-				}
-				if note.Fingerprint != "" {
-					attrs["cache.hit"] = note.Hit
-					attrs["cache.tier"] = note.Tier
-					attrs["cache.fingerprint"] = note.Fingerprint
-				}
-				sp.SetAttributes(attrs)
+					if msg != nil {
+						attrs["model"] = msg.Model
+						attrs["provider"] = msg.Provider
+						attrs["stop_reason"] = string(msg.StopReason)
+						attrs["input_tokens"] = msg.Usage.InputTokens
+						attrs["output_tokens"] = msg.Usage.OutputTokens
+						attrs["cost_usd"] = msg.Usage.CostUSD
+						if msg.StopReason == core.StopReasonError {
+							sp.SetStatus(errors.New(msg.ErrorMessage))
+						}
+					}
+					if note.Fingerprint != "" {
+						attrs["cache.hit"] = note.Hit
+						attrs["cache.tier"] = note.Tier
+						attrs["cache.fingerprint"] = note.Fingerprint
+					}
+					sp.SetAttributes(attrs)
+				})
 				return nil
 			})
 			return out
@@ -489,6 +535,10 @@ func RateLimitMiddleware(perSecond float64, burst int) core.Middleware {
 			if tokens < 1 {
 				wait = time.Duration((1 - tokens) / perSecond * float64(time.Second))
 				tokens = 0
+				// The wait spends the token that accrues during it, so the
+				// clock advances past the wait: crediting that interval again
+				// on the next call let two callers through at ~2x the rate.
+				last = now.Add(wait)
 			} else {
 				tokens--
 			}
