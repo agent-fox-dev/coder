@@ -130,7 +130,11 @@ transcript — on the turn an MCP server connects, which is when the transcript
 is longest. `SplitDeferredTools` is a single forward pass and later usage
 cannot un-defer a tool: a tool used on the turn *after* it appeared is the
 normal case, and un-deferring there promotes it exactly when promotion costs
-most.
+most. On the Anthropic wire the late tool is appended **visible and
+unstamped**, never with `defer_loading`: that flag belongs to the tool-search
+feature and a deferred tool is not shown to the model unless a tool-search
+server tool finds it, so "declared at its transcript position" was, on that
+wire, "hidden for the rest of the session" (ruling L-10).
 
 **Ignore rules are layered, and a nested repository is its own root**
 ([`tools/ignore.go`](tools/ignore.go)). A deeper `.gitignore` overrides a
@@ -378,7 +382,35 @@ unmap first.
 **Compaction applies its checkpoint before estimating.** The naive reading
 oscillates: the compacted request reports small usage → the threshold passes →
 full history returns → it fails again. Each swing invalidates the provider's
-cache prefix and re-sends content already paid to summarize.
+cache prefix and re-sends content already paid to summarize. **And extending
+a checkpoint summarizes only the delta** ([`compaction.go`](compaction.go)):
+the messages since the previous cut, with the previous summary handed to the
+summarizer to build on. Re-summarizing from message 0 on every extension is
+O(history) tokens each time and fails outright once the history has outgrown
+the window — which is exactly when the second extension is due
+([`docs/errata/compaction_extension.md`](docs/errata/compaction_extension.md)).
+
+**A tool result reaches the model as text, not as a JSON envelope**
+([`core/tool.go`](core/tool.go), `ToolResult.Text`). REQ-TOOL-08's envelope is
+the right Go type and the wrong wire shape: a source file inside a JSON string
+pays for every newline, tab and quote twice — 9–13% more bytes on Go code and
+an estimated 15–30% more tokens, on the results that dominate an agent's
+context — and the model then reads code through a layer of escaping it has to
+undo when it writes an edit. The built-in tools render their own text
+(`read_file` raw, `execute` raw with a status line only when it says
+something, `search_files` grep-style grouped by file); `Data` stays populated
+for interceptors, the audit trail and MCP bridging, and a custom tool that
+sets no `Text` gets the envelope byte for byte
+([`docs/errata/tool_result_rendering.md`](docs/errata/tool_result_rendering.md)).
+
+**`ThinkingLevel` on a current Claude model is `effort`, not a budget**
+([`provider/anthropic/stream.go`](provider/anthropic/stream.go)). The rows
+for Claude 4.6 and later speak in effort tokens, and the adapter sends
+`thinking: {type: "adaptive"}` plus `output_config.effort` for them;
+`budget_tokens` is a 400 on those models, so translating an effort into a
+budget — the previous behaviour — could only be omitted, which left every
+level inert. `off` consults the row first: Fable has no off switch, and
+sending `disabled` to it was a 400 on every request.
 
 **A non-unique `old_string` is a rejection, not a replace-all**
 ([`tools/edit.go`](tools/edit.go)). There is deliberately no `{replaced: N}`
@@ -715,9 +747,10 @@ requirement ledger, fixed and deferred alike, is [`docs/GAPS.md`](docs/GAPS.md).
 
 Three wire-level limits are consequences rather than omissions, and are
 recorded as rulings in [`docs/PROVIDERS.md`](docs/PROVIDERS.md) so they are not
-rediscovered as bugs: on `openai-completions` a deferred tool is re-declared in
-**prose** because that wire has neither `defer_loading` nor `additional_tools`,
-and a model may call a tool absent from `tools`; on Gemini a deferred tool is
+rediscovered as bugs: on both OpenAI wires a late-added tool is re-declared in
+**prose** because neither has a field for it (`additional_tools` does not
+exist on the Responses API), and a model may call a tool absent from `tools`;
+on Gemini a deferred tool is
 not callable at all, because that wire gates calling on `functionDeclarations`;
 and on Ollama `is_error` has nowhere to go and rides as an `Error: ` text
 prefix.
