@@ -31,6 +31,19 @@ import (
 // MaxDimension is REQ-TOOL-14.3's 2000×2000.
 const MaxDimension = 2000
 
+// MaxPixels and MaxSide bound what Normalize will DECODE at all.
+//
+// They are checked from the header alone, before any pixel is allocated. A
+// PNG whose IHDR claims 30000×30000 is a few hundred bytes on disk and 3.6 GB
+// once decoded; without a header check the normalizer is a decompression
+// bomb that any file the agent can read can trigger. MaxSide is the largest
+// side any mainstream encoder emits; MaxPixels (40 MP) is well past any
+// screenshot and still under 200 MB of RGBA.
+const (
+	MaxPixels = 40_000_000
+	MaxSide   = 16384
+)
+
 // MaxBase64Bytes is the 4.5 MB budget, measured on the BASE64 text rather than
 // the decoded bytes.
 //
@@ -63,6 +76,9 @@ var (
 	ErrNonIHDRPNG  = errors.New("imagex: malformed PNG: the first chunk is not IHDR")
 	ErrUnsupported = errors.New("imagex: unsupported image format")
 	ErrNotAnImage  = errors.New("imagex: not a recognised image")
+	// ErrTooLarge is a header that declares more pixels than MaxPixels or a
+	// side over MaxSide. It is returned BEFORE any decode.
+	ErrTooLarge = errors.New("imagex: image dimensions exceed the decode limit")
 )
 
 // MIME types this package recognises.
@@ -186,18 +202,34 @@ func validatePNG(data []byte) error {
 	return nil
 }
 
-// validateJPEG decodes to find the colour model.
+// validateJPEG reads the frame header to find the colour model.
 //
 // There is no header field that says "CMYK" without parsing the frame markers,
-// and Go's decoder already does that — it returns *image.CMYK. Decoding is the
-// cheap, correct check.
+// and Go's DecodeConfig already does that: a four-component frame reports
+// color.CMYKModel. It stops at the SOF marker, so the check costs a header
+// parse and not a full decode — the previous version decoded the whole image
+// to inspect its type, which made validation itself the decompression bomb
+// that Normalize's header check exists to prevent.
 func validateJPEG(data []byte) error {
-	img, err := jpeg.Decode(bytes.NewReader(data))
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("imagex: %w", err)
 	}
-	if _, isCMYK := img.(*image.CMYK); isCMYK {
+	if cfg.ColorModel == color.CMYKModel {
 		return ErrCMYKJPEG
+	}
+	return nil
+}
+
+// checkDimensions refuses a header that declares more than the decode limit.
+// It is the FIRST thing Normalize does, because everything after it — the
+// format validators included — may allocate in proportion to what the header
+// claims.
+func checkDimensions(cfg image.Config) error {
+	w, h := cfg.Width, cfg.Height
+	if w < 0 || h < 0 || w > MaxSide || h > MaxSide || int64(w)*int64(h) > MaxPixels {
+		return fmt.Errorf("%w: %dx%d (limit %d pixels, %d per side)",
+			ErrTooLarge, w, h, MaxPixels, MaxSide)
 	}
 	return nil
 }
@@ -228,14 +260,20 @@ func Normalize(data []byte, mime string) (Result, error) {
 			return Result{}, ErrNotAnImage
 		}
 	}
-	if err := Validate(data, mime); err != nil {
-		return Result{}, err
-	}
-
+	// Header first, before anything that could allocate for the pixels. The
+	// order is the safety property: Validate used to full-decode a JPEG, and
+	// decode() below allocates width×height×4 bytes whatever the file size.
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return Result{}, fmt.Errorf("imagex: %w", err)
 	}
+	if err := checkDimensions(cfg); err != nil {
+		return Result{}, err
+	}
+	if err := Validate(data, mime); err != nil {
+		return Result{}, err
+	}
+
 	if cfg.Width <= MaxDimension && cfg.Height <= MaxDimension && fitsBudget(len(data)) {
 		return Result{Data: data, MIMEType: mime, Width: cfg.Width, Height: cfg.Height}, nil
 	}

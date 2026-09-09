@@ -114,14 +114,16 @@ func isPlainASCII(s string) bool {
 }
 
 // FoldLine is the per-line match key: confusables folded, then TRAILING
-// whitespace trimmed.
+// whitespace trimmed. A trailing CR counts as whitespace: a needle copied
+// from a CRLF file that reached the tool with its CRs intact is the same
+// line, and this is the last place the difference can be forgiven.
 //
 // Trailing only. Leading whitespace is indentation and is semantic in Go,
 // Python, YAML and Makefiles alike; trimming it would let an edit match a line
 // at the wrong nesting level, which is precisely the kind of silent
 // mis-application REQ-TOOL-04c's uniqueness rule exists to prevent.
 func FoldLine(s string) string {
-	return strings.TrimRight(FoldConfusables(s), " \t")
+	return strings.TrimRight(FoldConfusables(s), " \t\r")
 }
 
 // foldLines is FoldLine over a split block.

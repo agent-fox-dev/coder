@@ -80,7 +80,7 @@ func PowerShell(opts Options) core.Tool {
 			if err != nil {
 				return core.ErrResult("exec_failed", err.Error())
 			}
-			return execResultToTool(res)
+			return execResultToTool(res, timeout)
 		},
 	}
 }

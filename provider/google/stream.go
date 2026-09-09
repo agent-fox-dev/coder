@@ -350,7 +350,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 		// service rejected the pairing. The entry is cleared — the next turn
 		// starts a fresh creation — and THIS turn is retried once without
 		// the reference rather than failed for a cache it never needed.
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		c.entry(attached.key).clear(attached.name)
 		if call.Body, err = fallback(); err != nil {
 			d.fail(err.Error(), err)

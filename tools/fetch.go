@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
@@ -25,6 +27,21 @@ const FetchResponseCap = 512 << 10
 
 // FetchMaxRedirects is REQ-TOOL-07's 5-hop limit.
 const FetchMaxRedirects = 5
+
+// fetchHeaderValueCap bounds each returned header value. The headers that
+// reach the model are a curated set (see returnedHeaders), and even those are
+// capped: a Location or Cache-Control of several kilobytes is a payload, not
+// metadata.
+const fetchHeaderValueCap = 256
+
+// returnedHeaders is the set of response headers the tool hands to the model.
+// Everything else — cookies, CSP policies, server fingerprints, the several
+// kilobytes of tracking headers a CDN adds — is dropped: the model cannot act
+// on them, they cost context on every fetch, and a server that wants to feed
+// the model text has the body for that.
+var returnedHeaders = []string{
+	"content-type", "content-length", "location", "last-modified", "etag", "cache-control",
+}
 
 // FetchOptions configures the fetch_url tool.
 type FetchOptions struct {
@@ -168,22 +185,21 @@ func FetchTool(opts FetchOptions) core.Tool {
 				raw = raw[:FetchResponseCap]
 			}
 
-			text := string(raw)
 			contentType := resp.Header.Get("Content-Type")
-			if a.AsText && strings.Contains(strings.ToLower(contentType), "html") {
-				text = HTMLToText(text)
-			}
-
 			headers := map[string]any{}
-			for k, v := range resp.Header {
-				headers[k] = strings.Join(v, ", ")
+			for _, k := range returnedHeaders {
+				if v := resp.Header.Get(k); v != "" {
+					if len(v) > fetchHeaderValueCap {
+						v = v[:fetchHeaderValueCap]
+					}
+					headers[k] = v
+				}
 			}
 			data := map[string]any{
 				"status":       resp.StatusCode,
 				"url":          resp.Request.URL.String(),
 				"content_type": contentType,
 				"headers":      headers,
-				"body":         text,
 				"truncated":    truncated,
 			}
 			r := core.OKResult(data)
@@ -193,10 +209,71 @@ func FetchTool(opts FetchOptions) core.Tool {
 			}
 			if truncated {
 				r.Metadata.TruncatedBy = string(TruncatedByBytes)
+				// The cut can land inside a multi-byte character; the partial
+				// rune is dropped so a truncated text body is still text.
+				raw = trimIncompleteRune(raw)
 			}
+
+			// A body that is not text is not returned as text. An image, a
+			// zip or a PDF handed to the model as a string is several hundred
+			// KB of mojibake it cannot read; it is told what arrived and how
+			// big it was instead. The decision is made on the content type
+			// where the server states one, and on the bytes where it does not
+			// — a text/plain that is not valid UTF-8 is not text either.
+			if !textualContentType(contentType) || !utf8.Valid(raw) {
+				data["binary"] = true
+				data["bytes"] = len(raw)
+				return r
+			}
+			text := string(raw)
+			if a.AsText && strings.Contains(strings.ToLower(contentType), "html") {
+				text = HTMLToText(text)
+			}
+			data["body"] = text
 			return r
 		},
 	}
+}
+
+// textualContentType reports whether a Content-Type names something the model
+// can read as text. An absent or unparseable type is treated as textual and
+// left to the UTF-8 check.
+func textualContentType(ct string) bool {
+	if strings.TrimSpace(ct) == "" {
+		return true
+	}
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return true
+	}
+	typ, sub, _ := strings.Cut(strings.ToLower(mt), "/")
+	switch {
+	case typ == "text":
+		return true
+	case strings.HasSuffix(sub, "+json"), strings.HasSuffix(sub, "+xml"):
+		return true
+	}
+	switch sub {
+	case "json", "xml", "javascript", "ecmascript", "x-www-form-urlencoded",
+		"x-ndjson", "ld+json", "graphql", "yaml", "x-yaml", "toml", "sql":
+		return typ == "application"
+	}
+	return false
+}
+
+// trimIncompleteRune drops a trailing partial UTF-8 sequence left by a byte
+// cut, so a body truncated at exactly the cap is still valid text.
+func trimIncompleteRune(b []byte) []byte {
+	for i := len(b) - 1; i >= 0 && i >= len(b)-utf8.UTFMax; i-- {
+		if !utf8.RuneStart(b[i]) {
+			continue
+		}
+		if !utf8.FullRune(b[i:]) {
+			return b[:i]
+		}
+		break
+	}
+	return b
 }
 
 func checkScheme(u *url.URL, allowHTTP bool) error {
@@ -256,24 +333,55 @@ func HTMLToText(s string) string {
 	return strings.Join(strings.Fields(out), " ")
 }
 
-// dropElement removes an element and its content, case-insensitively.
+// dropElement removes an element and its content, case-insensitively, in ONE
+// forward pass over the input.
+//
+// The previous version re-lowercased and re-spliced the whole string per
+// element removed, which on a page with a few thousand inline scripts is
+// quadratic in the 512 KB the tool allows. It also matched `<script` as a
+// prefix, so `<scripts>` and `<scriptlet>` were dropped too; the tag name
+// must now END where a name ends — at whitespace, `>` or `/`.
 func dropElement(s, tag string) string {
-	lower := strings.ToLower(s)
 	open, closing := "<"+tag, "</"+tag
-	for {
-		i := strings.Index(lower, open)
-		if i < 0 {
-			return s
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if !tagAt(s, i, open) {
+			b.WriteByte(s[i])
+			i++
+			continue
 		}
-		j := strings.Index(lower[i:], closing)
-		if j < 0 {
-			return s[:i]
+		// Inside the element: scan forward to its closing tag.
+		end := -1
+		for j := i + len(open); j+len(closing) <= len(s); j++ {
+			if s[j] == '<' && tagAt(s, j, closing) {
+				end = len(s)
+				if k := strings.IndexByte(s[j:], '>'); k >= 0 {
+					end = j + k + 1
+				}
+				break
+			}
 		}
-		end := i + j
-		if k := strings.Index(lower[end:], ">"); k >= 0 {
-			end += k + 1
+		if end < 0 {
+			break // unclosed: the element runs to the end of the input
 		}
-		s = s[:i] + s[end:]
-		lower = strings.ToLower(s)
+		i = end
 	}
+	return b.String()
+}
+
+// tagAt reports whether s[i:] starts with tag (case-insensitively) as a WHOLE
+// tag name, i.e. followed by whitespace, `>`, `/` or the end of input.
+func tagAt(s string, i int, tag string) bool {
+	if len(s)-i < len(tag) || !strings.EqualFold(s[i:i+len(tag)], tag) {
+		return false
+	}
+	if i+len(tag) == len(s) {
+		return true
+	}
+	switch s[i+len(tag)] {
+	case ' ', '\t', '\n', '\r', '\f', '>', '/':
+		return true
+	}
+	return false
 }

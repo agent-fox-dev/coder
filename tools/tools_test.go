@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -401,10 +402,11 @@ func TestExecuteDoesNotLeakAPIKeys(t *testing.T) {
 		"PATH=/usr/bin:/bin",
 		"ANTHROPIC_API_KEY=sk-ant-secret",
 		"OPENAI_API_KEY=sk-openai-secret",
+		"anthropic_api_key=sk-lower-secret", // the prefix rule is case-insensitive
 		"HOME=/home/user",
 	})
 	joined := strings.Join(env, "\n")
-	for _, leaked := range []string{"sk-ant-secret", "sk-openai-secret"} {
+	for _, leaked := range []string{"sk-ant-secret", "sk-openai-secret", "sk-lower-secret"} {
 		if strings.Contains(joined, leaked) {
 			t.Errorf("credential %q reached the subprocess environment", leaked)
 		}
@@ -872,15 +874,25 @@ func TestCapMarkersNameACallThatWorks(t *testing.T) {
 		t.Fatalf("search_files at the cap: %q", m)
 	}
 
-	// Through the tool: 501 entries at the default limit.
+	// Through the tool: 501 entries. At the DEFAULT limit (200) the marker
+	// names limit=400, a call that works; at the cap it says so.
 	dir := t.TempDir()
 	for i := 0; i < ListEntryCap+1; i++ {
 		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%04d", i)), nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	res := toolByName(t, dir, "list_files").Execute(context.Background(), json.RawMessage(`{}`))
+	list := toolByName(t, dir, "list_files")
+	res := list.Execute(context.Background(), json.RawMessage(`{}`))
 	note, _ := res.Data["note"].(string)
+	if entries := res.Data["entries"].([]string); len(entries) != ListEntryDefault {
+		t.Fatalf("the default list limit is %d, got %d entries", ListEntryDefault, len(entries))
+	}
+	if !strings.Contains(note, "limit=400") {
+		t.Fatalf("at the default the marker names the doubled limit: %q", note)
+	}
+	res = list.Execute(context.Background(), json.RawMessage(`{"limit":500}`))
+	note, _ = res.Data["note"].(string)
 	if note == "" || strings.Contains(note, "limit=") {
 		t.Fatalf("list_files at the cap must say so, not name limit=1000: %+v", res.Data)
 	}
@@ -946,8 +958,8 @@ func TestReadFileLongLineGetsTheSedMarker(t *testing.T) {
 	if !strings.Contains(content, wantMarker) {
 		t.Fatalf("content lacks the REQ-TOOL-09c marker %q:\n%.200s", wantMarker, content)
 	}
-	if !strings.Contains(wantMarker, "sed -n '2p' long.txt | head -c 51200") {
-		t.Fatalf("the marker must name the sed workaround: %q", wantMarker)
+	if !strings.Contains(wantMarker, "sed -n '2p' 'long.txt' | head -c 51200") {
+		t.Fatalf("the marker must name the sed workaround, with the path shell-quoted: %q", wantMarker)
 	}
 	if strings.Contains(content, "éé") {
 		t.Fatal("the oversized line's bytes must not be shown at all")
@@ -1206,15 +1218,27 @@ func TestReducedEnvStripsGenericCredentialSuffixes(t *testing.T) {
 		"PATH=/usr/bin", "HOME=/h", "LANG=C.UTF-8", "TMPDIR=/tmp", "TERM=xterm",
 		"GITHUB_TOKEN=ghp_1", "NPM_TOKEN=npm_1", "DB_PASSWORD=pw", "STRIPE_SECRET=sk",
 		"SOME_API_KEY=k", "GOOGLE_APPLICATION_CREDENTIALS=/c.json", "vault_token=lower",
+		// The suffixes a provider list never reaches.
+		"GITHUB_PAT=pat1", "DOCKER_AUTH=auth1", "DB_PASS=pass1", "DB_PWD=pwd1",
+		"SSH_PRIVATE_KEY=priv1", "SIGNING_KEY=key1",
+		// Bare names with no suffix at all.
+		"TOKEN=bare1", "API_KEY=bare2", "SECRET=bare3", "PASSWORD=bare4",
+		// Provider prefixes in either case; the non-secret settings survive.
+		"aws_secret_access_key=aws1", "AWS_ACCESS_KEY_ID=aws2", "google_api_key=g1",
+		"AWS_PROFILE=dev", "AWS_REGION=eu-west-1", "AWS_DEFAULT_REGION=us-east-1",
+		"GOOGLE_CLOUD_PROJECT=proj",
 		"EDITOR=vim",
 	})
 	joined := "\n" + strings.Join(env, "\n") + "\n"
-	for _, leaked := range []string{"ghp_1", "npm_1", "=pw", "=sk", "=k\n", "c.json", "lower"} {
+	for _, leaked := range []string{"ghp_1", "npm_1", "=pw\n", "=sk\n", "=k\n", "c.json", "lower",
+		"pat1", "auth1", "pass1", "pwd1", "priv1", "key1",
+		"bare1", "bare2", "bare3", "bare4", "aws1", "aws2", "=g1"} {
 		if strings.Contains(joined, leaked) {
 			t.Errorf("%q reached the subprocess environment", leaked)
 		}
 	}
-	for _, kept := range []string{"PATH=/usr/bin", "HOME=/h", "LANG=C.UTF-8", "TMPDIR=/tmp", "TERM=xterm", "EDITOR=vim"} {
+	for _, kept := range []string{"PATH=/usr/bin", "HOME=/h", "LANG=C.UTF-8", "TMPDIR=/tmp", "TERM=xterm", "EDITOR=vim",
+		"AWS_PROFILE=dev", "AWS_REGION=eu-west-1", "AWS_DEFAULT_REGION=us-east-1", "GOOGLE_CLOUD_PROJECT=proj"} {
 		if !strings.Contains(joined, "\n"+kept+"\n") {
 			t.Errorf("%q was stripped", kept)
 		}
@@ -1309,5 +1333,520 @@ func TestIgnoreOptionsAreThreadedAndGitConfigIsCached(t *testing.T) {
 	}
 	if n := calls.Load(); n != 1 {
 		t.Fatalf("git config was consulted %d times across six calls; want once per workspace", n)
+	}
+}
+
+// ------------------------------------------------------------------ review fixes
+
+// TestReadFileRefusesAnOversizedImageBeforeLoadingIt. The normalizer bounds
+// what it DECODES; nothing bounded what read_file handed it. The file is
+// sparse — a PNG signature and thirty-two megabytes of holes — so the test
+// costs nothing to set up and the assertion is on allocation, which is what
+// a size check placed after io.ReadAll would fail.
+func TestReadFileRefusesAnOversizedImageBeforeLoadingIt(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.Create(filepath.Join(dir, "huge.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("\x89PNG\r\n\x1a\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(ImageFileMaxBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	read := toolByName(t, dir, "read_file")
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	res := read.Execute(context.Background(), json.RawMessage(`{"path":"huge.png"}`))
+	runtime.ReadMemStats(&after)
+	if res.OK || res.Error != "image_too_large" {
+		t.Fatalf("want image_too_large, got %+v", res)
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 1<<20 {
+		t.Fatalf("refusing a %d byte image allocated %d bytes: the size must be checked "+
+			"BEFORE the file is read", ImageFileMaxBytes+1, alloc)
+	}
+	if res.Text != "" {
+		t.Fatal("an error result keeps the JSON envelope; Text must be empty")
+	}
+}
+
+// TestFileToolsRefuseWhatIsNotARegularFile. A directory is a list_files
+// question. A FIFO is worse: a read blocks until something writes, which is
+// never, and the whole batch waits behind it. The FIFO case runs with a
+// deadline so a regression is a failure rather than a hang.
+func TestFileToolsRefuseWhatIsNotARegularFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	read := toolByName(t, dir, "read_file")
+	edit := toolByName(t, dir, "edit_file")
+
+	for name, in := range map[string]json.RawMessage{
+		"read_file": json.RawMessage(`{"path":"sub"}`),
+		"edit_file": json.RawMessage(`{"path":"sub","edits":[{"old_string":"a","new_string":"b"}]}`),
+	} {
+		tl := read
+		if name == "edit_file" {
+			tl = edit
+		}
+		res := tl.Execute(context.Background(), in)
+		if res.OK || res.Error != "not_a_file" || !strings.Contains(res.Detail, "directory") {
+			t.Fatalf("%s on a directory: want not_a_file naming a directory, got %+v", name, res)
+		}
+	}
+
+	if runtime.GOOS == "windows" {
+		return
+	}
+	fifo := filepath.Join(dir, "pipe")
+	if out, err := exec.Command("mkfifo", fifo).CombinedOutput(); err != nil {
+		t.Skipf("mkfifo unavailable: %v %s", err, out)
+	}
+	for name, tl := range map[string]core.Tool{"read_file": read, "edit_file": edit} {
+		in := json.RawMessage(`{"path":"pipe","edits":[{"old_string":"a","new_string":"b"}]}`)
+		done := make(chan core.ToolResult, 1)
+		go func() { done <- tl.Execute(context.Background(), in) }()
+		select {
+		case res := <-done:
+			if res.OK || res.Error != "not_a_file" {
+				t.Fatalf("%s on a FIFO: want not_a_file, got %+v", name, res)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s blocked on a FIFO: the file must be Stat'ed and refused before it is opened", name)
+		}
+	}
+}
+
+// TestEditFileRefusesAFileOverItsSizeCeiling, with a message that names the
+// tool that can do it. Sparse again: the size is what is checked.
+func TestEditFileRefusesAFileOverItsSizeCeiling(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.Create(filepath.Join(dir, "big.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("needle\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(EditFileMaxBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	res := toolByName(t, dir, "edit_file").Execute(context.Background(),
+		json.RawMessage(`{"path":"big.log","edits":[{"old_string":"needle","new_string":"x"}]}`))
+	if res.OK || res.Error != "file_too_large" || !strings.Contains(res.Detail, "execute") {
+		t.Fatalf("want file_too_large pointing at execute, got %+v", res)
+	}
+}
+
+// TestCheckWriteTargetReResolvesTheWholePath. The leaf is not where the swap
+// happens: replace a PARENT directory with a link to outside and the leaf
+// looks like an ordinary (or absent) file while the write lands elsewhere.
+func TestCheckWriteTargetReResolvesTheWholePath(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	ws, _ := NewWorkspace(dir)
+	sub := filepath.Join(ws.Root, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(sub, "file.txt")
+	if err := os.WriteFile(abs, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.CheckWriteTarget(abs); err != nil {
+		t.Fatalf("a plain file under a plain directory is fine: %v", err)
+	}
+	// The swap: sub becomes a link to outside, and outside holds a plain
+	// file.txt so the leaf Lstat's as a regular file.
+	if err := os.RemoveAll(sub); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "file.txt"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, outside, sub)
+	if err := ws.CheckWriteTarget(abs); !errors.Is(err, ErrPathNotAllowed) {
+		t.Fatalf("err = %v, want ErrPathNotAllowed: the parent is now a link to outside, "+
+			"and a check that looks only at the leaf does not see it", err)
+	}
+}
+
+// TestWriteFileChecksContainmentBeforeMkdirAll pins the ORDER. The swap is
+// made while the tool is blocked on the path lock — after Resolve, before the
+// write — which is the race the check exists for. MkdirAll before the check
+// would create `deeper/` inside the outside directory even though the write
+// itself is then refused.
+func TestWriteFileChecksContainmentBeforeMkdirAll(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	ws, _ := NewWorkspace(dir)
+	sub := filepath.Join(ws.Root, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs := newFileTools(Options{Workspace: ws}.withDefaults())
+	abs := filepath.Join(sub, "deeper", "file.txt")
+	key, err := lockKey(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := fs.locks.acquire(key)
+
+	done := make(chan core.ToolResult, 1)
+	go func() {
+		done <- fs.writeFile().Execute(context.Background(),
+			json.RawMessage(`{"path":"sub/deeper/file.txt","content":"pwned"}`))
+	}()
+	// The tool has resolved the path and is now waiting on the lock.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case res := <-done:
+		t.Fatalf("the write ran while the lock was held: %+v", res)
+	default:
+	}
+	if err := os.RemoveAll(sub); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, outside, sub)
+	release()
+
+	select {
+	case res := <-done:
+		if res.OK || res.Error != "path_not_allowed" {
+			t.Fatalf("want path_not_allowed, got %+v", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the write never completed")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "deeper")); err == nil {
+		t.Fatal("MkdirAll created a directory OUTSIDE the workspace before the containment " +
+			"re-check ran; CheckWriteTarget must come first")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "deeper", "file.txt")); err == nil {
+		t.Fatal("the file was written outside the workspace")
+	}
+}
+
+// TestCRLFNeedlesMatchACRLFFile is B1. The file is normalised to LF before
+// matching; a needle the model copied with its CRs intact was not, and never
+// matched. Through the tool, so Restore is covered too.
+func TestCRLFNeedlesMatchACRLFFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "win.txt")
+	if err := os.WriteFile(path, []byte("alpha\r\nbravo\r\ncharlie\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := toolByName(t, dir, "edit_file").Execute(context.Background(), json.RawMessage(
+		`{"path":"win.txt","edits":[{"old_string":"alpha\r\nbravo","new_string":"ALPHA\r\nBRAVO"}]}`))
+	if !res.OK {
+		t.Fatalf("a CRLF needle against a CRLF file must match: %+v", res)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "ALPHA\r\nBRAVO\r\ncharlie\r\n" {
+		t.Fatalf("file = %q: the replacement must be written with the file's own CRLF, once", got)
+	}
+}
+
+// TestEditRejectionsNameTheEditOnlyInABatch is B9: `edits[1]:` tells the
+// model which one, and for a single edit the prefix is noise. The pinned
+// not-unique wording is asserted unprefixed in
+// TestNonUniqueIsARejectionNotAReplaceAll.
+func TestEditRejectionsNameTheEditOnlyInABatch(t *testing.T) {
+	const content = "one\ntwo\ntwo\n"
+	_, _, err := ApplyEdits(content, []Edit{
+		{OldString: "one", NewString: "1"},
+		{OldString: "two", NewString: "2"},
+	})
+	if err == nil || !strings.HasPrefix(err.Error(), "edits[1]: Found 2 occurrences") {
+		t.Fatalf("a batch rejection names the edit: %v", err)
+	}
+	_, _, err = ApplyEdits(content, []Edit{{OldString: "zulu", NewString: "z"}})
+	if err == nil || strings.HasPrefix(err.Error(), "edits[") {
+		t.Fatalf("a single-edit rejection carries no index: %v", err)
+	}
+	_, _, err = ApplyEdits(content, []Edit{
+		{OldString: "one", NewString: "1"},
+		{OldString: "zulu", NewString: "z"},
+	})
+	if err == nil || !strings.HasPrefix(err.Error(), "edits[1]: The string to replace was not found") {
+		t.Fatalf("a batch not-found names the edit: %v", err)
+	}
+}
+
+// TestNotFoundSaysWhereTheFirstLineIs is T5: the rejection reports whether
+// the needle's first line occurs and at which lines (at most three), so the
+// model can repair the needle without re-reading the file.
+func TestNotFoundSaysWhereTheFirstLineIs(t *testing.T) {
+	content := "func a() {\n\treturn 1\n}\n\nfunc a() {\n\treturn 2\n}\n\nfunc a() {\n\treturn 3\n}\n\nfunc a() {\n\treturn 4\n}\n"
+	reject := func(old string) string {
+		t.Helper()
+		_, _, err := ApplyEdits(content, []Edit{{OldString: old, NewString: "x"}})
+		if err == nil {
+			t.Fatalf("%q must be rejected", old)
+		}
+		return err.Error()
+	}
+	got := reject("func a() {\n\treturn 9\n}")
+	if !strings.Contains(got, "first line occurs at line 1, 5, 9, …") || strings.Contains(got, "13") {
+		t.Fatalf("the hint names at most three line numbers of the first line: %q", got)
+	}
+	if !strings.Contains(got, "lines after it differ") {
+		t.Fatalf("the hint says what to look at: %q", got)
+	}
+	got = reject("    return 4")
+	if !strings.Contains(got, "line 14 with different indentation") {
+		t.Fatalf("an indentation mismatch is named as such: %q", got)
+	}
+	got = reject("func zzz() {\n\treturn 1\n}")
+	if !strings.Contains(got, "Not even its first line occurs") {
+		t.Fatalf("an absent first line says so: %q", got)
+	}
+}
+
+// TestShellQuoteIsSafeForTheSedMarker is B8: the path in the long-line marker
+// is pasted into a shell.
+func TestShellQuoteIsSafeForTheSedMarker(t *testing.T) {
+	if got := ShellQuote("it's a $file.txt"); got != `'it'\''s a $file.txt'` {
+		t.Fatalf("ShellQuote = %s", got)
+	}
+	m := LongLineMarker(3, 1<<20, DefaultByteLimit, "my file.txt")
+	if !strings.Contains(m, "sed -n '3p' 'my file.txt' |") {
+		t.Fatalf("the path must be quoted in the marker: %q", m)
+	}
+}
+
+// TestAbortDuringTheDrainDoesNotReclassifyAFinishedCommand is B5. The
+// command exits 0 at once and leaves a descendant holding the pipe. A
+// cancellation that arrives during the post-exit drain must (a) end the drain
+// now rather than at the idle/ceiling bound, and (b) not turn a command that
+// had already completed into an aborted one.
+func TestAbortDuringTheDrainDoesNotReclassifyAFinishedCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fixture is a unix shell background job")
+	}
+	if _, _, err := ResolveShell(); err != nil {
+		t.Skip("no shell available")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	res, err := Run(ctx, "( sleep 3 ) & echo started; exit 0", ExecOptions{
+		MaxBytes: 4096, DrainIdle: 10 * time.Second, DrainCeiling: 10 * time.Second,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Run took %v after cancellation; the post-exit drain must stop on ctx.Done", elapsed)
+	}
+	if res.Outcome != OutcomeOK || !strings.Contains(res.Output, "started") {
+		t.Fatalf("outcome = %q output = %q; the command finished before the cancellation and "+
+			"must be classified from the state at exit", res.Outcome, res.Output)
+	}
+}
+
+// ---- T1: the model-facing text (core.ToolResult.Text)
+
+// TestReadFileTextIsTheContentWithoutAnEnvelope.
+func TestReadFileTextIsTheContentWithoutAnEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	body := "package main\n\nfunc main() {\n\tprintln(\"hi\")\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	read := toolByName(t, dir, "read_file")
+	res := read.Execute(context.Background(), json.RawMessage(`{"path":"main.go"}`))
+	if !res.OK {
+		t.Fatalf("%+v", res)
+	}
+	if res.Text != strings.TrimSuffix(body, "\n") {
+		t.Fatalf("Text = %q, want the raw content", res.Text)
+	}
+	if res.Data["content"] != res.Text {
+		t.Fatal("Data.content stays populated for programmatic consumers")
+	}
+	if res.LLMText() != res.Text || strings.HasPrefix(res.LLMText(), "{") {
+		t.Fatalf("the model must read the text, not an envelope: %q", res.LLMText())
+	}
+	// The continuation marker is part of the text, in place.
+	res = read.Execute(context.Background(), json.RawMessage(`{"path":"main.go","limit":2}`))
+	if !strings.HasSuffix(res.Text, "\n"+ReadOffsetMarker(1, 2, 5)) {
+		t.Fatalf("the marker stays inside the text: %q", res.Text)
+	}
+	// Errors keep the envelope.
+	res = read.Execute(context.Background(), json.RawMessage(`{"path":"missing.go"}`))
+	if res.OK || res.Text != "" || !strings.HasPrefix(res.LLMText(), `{"detail"`) {
+		t.Fatalf("an error keeps the envelope: %+v", res)
+	}
+}
+
+// TestExecuteTextIsTheOutputPlusAStatusLineOnlyWhenInformative.
+func TestExecuteTextIsTheOutputPlusAStatusLineOnlyWhenInformative(t *testing.T) {
+	ok := execResultToTool(ExecResult{Output: "hello\n", Outcome: OutcomeOK}, 0)
+	if ok.Text != "hello\n" {
+		t.Fatalf("a clean exit adds nothing: %q", ok.Text)
+	}
+	if ok.Data["exit_code"] != 0 || ok.Data["outcome"] != "ok" {
+		t.Fatalf("Data keeps exit_code/outcome for programmatic readers: %+v", ok.Data)
+	}
+	cases := []struct {
+		res  ExecResult
+		want string
+	}{
+		{ExecResult{Output: "boom", Outcome: OutcomeExit, ExitCode: 2}, "boom\n[exit 2]"},
+		{ExecResult{Output: "", Outcome: OutcomeExit, ExitCode: 1}, "[exit 1]"},
+		{ExecResult{Output: "partial\n", Outcome: OutcomeTimeout, ExitCode: 137}, "partial\n[timeout after 5s]"},
+		{ExecResult{Output: "x\n", Outcome: OutcomeAbort}, "x\n[aborted]"},
+		{ExecResult{Output: "y\n", Outcome: OutcomeSignal, ExitCode: 137}, "y\n[killed by signal 9]"},
+	}
+	for _, c := range cases {
+		got := execResultToTool(c.res, 5*time.Second)
+		if got.Text != c.want {
+			t.Fatalf("%s: Text = %q, want %q", c.res.Outcome, got.Text, c.want)
+		}
+		if got.OK {
+			t.Fatalf("%s is not OK", c.res.Outcome)
+		}
+	}
+	if _, _, err := ResolveShell(); err != nil {
+		return
+	}
+	res := toolByName(t, t.TempDir(), "execute").Execute(context.Background(),
+		json.RawMessage(`{"command":"echo out; echo err >&2; exit 3"}`))
+	if res.Text != "out\nerr\n[exit 3]" {
+		t.Fatalf("through the tool: %q", res.Text)
+	}
+}
+
+// TestSearchTextIsGrepStyleGroupedByFile.
+func TestSearchTextIsGrepStyleGroupedByFile(t *testing.T) {
+	res := SearchResult{FilesSearched: 7, Matches: []SearchMatch{
+		{File: "a/b.go", Line: 12, Text: "\tx := needle()", Before: []string{"func f() {"}, After: []string{"\treturn x", "}"}},
+		{File: "a/b.go", Line: 13, Text: "\treturn needle", Before: []string{"\tx := needle()"}, After: []string{"}"}},
+		{File: "c.md", Line: 1, Text: "needle"},
+	}}
+	want := "a/b.go\n" +
+		"  11- func f() {\n" +
+		"  12: \tx := needle()\n" +
+		"  13: \treturn needle\n" +
+		"  14- }\n" +
+		"\n" +
+		"c.md\n" +
+		"  1: needle\n" +
+		SearchMarker(50)
+	if got := RenderSearchText(res, SearchMarker(50)); got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+	if got := RenderSearchText(SearchResult{FilesSearched: 3}, ""); got != "No matches (3 files searched)." {
+		t.Fatalf("empty: %q", got)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.txt"), []byte("one\nneedle\nthree\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := toolByName(t, dir, "search_files").Execute(context.Background(),
+		json.RawMessage(`{"pattern":"needle","context_lines":1}`))
+	if !out.OK || out.Text != "x.txt\n  1- one\n  2: needle\n  3- three" {
+		t.Fatalf("through the tool: %+v %q", out.Error, out.Text)
+	}
+	if _, ok := out.Data["matches"].([]SearchMatch); !ok {
+		t.Fatal("Data keeps the structured matches")
+	}
+}
+
+// TestListAndFindTextIsOneEntryPerLine, plus T3's defaults and B11's
+// slash-separated find paths and symlink-to-directory suffix.
+func TestListAndFindTextIsOneEntryPerLine(t *testing.T) {
+	dir := t.TempDir()
+	for _, p := range []string{"src/a.go", "src/b.go", "README"} {
+		full := filepath.Join(dir, filepath.FromSlash(p))
+		_ = os.MkdirAll(filepath.Dir(full), 0o755)
+		if err := os.WriteFile(full, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustSymlink(t, "src", filepath.Join(dir, "srclink"))
+	list := toolByName(t, dir, "list_files")
+	res := list.Execute(context.Background(), json.RawMessage(`{}`))
+	if res.Text != "README\nsrc/\nsrclink/" {
+		t.Fatalf("list_files Text = %q: one entry per line, directories and links to directories with /", res.Text)
+	}
+	find := toolByName(t, dir, "find_files")
+	res = find.Execute(context.Background(), json.RawMessage(`{"pattern":"**/*.go"}`))
+	if res.Text != "src/a.go\nsrc/b.go" {
+		t.Fatalf("find_files Text = %q", res.Text)
+	}
+	for _, f := range res.Data["files"].([]string) {
+		if strings.Contains(f, `\`) {
+			t.Fatalf("find_files returns slash-separated paths: %q", f)
+		}
+	}
+
+	// Defaults: 201 files at the default limit of 200 truncates with a marker
+	// naming limit=400.
+	many := t.TempDir()
+	for i := 0; i < FindResultDefault+1; i++ {
+		if err := os.WriteFile(filepath.Join(many, fmt.Sprintf("f%04d.txt", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res = toolByName(t, many, "find_files").Execute(context.Background(), json.RawMessage(`{"pattern":"*.txt"}`))
+	files := res.Data["files"].([]string)
+	if len(files) != FindResultDefault || res.Data["truncated"] != true {
+		t.Fatalf("default find limit is %d: got %d, truncated=%v", FindResultDefault, len(files), res.Data["truncated"])
+	}
+	marker, _ := res.Data["marker"].(string)
+	if !strings.Contains(marker, "limit=400") || !strings.HasSuffix(res.Text, "\n"+marker) {
+		t.Fatalf("the marker names limit=400 and ends the text: %q / %q", marker, res.Text)
+	}
+	if strings.Count(res.Text, "\n") != FindResultDefault {
+		t.Fatalf("Text is %d entries then the marker", FindResultDefault)
+	}
+	res = toolByName(t, many, "find_files").Execute(context.Background(), json.RawMessage(`{"pattern":"*.txt","limit":5000}`))
+	if len(res.Data["files"].([]string)) != FindResultDefault+1 {
+		t.Fatal("an explicit limit above the cap is clamped to the cap, which still fits 201 files")
+	}
+}
+
+// TestToolDescriptionsCarryTheOperativeFacts is T5/T6: these strings are sent
+// on every request, so each fact is one sentence, and the facts a model most
+// often gets wrong are present.
+func TestToolDescriptionsCarryTheOperativeFacts(t *testing.T) {
+	ws, _ := NewWorkspace(t.TempDir())
+	all, _ := All(Options{Workspace: ws})
+	byName := map[string]core.Tool{}
+	for _, tl := range all {
+		byName[tl.Name] = tl
+	}
+	for _, want := range []string{"last 50 KB", "No default timeout", "> log 2>&1 &", "workspace root"} {
+		if !strings.Contains(byName["execute"].Description, want) {
+			t.Errorf("execute's description lacks %q: %q", want, byName["execute"].Description)
+		}
+	}
+	for _, want := range []string{"hidden", "max_matches (<= 100)", "context_lines (<= 20)"} {
+		if !strings.Contains(byName["search_files"].Description, want) {
+			t.Errorf("search_files' description lacks %q", want)
+		}
+	}
+	if !strings.Contains(byName["list_files"].Description, "Does not apply .gitignore") {
+		t.Error("list_files' description must say it ignores .gitignore")
+	}
+	if g := byName["write_file"].PromptGuidelines; len(g) != 1 ||
+		g[0] != "Prefer edit_file for an existing file; write_file replaces the whole file." {
+		t.Errorf("write_file guideline: %q", g)
+	}
+	if ExecuteFallbackGuideline != "Use execute for file operations like ls, rg, find." {
+		t.Error("REQ-TOOL-04e's guideline is pinned")
 	}
 }

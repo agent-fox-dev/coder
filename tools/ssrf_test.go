@@ -45,6 +45,13 @@ func TestBlockedAddressCoversEveryReservedRange(t *testing.T) {
 		{"240.0.0.1", "reserved"},
 		{"255.255.255.255", "broadcast"},
 		{"2001:db8::1", "IPv6 documentation"},
+		{"0.0.0.1", "this network (0.0.0.0/8)"},
+		{"0.255.255.254", "this network (0.0.0.0/8)"},
+		{"64:ff9b:1::1", "local-use NAT64"},
+		{"::10.0.0.1", "IPv4-compatible IPv6 embedding a private address"},
+		{"::169.254.169.254", "IPv4-compatible IPv6 embedding the metadata endpoint"},
+		{"::8.8.8.8", "IPv4-compatible IPv6 (deprecated ::/96) even with a public embedded address"},
+		{"::1.2.3.4", "IPv4-compatible IPv6"},
 	}
 	for _, c := range blocked {
 		t.Run(c.addr, func(t *testing.T) {
@@ -59,7 +66,13 @@ func TestBlockedAddressCoversEveryReservedRange(t *testing.T) {
 		})
 	}
 
-	for _, ok := range []string{"93.184.216.34", "8.8.8.8", "1.1.1.1", "2606:4700::1111"} {
+	// ::169.254.169.254 says WHY in terms of the embedded address: the
+	// low 32 bits are unmapped and classified before the generic reason.
+	if _, why := BlockedAddress(netip.MustParseAddr("::169.254.169.254")); !strings.Contains(why, "link-local") {
+		t.Fatalf("an IPv4-compatible address must be classified by its embedded IPv4 address: %q", why)
+	}
+
+	for _, ok := range []string{"93.184.216.34", "8.8.8.8", "1.1.1.1", "2606:4700::1111", "1::1"} {
 		if blocked, why := BlockedAddress(netip.MustParseAddr(ok)); blocked {
 			t.Fatalf("%s was refused as %q; a guard that blocks the public internet is "+
 				"an outage, not a control", ok, why)
@@ -461,4 +474,155 @@ func mustWorkspace(t *testing.T) *Workspace {
 		t.Fatal(err)
 	}
 	return ws
+}
+
+// ---- review fixes
+
+// TestFetchReturnsOnlyCuratedHeadersEachCapped is S2. A CDN response carries
+// several kilobytes of headers the model cannot act on; only the ones that
+// describe the body come back, and none of those at unbounded length.
+func TestFetchReturnsOnlyCuratedHeadersEachCapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		h := w.Header()
+		h.Set("Content-Type", "text/plain")
+		h.Set("ETag", strings.Repeat("e", 1000))
+		h.Set("Cache-Control", "max-age=60")
+		h.Set("Set-Cookie", "session=secret")
+		h.Set("X-Powered-By", "something")
+		h.Set("Content-Security-Policy", strings.Repeat("default-src 'self'; ", 100))
+		_, _ = io.WriteString(w, "body")
+	}))
+	defer srv.Close()
+	res := fetchThrough(t, srv, FetchOptions{AllowHTTP: true}, map[string]any{"url": "http://example.com/"})
+	if !res.OK {
+		t.Fatalf("%+v", res)
+	}
+	headers := res.Data["headers"].(map[string]any)
+	for _, gone := range []string{"Set-Cookie", "set-cookie", "X-Powered-By", "x-powered-by",
+		"Content-Security-Policy", "content-security-policy"} {
+		if _, has := headers[gone]; has {
+			t.Fatalf("%s reached the model; only the curated set is returned: %v", gone, headers)
+		}
+	}
+	if headers["content-type"] != "text/plain" || headers["cache-control"] != "max-age=60" {
+		t.Fatalf("curated headers missing: %v", headers)
+	}
+	if etag, _ := headers["etag"].(string); len(etag) != fetchHeaderValueCap {
+		t.Fatalf("etag is %d bytes; each value is capped at %d", len(etag), fetchHeaderValueCap)
+	}
+}
+
+// TestFetchRefusesAnOversizedHeaderBlock is S9's transport half: headers are
+// read into memory before the body cap applies, so they need their own.
+func TestFetchRefusesAnOversizedHeaderBlock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Filler", strings.Repeat("f", 200<<10))
+		_, _ = io.WriteString(w, "body")
+	}))
+	defer srv.Close()
+	res := fetchThrough(t, srv, FetchOptions{AllowHTTP: true}, map[string]any{"url": "http://example.com/"})
+	if res.OK {
+		t.Fatal("a 200 KB header block was accepted; the transport must cap response headers")
+	}
+	if got := (&SSRFGuard{}).Transport().MaxResponseHeaderBytes; got != 64<<10 {
+		t.Fatalf("MaxResponseHeaderBytes = %d, want 64 KiB", got)
+	}
+}
+
+// TestFetchDoesNotReturnABinaryBodyAsText is S9. A PDF or an image handed to
+// the model as a string is hundreds of kilobytes of mojibake it cannot read.
+// The decision is by content type where one is stated and by the bytes where
+// it is not; a text/plain that is not UTF-8 is not text either.
+func TestFetchDoesNotReturnABinaryBodyAsText(t *testing.T) {
+	cases := []struct {
+		name, contentType string
+		body              []byte
+		binary            bool
+	}{
+		{"octet-stream", "application/octet-stream", []byte("plain ascii"), true},
+		{"pdf", "application/pdf", []byte("%PDF-1.4"), true},
+		{"png", "image/png", []byte("\x89PNG\r\n\x1a\n"), true},
+		{"invalid utf-8 text", "text/plain", []byte("abc\xff\xfe"), true},
+		{"json", "application/json", []byte(`{"a":1}`), false},
+		{"json suffix", "application/problem+json; charset=utf-8", []byte(`{}`), false},
+		{"xml", "application/xml", []byte(`<a/>`), false},
+		{"html", "text/html; charset=utf-8", []byte(`<p>hi</p>`), false},
+		{"no content type", "", []byte("just bytes"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if c.contentType != "" {
+					w.Header().Set("Content-Type", c.contentType)
+				} else {
+					// Go sniffs a type for an unset header; an explicit empty
+					// value is what "the server said nothing" looks like.
+					w.Header()["Content-Type"] = nil
+				}
+				_, _ = w.Write(c.body)
+			}))
+			defer srv.Close()
+			res := fetchThrough(t, srv, FetchOptions{AllowHTTP: true}, map[string]any{"url": "http://example.com/x"})
+			if !res.OK {
+				t.Fatalf("%+v", res)
+			}
+			_, hasBody := res.Data["body"]
+			if c.binary {
+				if hasBody || res.Data["binary"] != true || res.Data["bytes"] != len(c.body) {
+					t.Fatalf("a binary body must come back as {binary:true, bytes:N} with no body: %+v", res.Data)
+				}
+				if res.Data["content_type"] != c.contentType {
+					t.Fatalf("content_type = %v", res.Data["content_type"])
+				}
+			} else if !hasBody || res.Data["body"] != string(c.body) {
+				t.Fatalf("a text body must come back as text: %+v", res.Data)
+			}
+		})
+	}
+}
+
+// TestATruncatedBodyIsCutOnARuneBoundary: the 512 KB cut can land inside a
+// multi-byte character, which would make a text body look binary.
+func TestATruncatedBodyIsCutOnARuneBoundary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		// "é" is two bytes; an odd number of leading ASCII bytes puts the cap
+		// mid-rune.
+		_, _ = io.WriteString(w, "a"+strings.Repeat("é", FetchResponseCap))
+	}))
+	defer srv.Close()
+	res := fetchThrough(t, srv, FetchOptions{AllowHTTP: true}, map[string]any{"url": "http://example.com/"})
+	if !res.OK || res.Data["truncated"] != true {
+		t.Fatalf("%+v", res)
+	}
+	body, ok := res.Data["body"].(string)
+	if !ok || res.Data["binary"] == true {
+		t.Fatalf("a truncated UTF-8 body is still text: %+v", res.Data)
+	}
+	if len(body) != FetchResponseCap-1 || !strings.HasSuffix(body, "é") {
+		t.Fatalf("body is %d bytes; the cut must drop the partial rune at the cap", len(body))
+	}
+}
+
+// TestDropElementMatchesWholeTagNamesInOnePass is S6b. `<scripts>` is not
+// `<script>`, and a page of many inline scripts must not cost quadratic time.
+func TestDropElementMatchesWholeTagNamesInOnePass(t *testing.T) {
+	in := `<scripts>keep one</scripts><SCRIPT type="x">drop</SCRIPT>` +
+		`<script>drop too</script ><scriptlet>keep two</scriptlet><script>unclosed drop`
+	if got := HTMLToText(in); got != "keep one keep two" {
+		t.Fatalf("HTMLToText = %q, want %q", got, "keep one keep two")
+	}
+
+	var b strings.Builder
+	for b.Len() < FetchResponseCap {
+		b.WriteString("<script>x</script>t ")
+	}
+	start := time.Now()
+	got := HTMLToText(b.String())
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("stripping %d scripts from 512 KB took %v; dropElement must be one forward pass", FetchResponseCap/20, elapsed)
+	}
+	if strings.Contains(got, "x") || !strings.HasPrefix(got, "t t t") {
+		t.Fatalf("scripts survived or text was lost: %.40q", got)
+	}
 }

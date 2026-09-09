@@ -110,8 +110,9 @@ const (
 func (f *fileTools) searchFiles() core.Tool {
 	return core.Tool{
 		Name: "search_files",
-		Description: "Search file contents by regular expression, skipping .gitignored " +
-			"and binary files.",
+		Description: "Search file contents by regular expression, skipping .gitignored, " +
+			"hidden (dot-prefixed) and binary files. Returns at most max_matches (<= 100) " +
+			"matches with context_lines (<= 20) lines either side.",
 		Builtin: true,
 		PromptGuidelines: []string{
 			"Prefer search_files over execute+grep: it respects .gitignore and returns structured matches.",
@@ -161,20 +162,106 @@ func (f *fileTools) searchFiles() core.Tool {
 				"truncated":      res.Truncated,
 				"files_searched": res.FilesSearched,
 			})
+			note := ""
 			if res.Truncated {
 				// The marker names THIS tool's parameter, max_matches, and its
 				// cap of 100 — not find_files' `limit` (REQ-TOOL-09b).
-				out.Data["note"] = SearchMarker(effectiveMax(a.MaxMatches))
+				note = SearchMarker(effectiveMax(a.MaxMatches))
 				if res.TruncatedBy == TruncatedByBytes {
-					out.Data["note"] = SearchBytesMarker(len(res.Matches), DefaultByteLimit)
+					note = SearchBytesMarker(len(res.Matches), DefaultByteLimit)
 				}
+				out.Data["note"] = note
 				out.Metadata = &core.ToolMetadata{
 					Truncated: true, TruncatedBy: string(res.TruncatedBy),
 				}
 			}
+			out.Text = RenderSearchText(res, note)
 			return out
 		},
 	}
+}
+
+// RenderSearchText is the model-facing rendering of a search result: grep
+// style, grouped by file.
+//
+//	path/to/file.go
+//	  12- context before
+//	  13: the matched line
+//	  14- context after
+//
+//	other/file.go
+//	  7: another match
+//	[marker]
+//
+// It replaces the JSON envelope for the model (core.ToolResult.Text). Per
+// match the envelope repeats the file name and the four keys, and every line
+// of code inside it is JSON-escaped; grep's shape says the file once per
+// group and the line once, unescaped, which for a typical result is a third
+// fewer bytes and a better tokenization of the code itself. Data keeps the
+// structured form for programmatic consumers.
+//
+// Within a file each line number is printed once: a line that is both a match
+// and another match's context is shown as the match.
+func RenderSearchText(res SearchResult, marker string) string {
+	if len(res.Matches) == 0 {
+		return fmt.Sprintf("No matches (%d files searched).", res.FilesSearched)
+	}
+	type line struct {
+		text  string
+		match bool
+	}
+	var (
+		b       strings.Builder
+		files   []string
+		perFile = map[string]map[int]line{}
+	)
+	for _, m := range res.Matches {
+		lines, ok := perFile[m.File]
+		if !ok {
+			lines = map[int]line{}
+			perFile[m.File] = lines
+			files = append(files, m.File)
+		}
+		put := func(n int, text string, match bool) {
+			if prev, seen := lines[n]; seen && prev.match && !match {
+				return
+			}
+			lines[n] = line{text, match}
+		}
+		for i, t := range m.Before {
+			put(m.Line-len(m.Before)+i, t, false)
+		}
+		put(m.Line, m.Text, true)
+		for i, t := range m.After {
+			put(m.Line+1+i, t, false)
+		}
+	}
+	for fi, f := range files {
+		if fi > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(f)
+		b.WriteByte('\n')
+		lines := perFile[f]
+		nums := make([]int, 0, len(lines))
+		for n := range lines {
+			nums = append(nums, n)
+		}
+		sort.Ints(nums)
+		for _, n := range nums {
+			l := lines[n]
+			sep := '-'
+			if l.match {
+				sep = ':'
+			}
+			fmt.Fprintf(&b, "  %d%c %s\n", n, sep, l.text)
+		}
+	}
+	if marker != "" {
+		b.WriteString(marker)
+		b.WriteByte('\n')
+	}
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 // SearchPatternError is a bad regular expression, separated so the tool can
@@ -549,6 +636,15 @@ func searchRipgrep(ctx context.Context, rg, root string, p SearchParams, ig Igno
 		// plain directory returns node_modules on the accelerated path and not
 		// on the native one.
 		"--no-require-git",
+		// Parity with the native engine's ignore SOURCES (REQ-TOOL-05.2): it
+		// reads the global excludes file, .git/info/exclude and the .gitignore
+		// files from the search root DOWN. rg additionally walks .gitignore
+		// files in the root's PARENT directories and honours .ignore files,
+		// neither of which the native path reads — so a search rooted in a
+		// subdirectory returned different files depending on which backend
+		// answered. The global layer is passed explicitly below, so rg's own
+		// lookup of it is turned off too.
+		"--no-ignore-parent", "--no-ignore-dot", "--no-ignore-global",
 		// Deterministic order, at the cost of ripgrep's parallelism. It is
 		// what makes truncation mean the same thing on both paths: "the first
 		// N by path then line" rather than "whichever N finished first".
@@ -596,7 +692,12 @@ func searchRipgrep(ctx context.Context, rg, root string, p SearchParams, ig Igno
 	// among other differences), so it is the only one that gets to decide.
 	args = append(args, "--", p.Pattern, ".")
 
-	cmd := exec.CommandContext(ctx, rg, args...)
+	// rg's own context, so it can be stopped the moment the result is full.
+	// Without this a search for a common word over a large tree read every
+	// match rg could find, at max_matches=1.
+	rgCtx, stopRG := context.WithCancel(ctx)
+	defer stopRG()
+	cmd := exec.CommandContext(rgCtx, rg, args...)
 	cmd.Dir = root
 	// An empty environment, like every other subprocess here (REQ-SEC-08). rg
 	// reads RIPGREP_CONFIG_PATH, and a config file picked up from the ambient
@@ -612,11 +713,14 @@ func searchRipgrep(ctx context.Context, rg, root string, p SearchParams, ig Igno
 		return SearchResult{}, err
 	}
 
-	res, parseErr := parseRipgrepJSON(stdout, p, max)
-
-	// Drain whatever is left so rg is not killed by a broken pipe mid-write,
-	// which would turn a successful truncated search into an error.
-	_, _ = stdout.Read(make([]byte, 0))
+	res, stopped, parseErr := parseRipgrepJSON(stdout, p, max)
+	if stopped || parseErr != nil {
+		// Done reading early: kill rg rather than let it finish a search
+		// nobody will read. Wait then closes the pipe; the rule that reads
+		// must finish before Wait is about not LOSING output, and here the
+		// rest of the output is unwanted by construction.
+		stopRG()
+	}
 	waitErr := cmd.Wait()
 
 	if parseErr != nil {
@@ -632,14 +736,18 @@ func searchRipgrep(ctx context.Context, rg, root string, p SearchParams, ig Igno
 	res.FilesSearched = n
 
 	if waitErr != nil {
+		if stopped {
+			return res, nil // killed by us, at max_matches: the result is complete
+		}
 		var ee *exec.ExitError
 		// Exit 1 is "no matches", which is a result and not a failure. Exit 2
-		// is a real error and carries a reason on stderr.
-		if errors.As(waitErr, &ee) && ee.ExitCode() == 1 && len(res.Matches) == 0 {
+		// is an error and carries a reason on stderr — but rg reports 2 when
+		// ANY file could not be read even if others matched, and the native
+		// path skips an unreadable file rather than failing, so matches that
+		// arrived alongside the error are kept.
+		if errors.As(waitErr, &ee) && (ee.ExitCode() == 1 && len(res.Matches) == 0 ||
+			ee.ExitCode() == 2 && len(res.Matches) > 0) {
 			return res, nil
-		}
-		if len(res.Matches) > 0 {
-			return res, nil // we stopped reading early; rg died of the pipe
 		}
 		return SearchResult{}, fmt.Errorf("ripgrep: %w: %s", waitErr,
 			strings.TrimSpace(stderr.String()))
@@ -664,7 +772,11 @@ type rgEvent struct {
 	} `json:"data"`
 }
 
-func parseRipgrepJSON(r interface{ Read([]byte) (int, error) }, p SearchParams, max int) (SearchResult, error) {
+// parseRipgrepJSON reads rg's event stream. It stops READING once max matches
+// are in hand and the file they came from has ended — the after-context for
+// the last match arrives before that file's "end" event — and reports that it
+// stopped, so the caller can kill rg rather than wait for it.
+func parseRipgrepJSON(r interface{ Read([]byte) (int, error) }, p SearchParams, max int) (res SearchResult, stopped bool, err error) {
 	out := SearchResult{Matches: []SearchMatch{}}
 
 	// Context lines arrive as their own events, before and after the match
@@ -701,17 +813,23 @@ func parseRipgrepJSON(r interface{ Read([]byte) (int, error) }, p SearchParams, 
 
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
-	for sc.Scan() {
+	for !stopped && sc.Scan() {
 		var ev rgEvent
 		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
-			return SearchResult{}, fmt.Errorf("ripgrep json: %w", err)
+			return SearchResult{}, false, fmt.Errorf("ripgrep json: %w", err)
 		}
 		switch ev.Type {
 		case "begin":
 			attach()
 			curFile = normalizeRGPath(ev.Data.Path.Text)
+			if out.Truncated {
+				stopped = true // the full result's last file has ended
+			}
 		case "end":
 			attach()
+			if out.Truncated {
+				stopped = true
+			}
 		case "summary":
 			// Deliberately ignored. rg's --stats "searches" counts files that
 			// matched, not files searched, so it disagrees with the native
@@ -732,6 +850,9 @@ func parseRipgrepJSON(r interface{ Read([]byte) (int, error) }, p SearchParams, 
 			pendingCtx = append(pendingCtx, ctxLine{n: ev.Data.LineNumber, text: text})
 			if len(out.Matches) >= max {
 				out.Truncated = true
+				if p.ContextLines == 0 {
+					stopped = true // nothing further to attach
+				}
 				continue
 			}
 			out.Matches = append(out.Matches, SearchMatch{
@@ -748,10 +869,10 @@ func parseRipgrepJSON(r interface{ Read([]byte) (int, error) }, p SearchParams, 
 	}
 	attach()
 	if err := sc.Err(); err != nil {
-		return SearchResult{}, err
+		return SearchResult{}, false, err
 	}
 	sortMatches(out.Matches)
-	return out, nil
+	return out, stopped, nil
 }
 
 // normalizeRGPath strips the leading "./" rg emits for a relative search.
