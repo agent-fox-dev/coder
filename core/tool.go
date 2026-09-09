@@ -134,9 +134,44 @@ type ToolResult struct {
 	// typed block, and base64 inside a JSON string would be both unreadable
 	// and counted as text tokens.
 	Blocks []ContentBlock `json:"-"`
+
+	// Text is the MODEL-FACING rendering of the result. When non-empty it is
+	// the text block the model reads, verbatim, in place of the JSON envelope;
+	// Data, Error and Detail stay populated for programmatic consumers
+	// (interceptors, the audit trail, an MCP server bridging the tool) and are
+	// unaffected.
+	//
+	// It exists because the envelope is the wrong shape for the results that
+	// dominate an agent's context. A source file inside a JSON string pays for
+	// every newline, tab and quote twice (`\n`, `\t`, `\"`) — 9–13% more
+	// bytes and, because escape sequences tokenize badly, an estimated 15–30%
+	// more tokens on indented code — and the model reads code through a layer
+	// of escaping it then has to undo when it writes an edit. read_file,
+	// execute and search_files set Text; a tool that returns a small
+	// structured value leaves it empty and the envelope is used.
+	//
+	// See docs/errata/tool_result_rendering.md for the divergence from
+	// REQ-TOOL-08's literal reading.
+	Text string `json:"-"`
 }
 
 func OKResult(data map[string]any) ToolResult { return ToolResult{OK: true, Data: data} }
+
+// LLMText is the text the model sees for this result: Text when the tool
+// rendered one, otherwise the REQ-TOOL-08 envelope (ToLLMMap) as JSON. A
+// marshal failure — a Data value that is not JSON-representable — yields a
+// fixed error envelope rather than an empty result, so the transcript never
+// carries a tool_result with no content.
+func (r ToolResult) LLMText() string {
+	if r.Text != "" {
+		return r.Text
+	}
+	payload, err := json.Marshal(r.ToLLMMap())
+	if err != nil {
+		return `{"ok":false,"error":"marshal_failed"}`
+	}
+	return string(payload)
+}
 
 func ErrResult(code, detail string) ToolResult {
 	return ToolResult{OK: false, Error: code, Detail: detail}
