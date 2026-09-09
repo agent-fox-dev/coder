@@ -40,8 +40,20 @@ var VendorAuth = provider.VendorAuth{
 		{Name: "ANTHROPIC_AUTH_TOKEN", Scheme: provider.SchemeBearer},
 		{Name: "ANTHROPIC_OAUTH_TOKEN", Scheme: provider.SchemeBearer},
 		{Name: "ANTHROPIC_API_KEY", Scheme: provider.SchemeAPIKey},
+		// A base URL is configuration, not a credential (REQ-AUTH-03's
+		// "discovery and retrieval are distinct operations"). Sending a proxy
+		// URL as a bearer token is nonsense; its presence still means the
+		// vendor is set up.
+		{Name: VertexBaseURLVar, DiscoveryOnly: true},
 	},
-	BaseURLVar: "ANTHROPIC_BASE_URL",
+	BaseURLVar: BaseURLVar,
+	// Ambient is REQ-AUTH-04 for the Vertex deployment, and it is the fix for
+	// the whole reported symptom: such a deployment authenticates with a
+	// Google OAuth token this process cannot read, so without this it resolves
+	// to CredentialNone and every pre-flight check refuses the run with a
+	// message saying the vendor is unconfigured. It is configured — for a
+	// deployment the table did not know existed.
+	Ambient: VertexSelected,
 }
 
 // Options configures the provider. The zero value is usable.
@@ -54,6 +66,13 @@ type Options struct {
 	Retry  provider.RetryPolicy
 	// Betas are sent as anthropic-beta. BetaCompaction is REQ-PROV-07.
 	Betas []string
+	// VertexProject and VertexLocation select the Vertex AI deployment
+	// (NFR-COMPAT-05). Setting the project is the whole switch: it selects the
+	// Vertex path shape and, with no base URL configured, the regional Vertex
+	// host. Both fall back to the environment — see ResolveVertex — so a
+	// deployment can also flip with no code change at all.
+	VertexProject  string
+	VertexLocation string
 	// Attribution overrides AgentConfig.Attribution for this provider
 	// (REQ-SEC-13.2). Nil means on unless AGENTKIT_TELEMETRY=0.
 	Attribution *bool
@@ -117,6 +136,17 @@ func (c *client) now() time.Time {
 // Go error (REQ-PROV-04) — the signature has no error to return, which is the
 // enforcement rather than a convention.
 func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o core.ProviderStreamOptions) *core.EventStream {
+	// NFR-COMPAT-05: the deployment is resolved from config, never from a
+	// second provider implementation. It is decided HERE rather than in run
+	// because it changes the request BODY as well as the URL, and the body is
+	// serialized below.
+	env := provider.Env{Override: req.Options.Env, Getenv: c.opts.Getenv}
+	vx, err := ResolveVertex(deploymentBase(m, defaultBase(c.opts.BaseURL), env),
+		c.opts.VertexProject, c.opts.VertexLocation, env)
+	if err != nil {
+		return core.ErrorStream(nil, err)
+	}
+
 	retention := core.CacheRetentionShort
 	if o.CacheRetention != "" {
 		retention = o.CacheRetention
@@ -136,6 +166,13 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 		o.Warnf("anthropic: %s", rep.String())
 	}
 	applyThinking(body, m, req.ThinkingLevel)
+	if vx.On() {
+		// The body half of NFR-COMPAT-05's second deployment. The model id is
+		// a URL segment here and the body field is rejected; the version moves
+		// out of the header and into the body.
+		body.Model = ""
+		body.AnthropicVersion = VertexAPIVersion
+	}
 	if c.wantsCompaction() {
 		// REQ-PROV-07: the beta header opts the REQUEST into the feature and
 		// the body names the edit; the server compacts only when both are
@@ -163,11 +200,12 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 	}
 
 	s := core.NewEventStream(core.StreamOptions{})
-	go c.run(ctx, s, m, req, raw)
+	go c.run(ctx, s, m, req, raw, vx)
 	return s
 }
 
-func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, req core.Request, raw []byte) {
+func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, req core.Request,
+	raw []byte, vx Vertex) {
 	d := &decodeState{
 		s: s, model: m, lookup: c.opts.BillingLookup,
 		partial: core.AssistantMessage{
@@ -198,12 +236,30 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 		return
 	}
 
-	url := provider.ResolveBaseURL(m, auth, defaultBase(c.opts.BaseURL)) + "/v1/messages"
+	base := provider.ResolveBaseURL(m, auth, defaultBase(c.opts.BaseURL))
+	if vx.On() {
+		// A Vertex proxy beats a general one: the two name different
+		// upstreams and a machine can carry both.
+		if u := env.Get(VertexBaseURLVar); u != "" {
+			base = strings.TrimRight(u, "/")
+		} else if base == strings.TrimRight(DefaultBaseURL, "/") {
+			// A project configured with no base URL anywhere: follow it to the
+			// Vertex host rather than sending a Vertex path to api.anthropic.com.
+			// An explicitly configured base URL is left exactly as it is.
+			base = vx.BaseURL()
+		}
+		auth = vertexAuth(auth)
+	}
+	url := base + vx.Path(m, true)
 
 	headers := map[string]string{
-		"content-type":      "application/json",
-		"accept":            "text/event-stream",
-		"anthropic-version": APIVersion,
+		"content-type": "application/json",
+		"accept":       "text/event-stream",
+	}
+	if !vx.On() {
+		// Vertex carries the version in the body instead, and rejects a
+		// request that names it in both places.
+		headers["anthropic-version"] = APIVersion
 	}
 	if len(c.opts.Betas) > 0 {
 		headers["anthropic-beta"] = strings.Join(c.opts.Betas, ",")
