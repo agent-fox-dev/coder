@@ -259,8 +259,23 @@ var ErrUnknownCompatKey = errors.New("agentkit: unknown compat key for openai-co
 // dropped without a sound. Failing here turns that into a request that ends
 // with a pre-closed error stream naming the key (REQ-PROV-04).
 func CompatFor(m *core.Model) (Compat, error) {
-	c := InferCompat(m)
-	if len(m.Compat) == 0 {
+	base := ""
+	if m != nil {
+		base = m.BaseURL
+	}
+	return CompatForBase(m, base)
+}
+
+// CompatForBase is CompatFor against the base URL the request will actually
+// go to — the environment override applied (OPENAI_BASE_URL and its vendor
+// siblings, provider.ResolveBaseURL's precedence) — rather than the catalog
+// row's. The provider uses this form: an operator who points an `openai` row
+// at a DeepSeek or Together host through the environment is talking to that
+// host, and inferring the profile from the row's URL sends it api.openai.com's
+// `store` and developer role, which those hosts reject.
+func CompatForBase(m *core.Model, base string) (Compat, error) {
+	c := inferCompat(m, base)
+	if m == nil || len(m.Compat) == 0 {
 		return c, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(m.Compat))
@@ -272,18 +287,26 @@ func CompatFor(m *core.Model) (Compat, error) {
 }
 
 // InferCompat is the Provider+BaseURL half of REQ-PROV-12: the profile a
-// model gets before its catalog row says anything.
+// model gets before its catalog row says anything, read from the row's own
+// BaseURL. See CompatForBase for the resolved form.
 //
 // Every departure from DefaultCompat below is a row of the REQ-PROV-12 table.
 // "OpenAI-compatible" is not a base-URL swap: the first request to any of
 // these hosts with the api.openai.com profile 400s on `store`, or on the
 // developer role, or on max_completion_tokens.
 func InferCompat(m *core.Model) Compat {
+	if m == nil {
+		return DefaultCompat()
+	}
+	return inferCompat(m, m.BaseURL)
+}
+
+func inferCompat(m *core.Model, base string) Compat {
 	c := DefaultCompat()
 	if m == nil {
 		return c
 	}
-	host := strings.ToLower(hostOf(m.BaseURL))
+	host := strings.ToLower(hostOf(base))
 	vendor := strings.ToLower(m.Provider)
 	if host == "" || host == "api.openai.com" {
 		return c
@@ -403,7 +426,7 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 	if r := req.Options.CacheRetention; r != nil {
 		retention = *r
 	}
-	out, rep, _, _, err := buildRequest(m, req, retention, nil)
+	out, rep, _, _, err := buildRequest(m, req, retention, nil, m.BaseURL)
 	return out, rep, err
 }
 
@@ -417,14 +440,17 @@ func BuildRequest(m *core.Model, req core.Request) (*request, provider.RepairRep
 // re-serializing every schema on every turn for bytes that had not changed.
 func BuildRequestCached(m *core.Model, req core.Request, retention core.CacheRetention,
 	prefix *provider.ToolPrefix) (*request, provider.RepairReport, provider.SyncReport, error) {
-	out, rep, _, sync, err := buildRequest(m, req, retention, prefix)
+	out, rep, _, sync, err := buildRequest(m, req, retention, prefix, m.BaseURL)
 	return out, rep, sync, err
 }
 
+// buildRequest builds against base, the URL the request will go to: the
+// compat profile is inferred from THAT host (CompatForBase), not the catalog
+// row's.
 func buildRequest(m *core.Model, req core.Request, retention core.CacheRetention,
-	prefix *provider.ToolPrefix) (*request, provider.RepairReport, Compat, provider.SyncReport, error) {
+	prefix *provider.ToolPrefix, base string) (*request, provider.RepairReport, Compat, provider.SyncReport, error) {
 	var sync provider.SyncReport
-	compat, err := CompatFor(m)
+	compat, err := CompatForBase(m, base)
 	if err != nil {
 		return nil, provider.RepairReport{}, compat, sync, err
 	}
@@ -488,10 +514,11 @@ func buildRequest(m *core.Model, req core.Request, retention core.CacheRetention
 	}
 	applyThinkingBudget(out, m, req.ThinkingLevel, compat)
 
-	// REQ-CACHE-10, third arm: this wire has neither Anthropic's
-	// defer_loading nor Responses' additional_tools, so a tool that appeared
-	// mid-session is WITHHELD from the tools array here and re-declared in a
-	// system message at its transcript position (deferredDeclaration above).
+	// REQ-CACHE-10, third arm: this wire has no defer_loading (nor does the
+	// Responses API have the additional_tools the PRD named, ruling L-10), so
+	// a tool that appeared mid-session is WITHHELD from the tools array here
+	// and re-declared in a system message at its transcript position
+	// (deferredDeclaration above).
 	// Prepending it to the array instead would rewrite the cached prefix and
 	// cost the whole provider-side cache over one added tool.
 	byName := make(map[string]int, len(req.Tools))
@@ -622,10 +649,18 @@ func encodeSchemas(tools []core.ToolWire, supportsStrict bool,
 		if t, ok := plan[s]; ok {
 			s = t
 		}
+		if s == nil {
+			// A tool with no schema takes no arguments; `parameters: null`
+			// is a 400, and an empty object is what the API documents.
+			return json.RawMessage(EmptyParameters), nil
+		}
 		return json.Marshal(s)
 	})
 	return raws, strict, rep, err
 }
+
+// EmptyParameters is the schema sent for a tool with no InputSchema.
+const EmptyParameters = `{"type":"object","properties":{}}`
 
 // strictTarget is REQ-TOOL-03 for this wire: the schema is PROBED through the
 // strict-subset rewrite before anything is sent, and strict:true is emitted
@@ -765,9 +800,7 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat,
 				case core.ThinkingBlock:
 					// REQ-PROV-12 ThinkingFormat: the wire shape for reasoning
 					// REPLAY. Only DeepSeek documents a round trip, so only
-					// that arm emits one; the rest degrade the block to text,
-					// which is REQ-PROV-11 rule 3/4's own answer to a block
-					// this target cannot replay.
+					// that arm emits one; every other profile DROPS the block.
 					//
 					//	deepseek       reasoning_content on the assistant message
 					//	openai         no replay field on this wire at all
@@ -781,12 +814,18 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat,
 					//
 					// Inventing a field for the others would either 400 or be
 					// silently ignored, and being silently ignored is worse:
-					// the chain looks replayed and is not.
-					switch compat.ThinkingFormat {
-					case "deepseek":
+					// the chain looks replayed and is not. Folding the text
+					// into `content` is worse still: the model is then
+					// conditioned on its own reasoning as if it had SAID it,
+					// re-sent and re-billed on every later turn, and learns to
+					// emit reasoning as answer text. A block only reaches
+					// this arm on a same-model replay (the decoder's marker
+					// signature survives REQ-PROV-11 rule 4 for exactly that
+					// case; rule 3 downgrades it for any other model), and a
+					// same-model replay that cannot carry the chain carries
+					// nothing.
+					if compat.ThinkingFormat == "deepseek" {
 						reasoning.WriteString(bv.Thinking)
-					default:
-						text.WriteString(bv.Thinking)
 					}
 				case core.ToolUseBlock:
 					msg.ToolCalls = append(msg.ToolCalls, toolCall{
@@ -886,10 +925,10 @@ type deferredDecl struct {
 //
 // Prose is the only declaration this wire has: `tools` is a prefix-position
 // array, so a tool added mid-session cannot be declared at its transcript
-// position any other way. It is weaker than Anthropic's defer_loading and the
-// Responses API's additional_tools — the model may call a tool that is not in
-// the array, which some servers reject — and it is still cheaper than
-// rewriting the cached prefix.
+// position any other way. It is weaker than Anthropic's defer_loading — the
+// model may call a tool that is not in the array, which some servers reject —
+// and it is still cheaper than rewriting the cached prefix. The Responses
+// wire shares it (ruling L-10).
 func deferredDeclaration(deferred []core.ToolWire, schemas []json.RawMessage, all []core.ToolWire,
 	compat Compat) *deferredDecl {
 	if len(deferred) == 0 {

@@ -125,22 +125,62 @@ func toolNames(t *testing.T, body map[string]any, key string) []string {
 	return out
 }
 
-// TestADeferredToolRidesInAdditionalTools is REQ-CACHE-10's Responses arm.
+// TestADeferredToolIsWithheldFromToolsAndDeclaredInProse is REQ-CACHE-10's
+// Responses arm, corrected.
 //
 // `tools` is the head of the cached prompt prefix, so a tool that appeared
-// mid-session must not be prepended to it: declaring it in additional_tools
-// leaves the prefix byte-identical to the previous turn's, where prepending
-// costs the whole provider-side cache over one added tool.
-func TestADeferredToolRidesInAdditionalTools(t *testing.T) {
-	body := send(t, openairesponses.Options{}, deferredRequest(t),
+// mid-session must not be prepended to it. The PRD's `additional_tools`
+// parameter does not exist on this wire (ruling L-10): a request carrying it
+// is rejected, or the field is dropped and the model can neither see nor call
+// the tool. The declaration therefore rides as a system message item placed
+// after the tool-result run that introduced it — the same prose arm the Chat
+// Completions wire uses — and `tools` stays byte-identical to the previous
+// turn's.
+func TestADeferredToolIsWithheldFromToolsAndDeclaredInProse(t *testing.T) {
+	req := deferredRequest(t)
+	// A user turn AFTER the run: the declaration must land between the
+	// results and it, not at the end of the transcript.
+	req.Messages = append(req.Messages,
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "now query"}}})
+	body := send(t, openairesponses.Options{}, req,
 		ev("response.completed", `{"response":{}}`))
 
 	if got := toolNames(t, body, "tools"); len(got) != 1 || got[0] != "read_file" {
 		t.Fatalf("tools = %v, want only the established tool: a late arrival in the prefix "+
 			"invalidates the cache", got)
 	}
-	if got := toolNames(t, body, "additional_tools"); len(got) != 1 || got[0] != "mcp__db__query" {
-		t.Fatalf("additional_tools = %v, want the tool the transcript introduced", got)
+	if _, present := body["additional_tools"]; present {
+		t.Fatalf("additional_tools = %v was sent; the Responses API has no such parameter",
+			body["additional_tools"])
+	}
+
+	its := items(t, body)
+	var types []string
+	for _, it := range its {
+		kind, _ := it["type"].(string)
+		if role, _ := it["role"].(string); role != "" {
+			kind += ":" + role
+		}
+		types = append(types, kind)
+	}
+	// The declaration lands AFTER the tool-result run (and the synthetic
+	// results REQ-PROV-11 may add), never ahead of the cached prefix.
+	want := "message:user,function_call,function_call_output,message:system,message:user"
+	if strings.Join(types, ",") != want {
+		t.Fatalf("items = %v, want %v: the declaration belongs at the transcript position "+
+			"where the tool appeared", types, want)
+	}
+	decl := its[3]
+	parts, _ := decl["content"].([]any)
+	if len(parts) != 1 {
+		t.Fatalf("declaration content = %v, want one input_text part", decl["content"])
+	}
+	text, _ := parts[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "mcp__db__query") || !strings.Contains(text, "sql") {
+		t.Fatalf("declaration = %q, want the withheld tool and its parameters", text)
+	}
+	if strings.Contains(text, "read_file") {
+		t.Fatalf("declaration = %q, want only the DEFERRED tools re-declared", text)
 	}
 }
 
@@ -155,8 +195,9 @@ func TestWhenEveryToolWouldBeDeferredTheyArePromoted(t *testing.T) {
 	if got := toolNames(t, body, "tools"); len(got) != 1 || got[0] != "mcp__db__query" {
 		t.Fatalf("tools = %v, want the promoted tool", got)
 	}
-	if _, present := body["additional_tools"]; present {
-		t.Fatalf("additional_tools = %v, want nothing deferred once the valve fires",
-			body["additional_tools"])
+	for _, it := range items(t, body) {
+		if it["role"] == "system" {
+			t.Fatalf("a declaration item was emitted for a promoted tool: %v", it)
+		}
 	}
 }

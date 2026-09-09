@@ -2,6 +2,8 @@ package google
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -199,36 +201,56 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 	}
 
 	// §6.2a Level 1 / NFR-PERF-08. The lookup is a map read and a mutex: if
-	// the resource for this prefix exists it is referenced and the prefix is
-	// withheld from the body; if creation is still in flight — or has never
-	// started — this request goes out uncached. Nothing here waits.
+	// the resource for this prefix exists and has not expired it is
+	// referenced and the prefix is withheld from the body; if creation is
+	// still in flight — or has never started — this request goes out
+	// uncached. Nothing here waits.
 	job := c.contextCacheJob(m, body)
-	if job != nil && c.attachCachedContent(body, job) {
-		job = nil
+	var attached *cacheRef
+	if job != nil {
+		if attached = c.attachCachedContent(body, job); attached != nil {
+			job = nil
+		}
 	}
 
-	var payload any = body
-	if fn := req.Options.OnPayload; fn != nil {
-		out, perr := fn(body, m)
-		if perr != nil {
-			return core.ErrorStream(nil, perr)
+	encode := func(body *request) ([]byte, error) {
+		var payload any = body
+		if fn := req.Options.OnPayload; fn != nil {
+			out, perr := fn(body, m)
+			if perr != nil {
+				return nil, perr
+			}
+			if out != nil {
+				payload = out
+			}
 		}
-		if out != nil {
-			payload = out
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("google: encoding request: %w", err)
 		}
+		return raw, nil
 	}
-	raw, err := json.Marshal(payload)
+	raw, err := encode(body)
 	if err != nil {
-		return core.ErrorStream(nil, fmt.Errorf("google: encoding request: %w", err))
+		return core.ErrorStream(nil, err)
+	}
+	// The uncached form of the same request, encoded only if the cached one
+	// is refused (run): a resource the service no longer holds is a 4xx on a
+	// request that was otherwise fine.
+	var fallback func() ([]byte, error)
+	if attached != nil {
+		uncached := *body
+		attached.restore(&uncached)
+		fallback = func() ([]byte, error) { return encode(&uncached) }
 	}
 
 	s := core.NewEventStream(core.StreamOptions{})
-	go c.run(ctx, s, m, req, raw, job)
+	go c.run(ctx, s, m, req, raw, job, attached, fallback)
 	return s
 }
 
 func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, req core.Request,
-	raw []byte, job *cacheJob) {
+	raw []byte, job *cacheJob, attached *cacheRef, fallback func() ([]byte, error)) {
 	now := time.Now
 	if c.opts.Now != nil {
 		now = c.opts.Now
@@ -321,6 +343,28 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 		}
 		d.fail(provider.TransportErrorText("google", caller, ctx, err), err)
 		return
+	}
+	if attached != nil && fallback != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		// The request referenced a CachedContent resource and the service
+		// refused it: the resource expired or was deleted under us, or the
+		// service rejected the pairing. The entry is cleared — the next turn
+		// starts a fresh creation — and THIS turn is retried once without
+		// the reference rather than failed for a cache it never needed.
+		resp.Body.Close()
+		c.entry(attached.key).clear(attached.name)
+		if call.Body, err = fallback(); err != nil {
+			d.fail(err.Error(), err)
+			return
+		}
+		attached = nil
+		if resp, err = call.Do(ctx); err != nil {
+			if errors.Is(err, provider.ErrRetryDelayTooLong) {
+				d.fail(err.Error(), err)
+				return
+			}
+			d.fail(provider.TransportErrorText("google", caller, ctx, err), err)
+			return
+		}
 	}
 	defer resp.Body.Close()
 
@@ -434,20 +478,46 @@ type decoder struct {
 	blocks   []core.ContentBlock
 	textIdx  int // index into blocks of the open text block, -1 when none
 	thinkIdx int
+	// textBuf and thinkBuf accumulate the open text and thought blocks.
+	// Builder.String() is a view, not a copy, so refreshing the block after
+	// each delta is O(delta); appending to the block's own string was O(block)
+	// per delta and quadratic over a long answer.
+	textBuf  strings.Builder
+	thinkBuf strings.Builder
 	usage    core.Usage
 	finishRs string
 	respID   string
 	respMod  string
 	calls    int
 	sawAny   bool
+	// nonce scopes synthesized tool-call ids when the response carries no id
+	// of its own; see callScope.
+	nonce string
 }
+
+// ThoughtMarkerSignature marks a Gemini thought part that arrived WITHOUT a
+// thoughtSignature.
+//
+// It is not a credential and replays nothing: the encoder drops a block
+// carrying it (encodeParts), because on this wire only the signature on a
+// functionCall part matters to the model. It exists so the block is not
+// demoted to text by REQ-PROV-11 rule 4 and re-sent as the model's own
+// visible prose on every later turn — re-billed each time, and conditioning
+// the model on its reasoning as if it had said it. Rule 3 still downgrades
+// it for another model, where the text is at least real context.
+const ThoughtMarkerSignature = "google-generative-ai/thought"
 
 func (d *decoder) consume(r *provider.SSEReader) error {
 	d.textIdx, d.thinkIdx = -1, -1
 	for {
 		ev, err := r.Next()
 		if err == io.EOF {
-			if !d.sawAny {
+			if !d.sawAny || d.finishRs == "" {
+				// A finishReason on the final candidate is this wire's
+				// terminal signal. Without it the stream stopped before the
+				// model did, and what arrived is a partial turn — a partial
+				// functionCall included, which reported as tool_use would be
+				// executed.
 				return provider.ErrSSETruncated
 			}
 			return nil
@@ -533,11 +603,15 @@ func (d *decoder) chunk(data []byte) error {
 			case p.Thought:
 				if d.thinkIdx < 0 {
 					d.thinkIdx = len(d.blocks)
-					d.blocks = append(d.blocks, core.ThinkingBlock{Signature: p.ThoughtSignature})
+					d.thinkBuf.Reset()
+					// The marker until a real signature arrives; a later
+					// part's signature replaces it.
+					d.blocks = append(d.blocks, core.ThinkingBlock{Signature: ThoughtMarkerSignature})
 					d.s.Push(core.ThinkingStartEvent{BlockIndex: d.thinkIdx})
 				}
 				tb := d.blocks[d.thinkIdx].(core.ThinkingBlock)
-				tb.Thinking += p.Text
+				d.thinkBuf.WriteString(p.Text)
+				tb.Thinking = d.thinkBuf.String()
 				if p.ThoughtSignature != "" {
 					tb.Signature = p.ThoughtSignature
 				}
@@ -559,13 +633,23 @@ func (d *decoder) chunk(data []byte) error {
 			case p.Text != "":
 				if d.textIdx < 0 {
 					d.textIdx = len(d.blocks)
+					d.textBuf.Reset()
 					d.blocks = append(d.blocks, core.TextBlock{})
 					d.s.Push(core.TextStartEvent{BlockIndex: d.textIdx})
 				}
 				tb := d.blocks[d.textIdx].(core.TextBlock)
-				tb.Text += p.Text
+				d.textBuf.WriteString(p.Text)
+				tb.Text = d.textBuf.String()
 				d.blocks[d.textIdx] = tb
 				d.s.Push(core.TextDeltaEvent{BlockIndex: d.textIdx, Delta: p.Text})
+				changed = true
+				if p.ThoughtSignature != "" {
+					d.keepSignature(p.ThoughtSignature)
+				}
+
+			case p.ThoughtSignature != "":
+				// A part carrying nothing but a signature.
+				d.keepSignature(p.ThoughtSignature)
 				changed = true
 			}
 		}
@@ -578,17 +662,48 @@ func (d *decoder) chunk(data []byte) error {
 	return nil
 }
 
-// callScope namespaces a synthesized tool-call id. Falling back to the model
-// version keeps ids stable for a golden test while still varying per response
-// wherever the API supplies a responseId.
+// keepSignature records a thoughtSignature that arrived on a part the
+// canonical layer has no signature field for — a text part, or a part that
+// is nothing but the signature.
+//
+// Gemini 3 attaches the turn's signature to the LAST text part when the turn
+// makes no function call, and a replay without it loses the chain (and on
+// some models is rejected). A ThinkingBlock carrying only the signature is
+// emitted at that position; the encoder sends it back as a signature-only
+// part. It is a REAL signature, never the marker, so rule 4 keeps it.
+func (d *decoder) keepSignature(sig string) {
+	idx := len(d.blocks)
+	d.blocks = append(d.blocks, core.ThinkingBlock{Signature: sig})
+	d.s.Push(core.ThinkingStartEvent{BlockIndex: idx})
+	// The signature closes the text run it rode on: later text is a new
+	// block, so the signature stays at the position it arrived in.
+	d.textIdx, d.thinkIdx = -1, -1
+}
+
+// callScope namespaces a synthesized tool-call id so two turns cannot mint
+// the same one — the repair pass keys results by id, and a repeat lets a
+// result answer the wrong call. The response id is the scope wherever the
+// API supplies one; without it a per-response nonce is minted rather than
+// falling back to the model name, which repeated "<model>-0" on every turn.
 func (d *decoder) callScope() string {
 	if d.respID != "" {
 		return d.respID
 	}
-	if d.respMod != "" {
-		return d.respMod
+	if d.nonce == "" {
+		d.nonce = newNonce()
 	}
-	return "call"
+	if d.respMod != "" {
+		return d.respMod + "-" + d.nonce
+	}
+	return "call-" + d.nonce
+}
+
+func newNonce() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 func (d *decoder) finish(m *core.Model, lookup func(string) *core.Model) {

@@ -64,10 +64,12 @@ const reasoningSSE = "data: " +
 // ThinkingFormat, end to end: decode a reasoning turn, then replay it.
 //
 // DeepSeek is the one profile that documents the round trip, so it is the one
-// profile that emits reasoning_content back. Everywhere else the block reaches
-// the model as TEXT — REQ-PROV-11 rule 3/4's own answer to a block this target
-// cannot replay — because inventing a field the vendor does not read is worse
-// than degrading: the chain looks replayed and is not.
+// profile that emits reasoning_content back. Everywhere else the block is
+// DROPPED on a same-model replay: inventing a field the vendor does not read
+// is worse than dropping — the chain looks replayed and is not — and folding
+// the reasoning into `content` is worse still, because the model is then
+// conditioned on its own chain as visible prose, re-sent and re-billed on
+// every later turn.
 func TestOnlyTheDeepSeekProfileReplaysReasoningContent(t *testing.T) {
 	ds := model("deepseek", "deepseek-reasoner", "https://api.deepseek.com")
 	msg := drive(t, ds, reasoningSSE)
@@ -86,6 +88,16 @@ func TestOnlyTheDeepSeekProfileReplaysReasoningContent(t *testing.T) {
 	// Same transcript, a profile with no documented replay shape.
 	oa := model("openai", "gpt-4o", "https://api.openai.com/v1")
 	msg = drive(t, oa, reasoningSSE)
+	var think *core.ThinkingBlock
+	for _, b := range msg.Content {
+		if tb, ok := b.(core.ThinkingBlock); ok {
+			think = &tb
+		}
+	}
+	if think == nil || think.Signature != openai.ReasoningMarkerSignature {
+		t.Fatalf("decoded thinking = %+v, want the block carrying the marker signature that "+
+			"keeps REQ-PROV-11 rule 4 from demoting it to text", think)
+	}
 	req = core.Request{Messages: core.Messages{
 		core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}, *msg}}
 	assistant = messagesOf(t, body(t, oa, req))[1]
@@ -94,9 +106,170 @@ func TestOnlyTheDeepSeekProfileReplaysReasoningContent(t *testing.T) {
 			"not read it", assistant)
 	}
 	text, _ := assistant["content"].(string)
-	if !strings.Contains(text, "weighing it") || !strings.Contains(text, "answer") {
-		t.Fatalf("assistant content = %q, want the thinking degraded to text rather than "+
-			"dropped (REQ-PROV-11 rule 3/4 semantics)", text)
+	if strings.Contains(text, "weighing it") {
+		t.Fatalf("assistant content = %q: the model's reasoning was re-sent as its own "+
+			"visible prose", text)
+	}
+	if text != "answer" {
+		t.Fatalf("assistant content = %q, want the answer alone", text)
+	}
+
+	// Cross-model, rule 3 still applies: another model gets the text.
+	other := model("openai", "gpt-4o-mini", "https://api.openai.com/v1")
+	assistant = messagesOf(t, body(t, other, req))[1]
+	if text, _ := assistant["content"].(string); !strings.Contains(text, "weighing it") {
+		t.Fatalf("assistant content = %q on ANOTHER model, want the reasoning downgraded "+
+			"to text by REQ-PROV-11 rule 3", text)
+	}
+}
+
+// TestAStreamCutBeforeItsTerminalSignalIsTruncated is REQ-PROV-04 with the
+// case that matters: the connection drops mid tool call. Salvage turns the
+// partial arguments into valid JSON, and a stream reported as a normal
+// tool_use turn would then EXECUTE that call with whatever survived the cut.
+// No [DONE] and no finish_reason on any choice is a stream the model did not
+// finish; a gateway that omits [DONE] but sends finish_reason is fine.
+func TestAStreamCutBeforeItsTerminalSignalIsTruncated(t *testing.T) {
+	oa := model("openai", "gpt-4o", "https://api.openai.com/v1")
+	cut := "data: " +
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"Hello"}}]}` + "\n\n" +
+		"data: " +
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"delete_file","arguments":"{\"path\":\"/etc/pa"}}]}}]}` + "\n\n"
+	msg := drive(t, oa, cut)
+	if msg.StopReason != core.StopReasonError {
+		t.Fatalf("stop = %q (%q), want error: neither [DONE] nor a finish_reason arrived, and "+
+			"reporting tool_use would execute a call cut off mid-argument",
+			msg.StopReason, msg.ErrorMessage)
+	}
+	if !strings.Contains(msg.ErrorMessage, "stream ended before") {
+		t.Fatalf("error = %q, want the truncation text the REQ-PROV-14 allowlist retries on",
+			msg.ErrorMessage)
+	}
+	if msg.Content.Text() != "Hello" {
+		t.Fatalf("content = %q, want the partial text kept alongside the failure", msg.Content.Text())
+	}
+
+	// finish_reason without [DONE] is a complete turn.
+	noDone := "data: " +
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":"stop"}]}` + "\n\n"
+	msg = drive(t, oa, noDone)
+	if msg.StopReason != core.StopReasonStop {
+		t.Fatalf("stop = %q (%q), want stop: a gateway that omits [DONE] but sends "+
+			"finish_reason delivered a whole turn", msg.StopReason, msg.ErrorMessage)
+	}
+
+	// A profile whose finish_reason cannot be trusted has no terminal signal
+	// to demand; content stays the evidence there.
+	untrusted := model("openai", "gpt-4o", "https://api.openai.com/v1")
+	untrusted.Compat = json.RawMessage(`{"supports_finish_reason": false}`)
+	msg = drive(t, untrusted, "data: "+
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"Hello"}}]}`+"\n\n")
+	if msg.StopReason != core.StopReasonStop {
+		t.Fatalf("stop = %q on a profile that never emits finish_reason, want stop", msg.StopReason)
+	}
+}
+
+// TestAToolCallIsDecodedOnceNotOnEveryChunk is NFR-PERF on the per-chunk
+// snapshot: every MessageUpdateEvent used to re-parse and re-salvage every
+// tool call from its first byte, so a long argument stream cost O(n²). The
+// snapshot now carries the last decoded value — an empty call until the
+// arguments close, the real one after — and decodes once.
+func TestAToolCallIsDecodedOnceNotOnEveryChunk(t *testing.T) {
+	oa := model("openai", "gpt-4o", "https://api.openai.com/v1")
+	chunk := func(args string) string {
+		return "data: " + `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"edit","arguments":"` + args + `"}}]}}]}` + "\n\n"
+	}
+	sse := chunk(`{\"path\":`) + chunk(`\"a.go\",`) + chunk(`\"body\":\"x}y\"}`) +
+		"data: " + `{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	req := userReq()
+	req.Options.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader(sse))}, nil
+	})
+	s := openai.Provider(openai.Options{Getenv: func(string) string { return "k" }}).
+		Stream(context.Background(), oa, req, core.ProviderStreamOptions{})
+	var inputs []string
+	for e := range s.Events() {
+		if u, ok := e.(core.MessageUpdateEvent); ok {
+			for _, b := range u.Message.Content {
+				if tu, ok := b.(core.ToolUseBlock); ok {
+					inputs = append(inputs, string(tu.Input))
+				}
+			}
+		}
+	}
+	if len(inputs) != 3 {
+		t.Fatalf("%d snapshots carried the call, want one per chunk: %v", len(inputs), inputs)
+	}
+	// The first two snapshots carry the value as last decoded — nothing yet,
+	// so an empty call — and NOT a salvage of the partial bytes.
+	for _, in := range inputs[:2] {
+		if in != "{}" {
+			t.Fatalf("snapshot input = %s before the arguments closed, want {} — the last "+
+				"decoded value, not a per-chunk re-parse of the partial bytes", in)
+		}
+	}
+	if inputs[2] != `{"path":"a.go","body":"x}y"}` {
+		t.Fatalf("snapshot input = %s once the object closed, want the whole call: a brace "+
+			"inside a string must not close it early", inputs[2])
+	}
+	final := core.ExtractToolUse(s.Result())
+	if len(final) != 1 || string(final[0].Input) != `{"path":"a.go","body":"x}y"}` {
+		t.Fatalf("final call = %+v", final)
+	}
+}
+
+// TestTheProfileFollowsTheEnvironmentsBaseURL is REQ-PROV-12 read with
+// provider.ResolveBaseURL's precedence: OPENAI_BASE_URL beats the catalog row,
+// so the profile must be inferred from the host the request actually reaches.
+// A row that names api.openai.com pointed at DeepSeek through the environment
+// was sending `store` and the developer role, which DeepSeek rejects.
+func TestTheProfileFollowsTheEnvironmentsBaseURL(t *testing.T) {
+	m := model("openai", "deepseek-chat", "https://api.openai.com/v1")
+	var got string
+	req := core.Request{
+		System:   []core.ContentBlock{core.TextBlock{Text: "sys"}},
+		Messages: userReq().Messages,
+		Options: core.RequestOptions{
+			Env: map[string]string{"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "https://api.deepseek.com"},
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				b, _ := io.ReadAll(r.Body)
+				got = string(b)
+				return &http.Response{StatusCode: 200, Header: http.Header{},
+					Body: io.NopCloser(strings.NewReader("data: [DONE]\n\n"))}, nil
+			}),
+		},
+	}
+	openai.Provider(openai.Options{}).Stream(context.Background(), m, req, core.ProviderStreamOptions{}).Result()
+	if got == "" {
+		t.Fatal("no request was sent")
+	}
+	if strings.Contains(got, `"store"`) {
+		t.Fatalf("store was sent to the DeepSeek host the environment selected: %s", got)
+	}
+	if strings.Contains(got, `"developer"`) {
+		t.Fatalf("the developer role was sent to the DeepSeek host the environment selected: %s", got)
+	}
+	c, err := openai.CompatForBase(m, "https://api.deepseek.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.UseMaxTokens || c.ThinkingFormat != "deepseek" {
+		t.Fatalf("CompatForBase = %+v, want the DeepSeek row", c)
+	}
+}
+
+// TestAToolWithNoSchemaSendsAnEmptyObjectNotNull: `parameters: null` is a 400.
+func TestAToolWithNoSchemaSendsAnEmptyObjectNotNull(t *testing.T) {
+	req := userReq()
+	req.Tools = []core.ToolWire{{Name: "ping", Description: "no arguments"}}
+	got := body(t, model("openai", "gpt-4o", "https://api.openai.com/v1"), req)
+	fn := got["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	params, ok := fn["parameters"].(map[string]any)
+	if !ok || params["type"] != "object" {
+		t.Fatalf("parameters = %#v, want an empty object schema, never null", fn["parameters"])
 	}
 }
 

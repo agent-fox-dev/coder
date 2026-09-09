@@ -3,6 +3,7 @@ package openairesponses
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
@@ -46,23 +47,23 @@ func DecodeResponse(m *core.Model, body []byte, lookup func(string) *core.Model)
 	for _, it := range w.Output {
 		switch it.Type {
 		case "message":
-			var text string
+			var text strings.Builder
 			for _, c := range it.Content {
-				text += c.Text
+				text.WriteString(c.Text)
 			}
-			if text != "" {
-				out.Content = append(out.Content, core.TextBlock{Text: text})
+			if text.Len() > 0 {
+				out.Content = append(out.Content, core.TextBlock{Text: text.String()})
 			}
 		case "reasoning":
-			var summary string
+			var summary strings.Builder
 			for _, sp := range it.Summary {
-				summary += sp.Text
+				summary.WriteString(sp.Text)
 			}
 			sig := EncodeThinkingSignature(it.ID, it.EncryptedContent)
-			if summary == "" && sig == "" {
+			if summary.Len() == 0 && sig == "" {
 				continue
 			}
-			out.Content = append(out.Content, core.ThinkingBlock{Thinking: summary, Signature: sig})
+			out.Content = append(out.Content, core.ThinkingBlock{Thinking: summary.String(), Signature: sig})
 		case "function_call":
 			args, _ := provider.SalvageJSON([]byte(it.Arguments))
 			blk, err := core.NewToolUse(JoinID(it.CallID, it.ID), it.Name, args)

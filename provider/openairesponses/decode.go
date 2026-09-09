@@ -33,14 +33,20 @@ const (
 var ErrTruncated = errors.New("openai-responses: stream ended before response.completed")
 
 type streamEvent struct {
-	Type        string          `json:"type"`
-	OutputIndex int             `json:"output_index"`
-	ItemID      string          `json:"item_id"`
-	Delta       string          `json:"delta"`
-	Item        *wireItem       `json:"item"`
-	Response    *wireResponse   `json:"response"`
-	Error       *wireError      `json:"error"`
-	Raw         json.RawMessage `json:"-"`
+	Type        string        `json:"type"`
+	OutputIndex int           `json:"output_index"`
+	ItemID      string        `json:"item_id"`
+	Delta       string        `json:"delta"`
+	Item        *wireItem     `json:"item"`
+	Response    *wireResponse `json:"response"`
+	Error       *wireError    `json:"error"`
+	// Code and Message are the `error` EVENT's own shape: it carries them at
+	// the top level, beside `type`, not under an `error` object as a failed
+	// HTTP body does. A decoder reading only the nested form reports "stream
+	// reported an error" for every error the stream actually named.
+	Code    string          `json:"code"`
+	Message string          `json:"message"`
+	Raw     json.RawMessage `json:"-"`
 }
 
 type wireError struct {
@@ -72,6 +78,8 @@ type wireResponse struct {
 	Incomplete  *struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
+	// Error is where response.failed says why: response.error.message.
+	Error *wireError `json:"error"`
 }
 
 // wireUsage is this wire's usage shape. The field NAMES differ from Chat
@@ -244,16 +252,41 @@ func (d *decoder) event(ev provider.SSEEvent) error {
 		d.closed = true
 		d.response(e)
 		if e.Response != nil && e.Response.Status == "failed" {
-			return errors.New("openai-responses: response failed")
+			return errors.New("openai-responses: response failed" +
+				errorDetail(e.Response.Error, "", ""))
 		}
 
 	case evError:
 		if e.Error != nil {
-			return fmt.Errorf("openai-responses: %s: %s", e.Error.Code, e.Error.Message)
+			return errors.New("openai-responses: stream reported an error" +
+				errorDetail(e.Error, "", ""))
 		}
-		return errors.New("openai-responses: stream reported an error")
+		return errors.New("openai-responses: stream reported an error" +
+			errorDetail(nil, e.Code, e.Message))
 	}
 	return nil
+}
+
+// errorDetail renders whichever of the nested object or the top-level pair
+// carried the server's text, as ": code: message" — the text is what the
+// REQ-PROV-14 classifier and the operator both read, and an error event that
+// named a rate limit was reaching them as an anonymous failure.
+func errorDetail(e *wireError, code, message string) string {
+	if e != nil {
+		code, message = e.Code, e.Message
+		if code == "" {
+			code = e.Type
+		}
+	}
+	switch {
+	case code != "" && message != "":
+		return ": " + code + ": " + message
+	case message != "":
+		return ": " + message
+	case code != "":
+		return ": " + code
+	}
+	return ""
 }
 
 func (d *decoder) startOnce(b *blockState) {

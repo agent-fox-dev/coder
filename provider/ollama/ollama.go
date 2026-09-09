@@ -200,6 +200,9 @@ func NormalizeToolCallID(s string) string {
 	return out
 }
 
+// EmptyParameters is the schema sent for a tool with no InputSchema.
+const EmptyParameters = `{"type":"object","properties":{}}`
+
 // Path is the native chat endpoint. It is NOT /v1/chat/completions — see the
 // package doc for why that endpoint is not used.
 const Path = "/api/chat"
@@ -233,10 +236,10 @@ func BuildRequestCached(m *core.Model, req core.Request, prefix *provider.ToolPr
 	compat := CompatFor(m)
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeToolCallID))
 
-	// REQ-CACHE-10, third arm. /api/chat has neither Anthropic's
-	// defer_loading nor Responses' additional_tools, so a tool added
-	// mid-session is WITHHELD from the top-level tools array and re-declared
-	// in a system message placed after the tool-result run that introduced it.
+	// REQ-CACHE-10, third arm. /api/chat has no defer_loading, so a tool
+	// added mid-session is WITHHELD from the top-level tools array and
+	// re-declared in a system message placed after the tool-result run that
+	// introduced it.
 	// Prepending it to the array instead would rewrite the cached prefix.
 	split := provider.SplitDeferredTools(req.Tools, req.Messages)
 	// ONE Sync over the whole tool list, before the split. Syncing the two
@@ -244,6 +247,11 @@ func BuildRequestCached(m *core.Model, req core.Request, prefix *provider.ToolPr
 	// reporting a prefix invalidation on every turn and evicting the very
 	// entries the cache exists to keep.
 	schemas, srep, err := prefix.SyncWith(req.Tools, func(s *schema.Schema) (json.RawMessage, error) {
+		if s == nil {
+			// A tool with no schema takes no arguments; `parameters: null`
+			// is rejected, and an empty object is what the server documents.
+			return json.RawMessage(EmptyParameters), nil
+		}
 		return json.Marshal(s)
 	})
 	if err != nil {
@@ -419,7 +427,7 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat,
 
 		case core.AssistantMessage:
 			msg := message{Role: "assistant"}
-			var text strings.Builder
+			var text, thinking strings.Builder
 			for _, b := range v.Content {
 				switch bv := b.(type) {
 				case core.TextBlock:
@@ -427,8 +435,11 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat,
 				case core.ThinkingBlock:
 					// Replayed under its own key, never merged into content:
 					// concatenating reasoning into the answer teaches the
-					// model to emit reasoning as answer text.
-					msg.Thinking += bv.Thinking
+					// model to emit reasoning as answer text. A block reaches
+					// this arm only on a same-model replay — the decoder's
+					// marker signature is what keeps REQ-PROV-11 rule 4 from
+					// demoting it to text first (ThinkingSignature).
+					thinking.WriteString(bv.Thinking)
 				case core.ToolUseBlock:
 					args := bv.Input
 					if len(args) == 0 {
@@ -440,6 +451,7 @@ func encodeMessages(ms core.Messages, system []core.ContentBlock, compat Compat,
 				}
 			}
 			msg.Content = text.String()
+			msg.Thinking = thinking.String()
 			out = append(out, msg)
 
 		case core.ToolResultMessage:

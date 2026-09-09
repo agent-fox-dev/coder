@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -108,22 +109,96 @@ type cacheJob struct {
 	opts *ContextCacheOptions
 }
 
+// cacheEntry is one prefix's resource: its name, when it expires, and whether
+// a creation is in flight.
+//
+// Expiry is tracked LOCALLY. The service deletes the resource when its TTL
+// runs out and says nothing; an entry that never expired here kept referencing
+// it forever, and every turn after the TTL was a 400 for a cache the caller
+// had opted into an hour earlier. An expired entry reads as absent, so the
+// next turn starts a fresh creation — which is why the in-flight flag replaces
+// a sync.Once: creation must be repeatable per prefix, never once per process.
 type cacheEntry struct {
-	once sync.Once
-	mu   sync.RWMutex
-	name string
+	mu       sync.Mutex
+	name     string
+	expires  time.Time
+	inflight bool
 }
 
-func (e *cacheEntry) get() string {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+// get returns the resource name if one exists and has not expired at now.
+func (e *cacheEntry) get(now time.Time) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.name == "" {
+		return ""
+	}
+	if !e.expires.IsZero() && !now.Before(e.expires) {
+		// Expired: absent, and free to be recreated.
+		e.name, e.expires = "", time.Time{}
+		return ""
+	}
 	return e.name
 }
 
-func (e *cacheEntry) set(name string) {
+// begin claims the creation slot. It reports false when a live resource
+// exists or a creation is already running, so exactly one creation is in
+// flight per prefix at a time.
+func (e *cacheEntry) begin(now time.Time) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.name = name
+	if e.inflight {
+		return false
+	}
+	if e.name != "" && (e.expires.IsZero() || now.Before(e.expires)) {
+		return false
+	}
+	e.inflight = true
+	return true
+}
+
+// finish releases the creation slot, recording the resource on success.
+func (e *cacheEntry) finish(name string, expires time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.inflight = false
+	if name != "" {
+		e.name, e.expires = name, expires
+	}
+}
+
+// clear forgets a resource the service refused, so the next turn recreates
+// it. It is keyed on the name so a resource created in the meantime — a
+// concurrent turn's fresh one — is not thrown away with the stale one.
+func (e *cacheEntry) clear(name string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.name == name {
+		e.name, e.expires = "", time.Time{}
+	}
+}
+
+// cacheRef is what attachCachedContent withheld from a request: enough to
+// put it back if the service refuses the reference.
+type cacheRef struct {
+	key, name  string
+	system     *content
+	tools      []toolSet
+	toolConfig *toolConfig
+}
+
+// restore undoes the attachment on a COPY of the request.
+func (r *cacheRef) restore(body *request) {
+	body.CachedContent = ""
+	body.SystemInstruction = r.system
+	body.Tools = r.tools
+	body.ToolConfig = r.toolConfig
+}
+
+func (c *client) now() time.Time {
+	if c.opts.Now != nil {
+		return c.opts.Now()
+	}
+	return time.Now()
 }
 
 func (c *client) entry(key string) *cacheEntry {
@@ -172,29 +247,32 @@ func (c *client) contextCacheJob(m *core.Model, body *request) *cacheJob {
 	return j
 }
 
-// attachCachedContent references an ALREADY-CREATED resource, and reports
-// whether it did.
+// attachCachedContent references an ALREADY-CREATED, unexpired resource, and
+// returns what it withheld — nil when nothing was attached.
 //
 // This is the non-blocking read NFR-PERF-08 turns on: it takes a mutex around
 // a string and never waits on the creation goroutine, so a session whose cache
 // is still being created sends the ordinary uncached request instead of
 // stalling behind a network call it did not need.
-func (c *client) attachCachedContent(body *request, j *cacheJob) bool {
-	name := c.entry(j.key).get()
+func (c *client) attachCachedContent(body *request, j *cacheJob) *cacheRef {
+	name := c.entry(j.key).get(c.now())
 	if name == "" {
-		return false
+		return nil
 	}
+	ref := &cacheRef{key: j.key, name: name,
+		system: body.SystemInstruction, tools: body.Tools, toolConfig: body.ToolConfig}
 	body.CachedContent = name
 	// The cached resource carries these; sending them again alongside
 	// cachedContent is rejected outright.
 	body.SystemInstruction = nil
 	body.Tools = nil
 	body.ToolConfig = nil
-	return true
+	return ref
 }
 
-// startContextCache launches creation once per prefix, on a background
-// goroutine, and returns immediately (NFR-PERF-08).
+// startContextCache launches creation for a prefix with no live resource, on
+// a background goroutine, and returns immediately (NFR-PERF-08). One creation
+// runs per prefix at a time; an expired or refused resource is recreated.
 //
 // The context is DETACHED from the request's. The whole point of creating in
 // the background is that the resource is there for the NEXT turn, and the next
@@ -205,22 +283,24 @@ func (c *client) attachCachedContent(body *request, j *cacheJob) bool {
 func (c *client) startContextCache(ctx context.Context, j *cacheJob, m *core.Model, vx Vertex,
 	base string, auth provider.ModelAuth, env provider.Env, opts core.RequestOptions) {
 	e := c.entry(j.key)
-	e.once.Do(func() {
-		body := j.body
-		body.Model = vx.modelResource(m)
-		url := base + vx.cachePath()
-		go func() {
-			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), j.opts.timeout())
-			defer cancel()
-			name, err := createCachedContent(cctx, c, url, body, m, auth, env, opts)
-			if err == nil && name != "" {
-				e.set(name)
-			}
-			if fn := j.opts.OnCreate; fn != nil {
-				fn(name, err)
-			}
-		}()
-	})
+	if !e.begin(c.now()) {
+		return
+	}
+	body := j.body
+	body.Model = vx.modelResource(m)
+	url := base + vx.cachePath()
+	go func() {
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), j.opts.timeout())
+		defer cancel()
+		name, expires, err := createCachedContent(cctx, c, url, body, m, auth, env, opts)
+		if err != nil {
+			name = ""
+		}
+		e.finish(name, expires)
+		if fn := j.opts.OnCreate; fn != nil {
+			fn(name, err)
+		}
+	}()
 }
 
 // cachePath and modelResource are the two spellings NFR-COMPAT-05 already
@@ -247,11 +327,17 @@ func (v Vertex) modelResource(m *core.Model) string {
 		"/publishers/google/models/" + strings.TrimPrefix(id, "models/")
 }
 
+// createCachedContent posts the resource and returns its name and expiry.
+//
+// The expiry is the service's own expireTime when the response names one,
+// else now plus the TTL that was requested: the resource is deleted at that
+// moment whether or not this process is told, so the entry must forget it
+// then too.
 func createCachedContent(ctx context.Context, c *client, url string, body cachedContentRequest,
-	m *core.Model, auth provider.ModelAuth, env provider.Env, opts core.RequestOptions) (string, error) {
+	m *core.Model, auth provider.ModelAuth, env provider.Env, opts core.RequestOptions) (string, time.Time, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	// The same Call pipeline the model request uses: identical credential
 	// resolution, header precedence and injected transport (REQ-PROV-18), so
@@ -272,19 +358,41 @@ func createCachedContent(ctx context.Context, c *client, url string, body cached
 		Attribution: c.opts.Attribution, Env: env,
 		Client: c.opts.HTTPClient, Retry: c.opts.Retry,
 	}
+	started := c.now()
 	resp, err := call.Do(ctx)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", errors.New(provider.StatusError("google: creating cachedContent", resp, provider.JSONErrorDetail))
+		return "", time.Time{}, errors.New(provider.StatusError("google: creating cachedContent", resp, provider.JSONErrorDetail))
 	}
 	var out struct {
-		Name string `json:"name"`
+		Name       string `json:"name"`
+		ExpireTime string `json:"expireTime"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
+	// Bounded: the body is bytes the service sent, and REQ-SEC-11's rule —
+	// bound before you allocate — applies to a response as to a peer.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxCacheCreateBody)).Decode(&out); err != nil {
+		return "", time.Time{}, err
 	}
-	return out.Name, nil
+	expires := started.Add(ttlOf(body.TTL))
+	if t, err := time.Parse(time.RFC3339Nano, out.ExpireTime); err == nil {
+		expires = t
+	}
+	return out.Name, expires, nil
+}
+
+// maxCacheCreateBody bounds a creation response. The body is a resource name,
+// a few timestamps and a usage block; a megabyte is orders of magnitude over.
+const maxCacheCreateBody = 1 << 20
+
+// ttlOf parses the "<seconds>s" the request carried, falling back to the
+// default so an unparsable value still expires rather than living forever.
+func ttlOf(ttl string) time.Duration {
+	n, err := strconv.Atoi(strings.TrimSuffix(ttl, "s"))
+	if err != nil || n <= 0 {
+		return DefaultContextCacheTTL
+	}
+	return time.Duration(n) * time.Second
 }

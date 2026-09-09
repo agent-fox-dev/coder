@@ -1,7 +1,10 @@
 package ollama_test
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -499,5 +502,160 @@ func TestThinkIsClampedAgainstTheRowsMap(t *testing.T) {
 	raw, w := build(t, m, r)
 	if w.Think != nil {
 		t.Fatalf("think = %v on a row that prices no level, want the key omitted: %s", *w.Think, raw)
+	}
+}
+
+// ---------------------------------------------------------------- streaming
+
+// drive runs one streamed turn against a canned NDJSON body with no server
+// (NFR-TEST-01) and returns the message and the URL the transport saw.
+func drive(t *testing.T, env map[string]string, ndjson string) (*core.AssistantMessage, string) {
+	t.Helper()
+	var url string
+	req := core.Request{
+		Messages: core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+		Options: core.RequestOptions{
+			Env: env,
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				url = r.URL.String()
+				return &http.Response{StatusCode: 200, Header: http.Header{},
+					Body: io.NopCloser(strings.NewReader(ndjson))}, nil
+			}),
+		},
+	}
+	msg := ollama.Provider(ollama.Options{Getenv: func(string) string { return "" }}).
+		Stream(context.Background(), model(), req, core.ProviderStreamOptions{}).Result()
+	return msg, url
+}
+
+// TestAStreamWithoutDoneIsTruncated is REQ-PROV-04 with the case that
+// matters: the connection drops after a tool call and before done:true. The
+// done object is this wire's terminal signal; a stream that ends without one
+// stopped before the model did, and reporting it as tool_use would execute a
+// call from a turn the model never finished.
+func TestAStreamWithoutDoneIsTruncated(t *testing.T) {
+	cut := `{"model":"qwen3:8b","message":{"role":"assistant","content":"Hello"},"done":false}` + "\n" +
+		`{"model":"qwen3:8b","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"delete_file","arguments":{"path":"/etc"}}}]},"done":false}` + "\n"
+	msg, _ := drive(t, nil, cut)
+	if msg.StopReason != core.StopReasonError {
+		t.Fatalf("stop = %q (%q), want error: no done:true arrived, so the call must not run",
+			msg.StopReason, msg.ErrorMessage)
+	}
+	if !strings.Contains(msg.ErrorMessage, "stream ended before") {
+		t.Fatalf("error = %q, want the truncation text the REQ-PROV-14 allowlist retries on",
+			msg.ErrorMessage)
+	}
+	if msg.Content.Text() != "Hello" {
+		t.Fatalf("content = %q, want the partial text kept alongside the failure", msg.Content.Text())
+	}
+
+	msg, _ = drive(t, nil, cut+`{"model":"qwen3:8b","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}`+"\n")
+	if msg.StopReason != core.StopReasonToolUse {
+		t.Fatalf("stop = %q (%q) with done:true, want tool_use", msg.StopReason, msg.ErrorMessage)
+	}
+}
+
+// TestThinkingIsMarkedAndReplayedUnderItsOwnKeyNeverAsText: the wire carries
+// no signature, so the decoder's unsigned block was demoted to text by
+// REQ-PROV-11 rule 4 and the model's reasoning re-sent as its own visible
+// prose on every later turn. Marked, it survives rule 4 on a same-model replay
+// and goes back under `thinking`, the field the server documents for it.
+func TestThinkingIsMarkedAndReplayedUnderItsOwnKeyNeverAsText(t *testing.T) {
+	stream := `{"model":"qwen3:8b","message":{"role":"assistant","content":"","thinking":"let me "},"done":false}` + "\n" +
+		`{"model":"qwen3:8b","message":{"role":"assistant","content":"","thinking":"think"},"done":false}` + "\n" +
+		`{"model":"qwen3:8b","message":{"role":"assistant","content":"Hello"},"done":true,"done_reason":"stop"}` + "\n"
+	msg, _ := drive(t, nil, stream)
+	var think *core.ThinkingBlock
+	for _, b := range msg.Content {
+		if tb, ok := b.(core.ThinkingBlock); ok {
+			think = &tb
+		}
+	}
+	if think == nil || think.Thinking != "let me think" {
+		t.Fatalf("thinking = %+v, want the deltas accumulated", think)
+	}
+	if think.Signature != ollama.ThinkingSignature {
+		t.Fatalf("signature = %q, want the marker that keeps rule 4 from demoting it", think.Signature)
+	}
+
+	replay := core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}, *msg,
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "more"}}},
+	}}
+	_, w := build(t, model(), replay)
+	assistant := w.Messages[1]
+	if assistant.Thinking != "let me think" {
+		t.Fatalf("assistant.thinking = %q, want the reasoning replayed under its own key", assistant.Thinking)
+	}
+	if *assistant.Content != "Hello" {
+		t.Fatalf("assistant.content = %q: the reasoning must never ride as answer text", *assistant.Content)
+	}
+
+	// Cross-model, rule 3 downgrades it to text: another model sees context.
+	other := model()
+	other.ID = "llama3"
+	_, w = build(t, other, replay)
+	if assistant := w.Messages[1]; assistant.Thinking != "" || !strings.Contains(*assistant.Content, "let me think") {
+		t.Fatalf("on ANOTHER model the reasoning must degrade to text (rule 3): %+v", assistant)
+	}
+}
+
+// TestSynthesizedCallIDsAreScopedToTheResponse: the fallback minted
+// "<model>-0" on every turn, and the repair pass — which keys results by id —
+// could answer one turn's call with another's result. created_at is the
+// response's own identity on this wire.
+func TestSynthesizedCallIDsAreScopedToTheResponse(t *testing.T) {
+	at := func(ts string) string {
+		return `{"model":"qwen3:8b","created_at":"` + ts + `","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"t","arguments":{}}}]},"done":true,"done_reason":"stop"}` + "\n"
+	}
+	a, _ := drive(t, nil, at("2026-01-01T12:00:00.000000001Z"))
+	b, _ := drive(t, nil, at("2026-01-01T12:00:00.000000002Z"))
+	ida, idb := core.ExtractToolUse(a)[0].ID, core.ExtractToolUse(b)[0].ID
+	if ida == idb {
+		t.Fatalf("two responses minted the same id %q", ida)
+	}
+	if !strings.HasPrefix(ida, "2026-01-01T12:00:00.000000001Z-") {
+		t.Fatalf("id = %q, want it scoped to the response's created_at", ida)
+	}
+	// The whole-response path agrees with the streaming one for the same
+	// response (REQ-PROV-17): same created_at, same id.
+	whole, err := ollama.DecodeResponse(model(), []byte(at("2026-01-01T12:00:00.000000001Z")), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := core.ExtractToolUse(whole)[0].ID; got != ida {
+		t.Fatalf("whole-response id %q differs from the streamed %q", got, ida)
+	}
+}
+
+// TestAHostWithoutASchemeGetsHTTP: OLLAMA_HOST is Ollama's own variable and its
+// CLI accepts "host:port", so that is what operators export. Handed to
+// net/http as-is it is not a URL, and the failure names a missing protocol
+// scheme rather than the variable.
+func TestAHostWithoutASchemeGetsHTTP(t *testing.T) {
+	ok := `{"model":"qwen3:8b","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop"}` + "\n"
+	msg, url := drive(t, map[string]string{"OLLAMA_HOST": "gpu-box:11434"}, ok)
+	if msg.StopReason == core.StopReasonError {
+		t.Fatalf("the turn failed: %s", msg.ErrorMessage)
+	}
+	if url != "http://gpu-box:11434/api/chat" {
+		t.Fatalf("url = %q, want http:// prefixed onto the bare host", url)
+	}
+	_, url = drive(t, map[string]string{"OLLAMA_HOST": "https://ollama.example/"}, ok)
+	if url != "https://ollama.example/api/chat" {
+		t.Fatalf("url = %q, want an explicit scheme left alone", url)
+	}
+}
+
+// TestAToolWithNoSchemaSendsAnEmptyObjectNotNull: `parameters: null` is
+// rejected by the server.
+func TestAToolWithNoSchemaSendsAnEmptyObjectNotNull(t *testing.T) {
+	_, w := build(t, model(), core.Request{
+		Messages: core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+		Tools:    []core.ToolWire{{Name: "ping", Description: "no arguments"}},
+	})
+	var params map[string]any
+	if err := json.Unmarshal(w.Tools[0].Function.Parameters, &params); err != nil || params["type"] != "object" {
+		t.Fatalf("parameters = %s, want an empty object schema, never null", w.Tools[0].Function.Parameters)
 	}
 }

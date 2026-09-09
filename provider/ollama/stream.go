@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/agentfox/agentkit-go/core"
@@ -133,7 +134,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	}
 	call := provider.Call{
 		Method:  http.MethodPost,
-		URL:     provider.ResolveBaseURL(m, auth, base) + Path,
+		URL:     withScheme(provider.ResolveBaseURL(m, auth, base)) + Path,
 		Body:    raw,
 		Headers: map[string]string{"content-type": "application/json", "accept": "application/x-ndjson"},
 		Auth:    auth, Model: m, Options: req.Options,
@@ -172,6 +173,20 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	d.finish(m, c.opts.BillingLookup)
 }
 
+// withScheme prefixes http:// onto a base URL that names no scheme.
+//
+// OLLAMA_HOST is Ollama's own variable and its own CLI accepts "host:port" —
+// "gpu-box:11434", "0.0.0.0:11434" — so that is what operators export. Handed
+// to net/http as-is it is not a URL at all, and the failure names a missing
+// protocol scheme rather than the variable. Plain http is the server's own
+// default; an operator behind TLS spells the scheme out.
+func withScheme(base string) string {
+	if strings.Contains(base, "://") {
+		return base
+	}
+	return "http://" + base
+}
+
 // ---------------------------------------------------------------- wire decode
 
 type wireToolCall struct {
@@ -192,7 +207,11 @@ type wireMessage struct {
 }
 
 type wireChunk struct {
-	Model      string       `json:"model"`
+	Model string `json:"model"`
+	// CreatedAt is the response's timestamp, nanosecond RFC 3339, and the only
+	// per-response identity this wire carries; it scopes synthesized tool-call
+	// ids (callScope).
+	CreatedAt  string       `json:"created_at"`
 	Message    *wireMessage `json:"message"`
 	Done       bool         `json:"done"`
 	DoneReason string       `json:"done_reason"`
@@ -209,19 +228,42 @@ type decoder struct {
 	blocks   []core.ContentBlock
 	textIdx  int
 	thinkIdx int
+	// textBuf and thinkBuf accumulate the open text and thinking blocks.
+	// Builder.String() is a view, not a copy, so refreshing the block after
+	// each delta is O(delta); appending to the block's own string was O(block)
+	// per delta and quadratic over a long answer.
+	textBuf  strings.Builder
+	thinkBuf strings.Builder
 	usage    core.Usage
 	doneRs   string
 	respMod  string
+	created  string
 	calls    int
 	sawDone  bool
 	sawAny   bool
 }
 
+// ThinkingSignature marks native `thinking` this wire received.
+//
+// It is not a credential and carries no provider state; it exists so the
+// block is NOT demoted to text. Unsigned, REQ-PROV-11 rule 4 turned it into a
+// TextBlock and the reasoning was re-sent as visible assistant prose on every
+// later turn — re-billed each time, and teaching the model to emit reasoning
+// as answer text. Marked, the block survives rule 4 on a same-model replay
+// and the encoder routes it back under `thinking`, the field the server
+// documents for exactly that (encodeMessages); rule 3 still downgrades it for
+// any other model.
+const ThinkingSignature = "ollama-chat/thinking"
+
 func (d *decoder) consume(r *provider.NDJSONReader) error {
 	for {
 		line, err := r.Next()
 		if err == io.EOF {
-			if !d.sawDone && !d.sawAny {
+			if !d.sawDone {
+				// done:true is this wire's terminal signal. Without it the
+				// stream stopped before the model did, and what arrived is
+				// a partial turn — a tool call included, which reported as
+				// tool_use would be executed.
 				return provider.ErrSSETruncated
 			}
 			return nil
@@ -255,6 +297,9 @@ func (d *decoder) chunk(line []byte) error {
 	if ch.Model != "" {
 		d.respMod = ch.Model
 	}
+	if d.created == "" && ch.CreatedAt != "" {
+		d.created = ch.CreatedAt
+	}
 	if ch.Done {
 		d.sawDone = true
 		d.doneRs = ch.DoneReason
@@ -270,15 +315,15 @@ func (d *decoder) chunk(line []byte) error {
 	if t := ch.Message.Thinking; t != "" {
 		if d.thinkIdx < 0 {
 			d.thinkIdx = len(d.blocks)
-			// No signature: this wire carries none, so REQ-PROV-11 rule 4
-			// demotes it to plain text on replay. That is the intended
-			// outcome, not a loss — replaying unsigned reasoning as reasoning
-			// is what the rule exists to prevent.
-			d.blocks = append(d.blocks, core.ThinkingBlock{})
+			d.thinkBuf.Reset()
+			// This wire carries no signature of its own; the marker keeps
+			// the block a thinking block on replay (see ThinkingSignature).
+			d.blocks = append(d.blocks, core.ThinkingBlock{Signature: ThinkingSignature})
 			d.s.Push(core.ThinkingStartEvent{BlockIndex: d.thinkIdx})
 		}
 		tb := d.blocks[d.thinkIdx].(core.ThinkingBlock)
-		tb.Thinking += t
+		d.thinkBuf.WriteString(t)
+		tb.Thinking = d.thinkBuf.String()
 		d.blocks[d.thinkIdx] = tb
 		d.s.Push(core.ThinkingDeltaEvent{BlockIndex: d.thinkIdx, Delta: t})
 		changed = true
@@ -287,11 +332,13 @@ func (d *decoder) chunk(line []byte) error {
 	if c := ch.Message.Content; c != "" {
 		if d.textIdx < 0 {
 			d.textIdx = len(d.blocks)
+			d.textBuf.Reset()
 			d.blocks = append(d.blocks, core.TextBlock{})
 			d.s.Push(core.TextStartEvent{BlockIndex: d.textIdx})
 		}
 		tb := d.blocks[d.textIdx].(core.TextBlock)
-		tb.Text += c
+		d.textBuf.WriteString(c)
+		tb.Text = d.textBuf.String()
 		d.blocks[d.textIdx] = tb
 		d.s.Push(core.TextDeltaEvent{BlockIndex: d.textIdx, Delta: c})
 		changed = true
@@ -327,7 +374,17 @@ func (d *decoder) chunk(line []byte) error {
 	return nil
 }
 
+// callScope namespaces a synthesized tool-call id so two turns cannot mint
+// the same one — the repair pass keys results by id, and a repeat lets a
+// result answer the wrong call. created_at is the response's own timestamp,
+// nanosecond-precise and present on every chunk a real server sends, so it
+// is the scope; the model name is only the fallback for a fixture without
+// one, where the streaming and whole-response paths must still agree.
 func (d *decoder) callScope() string {
+	if d.created != "" {
+		return d.created
+	}
+
 	if d.respMod != "" {
 		return d.respMod
 	}

@@ -337,9 +337,202 @@ func TestAForeignThinkingSignatureIsNotReplayedAsAnItem(t *testing.T) {
 	}, completedStream)
 
 	for _, it := range items(t, body) {
-		if it["type"] == "reasoning" && it["id"] != nil && it["id"] != "" {
-			t.Fatalf("a foreign signature must not become an item id: %v", it)
+		if it["type"] == "reasoning" {
+			t.Fatalf("a foreign signature must not become a reasoning item at all: %v. "+
+				"An empty reasoning item is rejected just as a foreign id is", it)
 		}
+	}
+}
+
+// TestEncryptedReasoningIsRequestedWhateverTheThinkingLevel is the fix for
+// the stateless second turn.
+//
+// A reasoning model reasons whether or not the caller named a level. With
+// `include` gated on ThinkingLevel, a request that set none got reasoning items
+// back with an item id and no encrypted blob; replayed by id alone under
+// store:false, the next turn was a 400 — the server keeps nothing between
+// turns and the id names nothing it holds.
+func TestEncryptedReasoningIsRequestedWhateverTheThinkingLevel(t *testing.T) {
+	body := send(t, openairesponses.Options{}, core.Request{
+		Messages: core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+	}, completedStream)
+	inc, _ := body["include"].([]any)
+	var found bool
+	for _, v := range inc {
+		if v == "reasoning.encrypted_content" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("include = %v with no thinking level, want reasoning.encrypted_content: "+
+			"a reasoning model reasons regardless, and its items are unreplayable without it",
+			body["include"])
+	}
+	if _, present := body["reasoning"]; present {
+		t.Fatalf("reasoning = %v was invented for a caller who set no level", body["reasoning"])
+	}
+
+	// A profile that cannot return the blob asks for nothing.
+	m := model()
+	m.Compat = json.RawMessage(`{"supports_encrypted_reasoning": false}`)
+	body = sendTo(t, m, openairesponses.Options{}, core.Request{
+		Messages: core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+	}, completedStream)
+	if _, present := body["include"]; present {
+		t.Fatalf("include = %v on a profile without encrypted reasoning", body["include"])
+	}
+}
+
+// TestAnItemIDAloneIsNotAReplayableSignature. Under store:false the item id
+// references server-side state that was never kept, so a reasoning item that
+// arrived without encrypted content — a gateway that strips it, a response
+// to a request that could not ask for it — must not be replayed by id: the
+// block is left UNSIGNED so REQ-PROV-11 rule 4 demotes it, and the encoder
+// drops any signed block whose blob is missing rather than send the 400.
+func TestAnItemIDAloneIsNotAReplayableSignature(t *testing.T) {
+	if got := openairesponses.EncodeThinkingSignature("rs_1", ""); got != "" {
+		t.Fatalf("EncodeThinkingSignature(item id, no blob) = %q, want empty: an id alone "+
+			"cannot be replayed stateless, and a signature that survives rule 4 would be", got)
+	}
+	if got := openairesponses.EncodeThinkingSignature("rs_1", "ENCRYPTED"); got == "" {
+		t.Fatal("a reasoning item WITH encrypted content must be signed")
+	}
+
+	// Through the decoder: an item with an id, a summary and no blob decodes
+	// to an unsigned block.
+	idOnly := ev("response.output_item.added",
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}`) +
+		ev("response.output_item.done",
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"weighing"}]}}`) +
+		completedStream
+	msg := drive(t, idOnly)
+	var think *core.ThinkingBlock
+	for _, b := range msg.Content {
+		if tb, ok := b.(core.ThinkingBlock); ok {
+			think = &tb
+		}
+	}
+	if think == nil {
+		t.Fatalf("no thinking block decoded: %v", msg.Content)
+	}
+	if think.Signature != "" {
+		t.Fatalf("signature = %q on an item with no encrypted content, want none", think.Signature)
+	}
+
+	// And a hand-built signed block whose blob is empty is dropped by the
+	// encoder on a store:false request rather than replayed by id.
+	body := send(t, openairesponses.Options{}, core.Request{
+		Messages: core.Messages{
+			core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}},
+			core.AssistantMessage{Content: core.Content{core.TextBlock{Text: "ok"},
+				core.ThinkingBlock{Thinking: "hmm", Signature: `{"item_id":"rs_1"}`}},
+				Provider: "openai", API: openairesponses.API, Model: "gpt-resp"},
+		},
+	}, completedStream)
+	for _, it := range items(t, body) {
+		if it["type"] == "reasoning" {
+			t.Fatalf("a reasoning item with no encrypted content was replayed under "+
+				"store:false: %v", it)
+		}
+	}
+}
+
+// TestAReplayedReasoningItemAlwaysCarriesASummaryArray. The API validates
+// `summary` on a replayed reasoning item and a Go nil slice marshals as null;
+// an item with a blob and no readable summary — the common case when the
+// profile asks for none — was rejected for a field that must merely be empty.
+func TestAReplayedReasoningItemAlwaysCarriesASummaryArray(t *testing.T) {
+	body := send(t, openairesponses.Options{}, core.Request{
+		Messages: core.Messages{
+			core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}},
+			core.AssistantMessage{Content: core.Content{
+				core.ThinkingBlock{Signature: openairesponses.EncodeThinkingSignature("rs_1", "ENCRYPTED")}},
+				Provider: "openai", API: openairesponses.API, Model: "gpt-resp"},
+		},
+	}, completedStream)
+	var found bool
+	for _, it := range items(t, body) {
+		if it["type"] != "reasoning" {
+			continue
+		}
+		found = true
+		sum, ok := it["summary"].([]any)
+		if !ok {
+			t.Fatalf("summary = %#v, want an empty ARRAY, never null or absent", it["summary"])
+		}
+		if len(sum) != 0 {
+			t.Fatalf("summary = %v, want empty for a block with no readable summary", sum)
+		}
+	}
+	if !found {
+		t.Fatalf("the signed reasoning item was not replayed: %v", items(t, body))
+	}
+}
+
+// TestARowThatRejectsSamplingParamsOmitsThem is REQ-PROV-12 on this wire:
+// reasoning models reject temperature and top_p outright, and the 400 names
+// sampling rather than the model.
+func TestARowThatRejectsSamplingParamsOmitsThem(t *testing.T) {
+	temp, topP := 0.2, 0.9
+	req := core.Request{
+		Messages:    core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+		Temperature: &temp, TopP: &topP,
+	}
+	body := send(t, openairesponses.Options{}, req, completedStream)
+	if body["temperature"] != 0.2 || body["top_p"] != 0.9 {
+		t.Fatalf("temperature/top_p = %v/%v on the default profile, want both sent",
+			body["temperature"], body["top_p"])
+	}
+
+	m := model()
+	m.Compat = json.RawMessage(`{"supports_sampling_params": false}`)
+	body = sendTo(t, m, openairesponses.Options{}, req, completedStream)
+	if _, ok := body["temperature"]; ok {
+		t.Fatalf("temperature was sent to a row that rejects it: %v", body)
+	}
+	if _, ok := body["top_p"]; ok {
+		t.Fatalf("top_p was sent to a row that rejects it: %v", body)
+	}
+}
+
+// TestStreamErrorsCarryTheServersOwnText. The `error` EVENT carries code and
+// message at its top level, and response.failed carries them under
+// response.error; both reached the caller as anonymous failures, which the
+// REQ-PROV-14 classifier cannot act on.
+func TestStreamErrorsCarryTheServersOwnText(t *testing.T) {
+	topLevel := ev("error",
+		`{"type":"error","code":"rate_limit_exceeded","message":"slow down","param":null}`)
+	msg := drive(t, topLevel)
+	if msg.StopReason != core.StopReasonError {
+		t.Fatalf("stop = %q, want error", msg.StopReason)
+	}
+	for _, want := range []string{"rate_limit_exceeded", "slow down"} {
+		if !strings.Contains(msg.ErrorMessage, want) {
+			t.Fatalf("error = %q, want it to carry %q from the event's top level", msg.ErrorMessage, want)
+		}
+	}
+
+	failed := ev("response.failed",
+		`{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"server_error","message":"the model overloaded"}}}`)
+	msg = drive(t, failed)
+	if msg.StopReason != core.StopReasonError {
+		t.Fatalf("stop = %q, want error", msg.StopReason)
+	}
+	if !strings.Contains(msg.ErrorMessage, "the model overloaded") {
+		t.Fatalf("error = %q, want response.error.message", msg.ErrorMessage)
+	}
+}
+
+// TestAToolWithNoSchemaSendsAnEmptyObjectNotNull: `parameters: null` is a 400.
+func TestAToolWithNoSchemaSendsAnEmptyObjectNotNull(t *testing.T) {
+	body := send(t, openairesponses.Options{}, core.Request{
+		Messages: core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+		Tools:    []core.ToolWire{{Name: "ping", Description: "no arguments"}},
+	}, completedStream)
+	tl := body["tools"].([]any)[0].(map[string]any)
+	params, ok := tl["parameters"].(map[string]any)
+	if !ok || params["type"] != "object" {
+		t.Fatalf("parameters = %#v, want an empty object schema, never null", tl["parameters"])
 	}
 }
 
