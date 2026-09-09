@@ -119,6 +119,21 @@ func (g *Git) Checkout(ctx context.Context, name string) error {
 	return err
 }
 
+// IsAncestor reports whether commit-ish a is reachable from b — which
+// includes a and b being the same commit. It is how the final branch decides
+// whether pointing itself at the new tip would lose anything.
+func (g *Git) IsAncestor(ctx context.Context, a, b string) bool {
+	_, code, err := g.git(ctx, "merge-base", "--is-ancestor", a, b)
+	return err == nil && code == 0
+}
+
+// PointBranchAt creates name at target, or moves it there if it exists. The
+// caller is responsible for having established that moving it loses nothing.
+func (g *Git) PointBranchAt(ctx context.Context, name, target string) error {
+	_, err := g.mustGit(ctx, "branch", "-f", name, target)
+	return err
+}
+
 func (g *Git) DeleteBranch(ctx context.Context, name string) error {
 	_, err := g.mustGit(ctx, "branch", "-q", "-D", name)
 	return err
@@ -285,6 +300,24 @@ var nonBranch = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
 // GroupBranch is agent-fox's `feature/{spec}/{group}`.
 func GroupBranch(specName string, group int) string {
 	return fmt.Sprintf("feature/%s/%d", nonBranch.ReplaceAllString(specName, "-"), group)
+}
+
+// FinalBranchName is the branch a completed run leaves the finished work on:
+// the spec's own canonical directory name, `NN_snake_case`, under `feature/`.
+// It exists so that "which branch do I merge?" has an answer that does not
+// involve counting task groups.
+//
+// It is deliberately NOT `feature/{spec_name}`, which is the name a reader
+// would expect. Git stores a branch as a file under `refs/heads`, so
+// `feature/widget_counter` and `feature/widget_counter/2` cannot both exist —
+// whichever is created second is refused, and here the second one is always
+// the one that matters. The spec id in front of the name keeps the final
+// branch out of the group branches' directory. (agent-fox hits the same
+// directory/file conflict between its worktree branches and guards it the
+// same way, by deleting the conflicting prefix ref.)
+func FinalBranchName(specID, specName string) string {
+	return fmt.Sprintf("feature/%s_%s",
+		nonBranch.ReplaceAllString(specID, "-"), nonBranch.ReplaceAllString(specName, "-"))
 }
 
 // UniqueBranchName appends a numeric suffix until the name is free. agent-fox

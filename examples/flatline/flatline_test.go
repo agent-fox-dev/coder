@@ -172,7 +172,8 @@ func baseOptions(t *testing.T, root string, pack *Pack, brain Brain) Options {
 	t.Helper()
 	return Options{
 		Pack: pack, Git: NewGit(root, execRunner), Brain: brain, Run: execRunner,
-		Landing: LandMerge, MaxRetries: 2, CheckTimeout: time.Minute, Out: io.Discard,
+		Landing: LandMerge, FinalBranch: FinalBranchName("01", "widget_counter"),
+		MaxRetries: 2, CheckTimeout: time.Minute, Out: io.Discard,
 	}
 }
 
@@ -652,6 +653,9 @@ func TestPipelineEndToEnd(t *testing.T) {
 	if branches := gitOut(t, root, "branch", "--list", "feature/*"); branches != "" {
 		t.Errorf("group branches should be deleted after merging: %s", branches)
 	}
+	if res.FinalBranch != "" {
+		t.Errorf("--land=merge needs no final branch, got %q", res.FinalBranch)
+	}
 	if dirty := gitOut(t, root, "status", "--porcelain"); dirty != "" {
 		t.Errorf("working tree is dirty after the run:\n%s", dirty)
 	}
@@ -790,6 +794,9 @@ func TestPipelineStallsWhenRetriesAreExhausted(t *testing.T) {
 	if s := subtaskState(readTasks(t, root), "1.1"); s != afspec.SubtaskStatePending {
 		t.Errorf("a blocked group's subtasks must stay pending, got %s", s)
 	}
+	if res.FinalBranch != "" || NewGit(root, execRunner).LocalBranchExists(context.Background(), FinalBranchName("01", "widget_counter")) {
+		t.Error("a stalled run must not name anything as finished work")
+	}
 }
 
 func TestPipelineSkipsACompletedGroup(t *testing.T) {
@@ -915,11 +922,99 @@ func TestPipelineKeepsBranchesWhenAsked(t *testing.T) {
 	if out := gitOut(t, root, "ls-tree", "--name-only", "feature/widget_counter/2"); !strings.Contains(out, "counter_test.go") {
 		t.Errorf("group 2's branch does not contain group 1's work:\n%s", out)
 	}
-	if b := gitOut(t, root, "rev-parse", "--abbrev-ref", "HEAD"); b != "feature/widget_counter/4" {
-		t.Errorf("checked out %q, want the last group's branch", b)
-	}
 	if res.Groups[3].Landed != "" {
 		t.Error("nothing is landed in branch mode")
+	}
+
+	// The finished work is named after the spec rather than left as "whichever
+	// numbered branch was last", and the run ends standing on it.
+	final := FinalBranchName("01", "widget_counter")
+	if final != "feature/01_widget_counter" {
+		t.Fatalf("FinalBranchName = %q", final)
+	}
+	if res.FinalBranch != final {
+		t.Errorf("Result.FinalBranch = %q, want %q", res.FinalBranch, final)
+	}
+	if got, want := gitOut(t, root, "rev-parse", final), gitOut(t, root, "rev-parse", "feature/widget_counter/4"); got != want {
+		t.Errorf("%s is at %s, want the last group's tip %s", final, got, want)
+	}
+	if b := gitOut(t, root, "rev-parse", "--abbrev-ref", "HEAD"); b != final {
+		t.Errorf("checked out %q, want %q", b, final)
+	}
+	var summary strings.Builder
+	Summary(&summary, res, nil, false)
+	if !strings.Contains(summary.String(), "merge:    "+final) {
+		t.Errorf("the summary must name the branch to merge:\n%s", summary.String())
+	}
+}
+
+// TestFinalBranchLeavesAnUnrelatedBranchAlone is the case where naming the work
+// would relabel somebody else's: a previous run, or a branch that happens to
+// carry that name. The work is still finished, so the run completes.
+func TestFinalBranchLeavesAnUnrelatedBranchAlone(t *testing.T) {
+	root := newRepo(t)
+	pack := loadPack(t, root)
+	final := FinalBranchName("01", "widget_counter")
+
+	gitOut(t, root, "checkout", "-q", "-b", final)
+	write(t, filepath.Join(root, "earlier.txt"), "an earlier run\n")
+	gitOut(t, root, "add", "-A")
+	gitOut(t, root, "commit", "-qm", "feat: an earlier run")
+	earlier := gitOut(t, root, "rev-parse", final)
+	gitOut(t, root, "checkout", "-q", "main")
+
+	brain := scriptedBrain(t, root, happyTurns()...)
+	opts := baseOptions(t, root, pack, brain)
+	opts.Landing = LandBranch
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run failed at %s: %v", res.Stage, err)
+	}
+	if got := gitOut(t, root, "rev-parse", final); got != earlier {
+		t.Errorf("%s moved from %s to %s, discarding the earlier run", final, earlier, got)
+	}
+	if res.FinalBranch != "" {
+		t.Errorf("FinalBranch = %q, want empty when it could not be named", res.FinalBranch)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, "\n"), "already exists") {
+		t.Errorf("the refusal must be reported: %v", res.Warnings)
+	}
+	// The work is still there, on the last group's branch, and the run says so.
+	if !strings.Contains(strings.Join(res.Warnings, "\n"), "feature/widget_counter/4") {
+		t.Errorf("the warning must say where the work is: %v", res.Warnings)
+	}
+	for _, g := range res.Groups {
+		if g.Status != StatusCompleted {
+			t.Errorf("group %d: %s", g.ID, g.Status)
+		}
+	}
+}
+
+// TestFinalBranchRefusesTheBaseBranch: --land=branch exists to leave the base
+// branch alone, so naming the work after it would defeat the flag.
+func TestFinalBranchRefusesTheBaseBranch(t *testing.T) {
+	root := newRepo(t)
+	pack := loadPack(t, root)
+	pack.Spec.Tasks.TaskGroups = pack.Spec.Tasks.TaskGroups[:1]
+	brain := scriptedBrain(t, root, happyTurns()[:2]...)
+	opts := baseOptions(t, root, pack, brain)
+	opts.Landing = LandBranch
+	opts.FinalBranch = "main"
+	before := gitOut(t, root, "rev-parse", "main")
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run failed at %s: %v", res.Stage, err)
+	}
+	if got := gitOut(t, root, "rev-parse", "main"); got != before {
+		t.Errorf("main moved from %s to %s", before, got)
+	}
+	if res.FinalBranch != "" {
+		t.Errorf("FinalBranch = %q", res.FinalBranch)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, "\n"), "may not be the base branch") {
+		t.Errorf("warnings = %v", res.Warnings)
 	}
 }
 

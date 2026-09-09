@@ -181,20 +181,24 @@ type GroupOutcome struct {
 
 // Result is what the run produced, whether or not it finished.
 type Result struct {
-	SpecDir   string
-	SpecName  string
-	Base      string
-	Groups    []GroupOutcome
-	Final     []CheckRun // the post-run check, agent-fox's `make check`
-	FinalOK   bool
-	Verdicts  *Verdicts
-	Stats     []RunStats
-	Warnings  []string
-	Journal   []JournalEntry
-	Stage     string // the step that failed; empty on success
-	Stalled   bool   // a group exhausted its retries
-	CostLimit bool   // the run ceiling was hit
-	Dirty     bool   // every group completed, but the final check fails
+	SpecDir  string
+	SpecName string
+	Base     string
+	Groups   []GroupOutcome
+	// FinalBranch is the branch the finished work was left on, named after
+	// the spec. Empty when the run did not get that far, or when there was
+	// nothing to name because every group landed on the base branch.
+	FinalBranch string
+	Final       []CheckRun // the post-run check, agent-fox's `make check`
+	FinalOK     bool
+	Verdicts    *Verdicts
+	Stats       []RunStats
+	Warnings    []string
+	Journal     []JournalEntry
+	Stage       string // the step that failed; empty on success
+	Stalled     bool   // a group exhausted its retries
+	CostLimit   bool   // the run ceiling was hit
+	Dirty       bool   // every group completed, but the final check fails
 }
 
 func (r *Result) CostUSD() float64 {
