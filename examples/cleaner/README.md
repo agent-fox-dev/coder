@@ -89,12 +89,25 @@ is handed against one directory, symlinks included, so `../../.ssh/id_rsa` is
 refused by the tool rather than by a paragraph in the system prompt.
 
 **A layered authorization boundary.** `agentkit.RestrictedPolicy` supplies the
-floor — an allowlist of program names, no shell operators. On top of it,
-`toolGuard` in [`phases.go`](phases.go) adds the two rules that are specific to
-*this* application: the agent may not run mutating `git` subcommands (the
-pipeline owns the branch, the commit and the push), and may not run `gh` at all
-(every write to the issue goes through the audited comment path). A refusal
-comes back to the model as a blocked tool result, so it adapts instead of dying.
+floor — an allowlist of program names. The implementation phase may use shell
+operators (`go test ./... 2>&1 | grep FAIL`); the read-only analysis phase may
+not, because a redirection is a write. On top of it, `toolGuard` in
+[`phases.go`](phases.go) adds the rules that are specific to *this*
+application: `git` is limited to an allowlist of read-only subcommands
+(`status`, `log`, `diff`, `show`, `blame`, `branch --list`, `remote -v`,
+`config --get`, …) because the pipeline owns the branch, the commit and the
+push; `gh` is refused outright, so every write to the issue goes through the
+audited comment path; and `find` may not `-exec` or `-delete`. Every simple
+command on a line is checked — `ls; git push` is two commands, and an
+environment assignment in front of a program (`GIT_AUTHOR_NAME=x git push`)
+does not hide it. A refusal comes back to the model as a blocked tool result,
+so it adapts instead of dying.
+
+**Compaction.** Both phases install `agentkit.NewContextTransform` with
+`SummarizationCompaction` at 60% of the context window (`installCompaction` in
+[`phases.go`](phases.go)), so a phase that reads many large files summarizes
+its own transcript instead of ending on a context-length error before it
+reaches its terminating tool.
 
 **Terminating tools with schemas.** `submit_analysis` and
 `submit_implementation` set `ToolResult.Terminate`, which ends the phase the
@@ -106,9 +119,11 @@ moment the structured answer arrives — and the stop policy names them too, so
 phase that never reaches its terminating tool stops anyway, and the program
 reports that as a failed run rather than as a fix.
 
-**Streaming.** Tool calls, results and costs are printed as they happen, so a
-ten-minute autonomous run is legible while it is happening — and `RunResult`
-still carries the usage and the stop reason afterwards.
+**Streaming.** Each step prints its elapsed time and token counts as it
+finishes, and `--verbose` adds the tool calls as they happen and the dollar
+cost at the end, so a ten-minute autonomous run is legible while it is
+happening — and `RunResult` still carries the usage and the stop reason
+afterwards.
 
 ## Where this corrects the `af-fix` skill
 
@@ -175,14 +190,14 @@ cleaner [flags] https://github.com/{owner}/{repo}/issues/{number}
 | `--land` | `pr` | `pr` · `branch` (push, no PR) · `merge` (squash locally) · `none` (commit only). |
 | `--dry-run` | off | Make no *remote* changes: nothing is pushed, no pull request is opened, and comments are printed instead of posted. The branch and the commit are still made locally — the implementation phase edits real files, so containing them on a branch you can delete is safer than leaving them loose. |
 | `--model` | `$AGENTKIT_MODEL`, else `anthropic/claude-sonnet-5` | Any model in the catalog: `openai/gpt-5.6-terra`, `ollama/qwen3-coder`, … |
-| `--max-turns` | `40` | Per-phase turn ceiling. |
+| `--max-turns` | `100` | Per-phase turn ceiling. |
 | `--budget` | `5.00` | Per-phase spend ceiling, in dollars. |
 | `--verify` | detected | The command that decides success. Detection order: `make check`, `make test`, `go test ./...`, `npm test`, `pytest`, `cargo test`. |
 | `--no-verify` | off | Run nothing. The result is then reported as **unverified** — not as a pass. |
 | `--verify-timeout` | `10m` | Timeout for one verification run. |
 | `--issue-file` | — | Read the issue from a JSON file instead of GitHub. Offline, and implies `--dry-run`. |
 | `--journal` | — | Append a JSONL record of every step to this file. |
-| `--allow` | — | Extra programs the implementation phase's shell may run. |
+| `--allow` | — | Extra programs the implementation phase's shell may run. The verification command's own program is always allowed. |
 | `--show-text` | off | Print the model's prose as well as its tool calls. |
 | `--verbose` | off | Verbose output: tool calls, timing and cost diagnostics. |
 | `--push-attempts` | `4` | Push retries, with exponential backoff. |
@@ -194,8 +209,8 @@ Exit codes, because this is meant to be run by something other than a human:
 | `0` | Fixed. Verified, committed, landed as `--land` asked. |
 | `1` | Failed. The stage is named on stderr and on the issue. |
 | `2` | Usage error. Nothing was fetched, nothing was posted. |
-| `3` | Stopped on purpose: the issue is ambiguous, and a question was posted to it. |
-| `4` | Code was written but the checks do not pass. The branch is left for a human. |
+| `3` | Stopped on purpose: the issue is ambiguous, and a question was posted to it. (If the question could not be posted, that is `1`.) |
+| `4` | Code was written but the checks do not pass. The work is committed on the branch as `wip: unverified fix for #N`, the checkout is back on the base branch, and the failure is posted to the issue. A run that reported a fix and changed nothing is `1`, not `4`. |
 
 ### Requirements
 
@@ -233,9 +248,14 @@ model that is three scripted turns.
 That makes the interesting failures testable, which is the point:
 
 - `TestPipelineRefusesToLandAFailingChange` — the suite fails after the change;
-  nothing is committed and the failure is posted to the issue.
+  nothing is landed, the work is parked as a `wip:` commit on the branch with
+  the checkout back on `main`, and the failure is posted to the issue.
 - `TestPipelineRefusesAnEmptyChange` — the model reports a fix and changed no
   files; the run fails instead of committing an empty tree.
+- `TestBaseBranchIsCapturedBeforeTheCheckout` — on a repository whose origin
+  advertises no default branch, the fix still lands on (and the pull request
+  still targets) the branch that was checked out at the start, not the
+  feature branch.
 - `TestPipelineRefusesADirtyTree` — pre-flight stops before anything is fetched
   or posted.
 - `TestPipelineStopsOnAmbiguity` — the analysis asks a question; no branch, no
@@ -243,8 +263,13 @@ That makes the interesting failures testable, which is the point:
 - `TestPipelineDegradesWhenThePullRequestFails` — the branch is pushed and the
   change is verified, so a PR that could not be opened is a warning, not a
   failed run.
-- `TestToolGuard` — `git commit`, `git -C . commit`, `git push` and `gh` are
-  refused; `git log` and `go test` are not.
+- `TestToolGuard` — `git commit`, `git -C . commit`, `git pull`, `git clone`,
+  `GIT_AUTHOR_NAME=x git commit`, `ls; git push`, `find -delete` and `gh` are
+  refused; `git log`, `git branch -a`, `git log | grep fix` and `go test` are
+  not. `TestToolGuardAppliesTheAllowlistToEverySegment` — with operators
+  allowed, `go test && curl` is refused for the `curl`.
+- `TestVerifyRunsWithoutCredentials` — the verification command does not see
+  the model's API key.
 - `TestVerificationLinesCannotOverclaim` — the reporting functions cannot print
   a green tick for a run that did not happen.
 
@@ -253,16 +278,26 @@ That makes the interesting failures testable, which is the point:
 Stated rather than left to be discovered:
 
 - **No review loop.** One analysis, one implementation. If the checks fail, the
-  run stops and leaves the branch; it does not iterate against the failure.
-  (The seam is there: `Brain` is an interface, and an implementation that loops
-  on `VerifyResult` would be a drop-in.)
+  run stops, parks the work as a `wip:` commit on the branch and returns to the
+  base branch; it does not iterate against the failure. (The seam is there:
+  `Brain` is an interface, and an implementation that loops on `VerifyResult`
+  would be a drop-in.)
 - **No session persistence.** Each phase is a fresh agent. A crashed run is
   re-run from the start, not resumed — `agentkit.OpenSession` is what you would
   add here, and [`examples/session`](../session) shows how.
 - **It does not look at CI.** Verification is the local command only.
 - **The shell allowlist is a floor, not a sandbox.** `go` and `make` alone can
-  run arbitrary code from the repository. Anything genuinely untrusted belongs
-  in a container, and this program does not make one.
+  run arbitrary code from the repository, and the implementation phase's shell
+  has operators. The guard checks every simple command on a line against the
+  allowlist and the git rules, but it is a classifier over shell syntax, not a
+  shell: an unusual construct is refused rather than understood. Anything
+  genuinely untrusted belongs in a container, and this program does not make
+  one. The verification command runs with the credential variables stripped
+  from its environment; the model's shell does not.
+- **The issue is text a stranger wrote.** It is fenced and labelled as such in
+  both prompts, capped at 96 KB, and both system prompts say to treat it as a
+  problem description rather than as instructions — which is a mitigation,
+  not a guarantee.
 - **It is not a substitute for review.** Every comment it posts says so.
 
 ## Related

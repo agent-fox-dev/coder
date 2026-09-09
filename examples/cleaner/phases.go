@@ -43,6 +43,9 @@ type ImplementInput struct {
 	Baseline      VerifyResult
 	VerifyCommand string
 	Branch        string
+	// Instructions is the project's AGENTS.md or CLAUDE.md when one exists
+	// and is small enough to inline; empty otherwise. See projectInstructions.
+	Instructions string
 }
 
 // agentBrain runs both phases as AgentKit agents against the configured model.
@@ -70,8 +73,11 @@ var readOnlyTools = []string{"read_file", "list_files", "find_files", "search_fi
 var writeTools = []string{"read_file", "write_file", "edit_file", "list_files", "find_files", "search_files", "execute", "run_command"}
 
 // readOnlyPrograms is the analysis phase's shell allowlist: programs that
-// report and do not change anything.
-var readOnlyPrograms = []string{"git", "ls", "cat", "head", "tail", "wc", "rg", "grep", "find", "file"}
+// report and do not change anything. `find` is not here on purpose: its
+// -exec and -delete make it a write tool, and find_files covers the reading
+// half. (toolGuard refuses those flags anyway, for a phase that adds it back
+// through --allow.)
+var readOnlyPrograms = []string{"git", "ls", "cat", "head", "tail", "wc", "rg", "grep", "file"}
 
 // buildPrograms is what an implementation phase needs on top of that: the
 // toolchains that compile, format and test. The verify command's own program
@@ -172,14 +178,18 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	)
 
 	// The shipped restricted policy is the floor: an allowlist of program
-	// names, and no shell operators. On top of it sits toolGuard, which knows
-	// two things this program cares about and a generic policy cannot: that
-	// git mutations belong to the pipeline rather than to the model, and that
-	// nothing the model does should reach GitHub without passing through the
-	// audited comment path.
+	// names. The implementation phase may use shell operators — a build that
+	// cannot pipe into grep or redirect a log is a build the model fights —
+	// and the allowlist is documented as a floor rather than a sandbox. The
+	// read-only phase gets no operators, because a redirection is a write.
+	// On top of the policy sits toolGuard, which knows two things this program
+	// cares about and a generic policy cannot: that git mutations belong to
+	// the pipeline rather than to the model, and that nothing the model does
+	// should reach GitHub without passing through the audited comment path.
 	base := agentkit.RestrictedPolicy(agentkit.RestrictedOptions{
-		AllowedPrograms:  spec.programs,
-		TerminateOnBlock: false,
+		AllowedPrograms:     spec.programs,
+		AllowShellOperators: !spec.readOnly,
+		TerminateOnBlock:    false,
 	})
 	cfg.BeforeToolCall = toolGuard(base, spec.readOnly, func(msg string) {
 		if b.verbose {
@@ -190,21 +200,66 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 		agentkit.RetryMiddleware(agentkit.RetryOptions{MaxAttempts: 3}),
 	)
 
+	// Compaction. A phase that reads a dozen large files fills the context
+	// window before it reaches its terminating tool, and the run then ends on
+	// a provider error rather than on a result. The transform binds the
+	// agent's own history, so the history is made first and handed to the
+	// constructor.
+	history := core.NewConversationHistory()
+	installCompaction(&cfg, history, func(err error) {
+		b.printf("  [compaction] %v\n", err)
+	})
+
 	built, err := tools.All(tools.Options{Workspace: b.workspace})
 	if err != nil {
 		return nil, err
 	}
 
-	agent, err := agentkit.NewAgent(cfg)
+	agent, err := agentkit.NewAgentWithHistory(cfg, history)
 	if err != nil {
 		return nil, err
 	}
 	for _, t := range append(selectTools(built, spec.toolNames...), spec.custom...) {
+		if t.Name == "execute" && spec.readOnly {
+			// The shipped description advertises operators the read-only
+			// policy refuses; a model told they work wastes turns finding out.
+			t.Description = "Run one plain command. Pipes, redirection, &&, ; and $() are " +
+				"refused in this phase, so run one program per call. Output is truncated " +
+				"from the END if it is large, so the tail of a long listing is preserved."
+		}
 		if err := agent.RegisterTool(t); err != nil {
 			return nil, err
 		}
 	}
 	return agent, nil
+}
+
+// compactionReserveTokens bounds the summary a compaction writes: its
+// max_tokens is 0.8 × this, clamped to the model's own ceiling.
+const compactionReserveTokens = 8000
+
+// installCompaction sets cfg.TransformContext to summarize the transcript in
+// place once it passes 60% of the model's context window. The summarizer
+// calls the provider directly, off the middleware path, which is why it needs
+// the provider rather than the agent. A model with no registered provider
+// gets no compaction — the run fails on the missing provider anyway.
+func installCompaction(cfg *core.AgentConfig, history *core.ConversationHistory, onError func(error)) {
+	if cfg.Model == nil || cfg.Providers == nil {
+		return
+	}
+	p, ok := cfg.Providers.Get(cfg.Model.API)
+	if !ok {
+		return
+	}
+	client := core.ClientFunc(p.Stream)
+	cfg.TransformContext = agentkit.NewContextTransform(agentkit.CompactionDeps{
+		Strategy:       agentkit.SummarizationCompaction{ThresholdFraction: 0.6},
+		Summarizer:     agentkit.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
+		TurnSummarizer: agentkit.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
+		History:        history,
+		Model:          cfg.Model,
+		OnError:        onError,
+	})
 }
 
 // drive runs one phase and renders it as progress on stderr.
@@ -273,15 +328,93 @@ func selectTools(all []core.Tool, names ...string) []core.Tool {
 	return out
 }
 
-// mutatingGit are the git subcommands the agent may not run. Reading history
-// is how you understand a bug; writing it is how a run stops being
-// reproducible.
-var mutatingGit = map[string]bool{
-	"commit": true, "push": true, "merge": true, "rebase": true, "reset": true,
-	"checkout": true, "switch": true, "branch": true, "cherry-pick": true,
-	"revert": true, "stash": true, "clean": true, "tag": true, "am": true,
-	"apply": true, "restore": true, "mv": true, "rm": true, "worktree": true,
-	"remote": true, "config": true, "gc": true, "update-ref": true, "filter-branch": true,
+// readOnlyGit are the git subcommands the agent may run: the ones that
+// report. Reading history is how you understand a bug; writing it is how a
+// run stops being reproducible. It is an allowlist rather than a list of
+// mutating verbs because git grows verbs (and `pull`, `fetch`, `clone`,
+// `bisect` and `notes` were all missing from the first denylist). `branch`,
+// `remote` and `config` have read-only forms and are handled by gitReadOnly.
+var readOnlyGit = map[string]bool{
+	"status": true, "log": true, "diff": true, "show": true, "blame": true,
+	"rev-parse": true, "rev-list": true, "ls-files": true, "ls-tree": true,
+	"grep": true, "cat-file": true, "describe": true, "shortlog": true, "name-rev": true,
+}
+
+// readOnlyGitFlags are the arguments under which `branch`, `remote` and
+// `config` only read.
+var readOnlyGitFlags = map[string]map[string]bool{
+	"branch": {"-a": true, "--all": true, "-r": true, "--remotes": true, "-l": true, "--list": true,
+		"-v": true, "-vv": true, "--verbose": true, "--show-current": true, "--no-color": true},
+	"remote": {"-v": true, "--verbose": true, "show": true, "get-url": true},
+	"config": {"--get": true, "--get-all": true, "--get-regexp": true, "--list": true, "-l": true},
+}
+
+const readOnlyGitHint = "read-only git is allowed: status, log, diff, show, blame, rev-parse, " +
+	"ls-files, grep, cat-file, describe, shortlog, name-rev, branch --list, remote -v, config --get"
+
+// gitReadOnly decides one git invocation (argv without the leading "git").
+// It returns the reason when the call is refused.
+func gitReadOnly(args []string) (reason string, ok bool) {
+	sub, i := gitSubcommand(args)
+	for _, a := range args {
+		if strings.HasPrefix(a, "--output") {
+			return "git --output writes a file; run the command without it", false
+		}
+	}
+	for _, a := range args[:i] {
+		// `-c core.fsmonitor=…`, `--config-env` and `--exec-path` make git
+		// run a program of the model's choosing before any subcommand does.
+		if a == "-c" || strings.HasPrefix(a, "--config-env") || strings.HasPrefix(a, "--exec-path") {
+			return "git " + a + " is not allowed; " + readOnlyGitHint, false
+		}
+	}
+	if readOnlyGit[sub] {
+		return "", true
+	}
+	if flags, known := readOnlyGitFlags[sub]; known {
+		rest := args[i+1:]
+		switch sub {
+		case "remote":
+			if len(rest) == 0 || flags[rest[0]] {
+				return "", true
+			}
+		case "config":
+			if len(rest) > 0 && flags[rest[0]] {
+				return "", true
+			}
+		default: // branch: listing only
+			listing := true
+			for _, a := range rest {
+				listing = listing && flags[a]
+			}
+			if listing {
+				return "", true
+			}
+		}
+	}
+	if sub == "" {
+		sub = "(no subcommand)"
+	}
+	return "git " + sub + " is the pipeline's job, not the agent's; " + readOnlyGitHint, false
+}
+
+// findWriteFlags turn find into a write tool.
+var findWriteFlags = []string{"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+
+// gitSubcommand skips git's global flags (`git -C dir commit`) to find the
+// verb and its index. A guard that read argv[0] blindly would wave that call
+// straight through.
+func gitSubcommand(args []string) (string, int) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			return a, i
+		}
+		if a == "-C" || a == "-c" || a == "--git-dir" || a == "--work-tree" {
+			i++ // this flag takes a value
+		}
+	}
+	return "", len(args)
 }
 
 func (b *agentBrain) print(args ...any) {
@@ -305,6 +438,11 @@ func (b *agentBrain) printf(format string, args ...any) {
 // toolGuard is the second half of the authorization boundary: the policy that
 // knows about THIS application. It runs before the shipped restricted policy
 // and can only narrow it.
+//
+// An `execute` command is judged one simple command at a time: `ls; git push`
+// is two commands, and the second is the one that matters. The shipped policy
+// only looks at the first program once operators are allowed, so it too is
+// applied to every segment.
 func toolGuard(base core.BeforeToolCall, readOnly bool, log func(string)) core.BeforeToolCall {
 	block := func(name, reason string) core.BeforeToolCallDecision {
 		log(name + ": " + reason)
@@ -317,59 +455,208 @@ func toolGuard(base core.BeforeToolCall, readOnly bool, log func(string)) core.B
 				return block(in.ToolName, "this phase is read-only: analyse the code, do not change it")
 			}
 		case "execute", "run_command":
-			argv := commandWords(in)
-			if len(argv) == 0 {
-				break
-			}
-			switch baseName(argv[0]) {
-			case "gh":
-				return block(in.ToolName,
-					"gh is not available to the agent: cleaner posts the analysis, the summary "+
-						"and the pull request itself, so every write to the issue is audited")
-			case "git":
-				if sub := firstSubcommand(argv[1:]); mutatingGit[sub] {
-					return block(in.ToolName, "git "+sub+" is the pipeline's job, not the agent's; "+
-						"read-only git (status, log, diff, show, blame) is allowed")
+			for _, argv := range commandVectors(in) {
+				if reason, blocked := guardProgram(argv); blocked {
+					return block(in.ToolName, reason)
 				}
 			}
+			if d := base(ctx, in); d.Block {
+				return d
+			}
+			if in.ToolName == "execute" {
+				cmd, _ := in.Arguments["command"].(string)
+				if segs := shellSegments(cmd); len(segs) > 1 {
+					for _, seg := range segs[1:] {
+						if d := base(ctx, withCommand(in, seg)); d.Block {
+							return d
+						}
+					}
+				}
+			}
+			return core.BeforeToolCallDecision{}
 		}
 		return base(ctx, in)
 	}
 }
 
-// commandWords normalizes the two shell tools into one argument vector.
-func commandWords(in core.BeforeToolCallContext) []string {
+// guardProgram applies the application's rules to one argument vector.
+func guardProgram(argv []string) (reason string, blocked bool) {
+	if len(argv) == 0 {
+		return "", false
+	}
+	switch baseName(argv[0]) {
+	case "gh":
+		return "gh is not available to the agent: cleaner posts the analysis, the summary " +
+			"and the pull request itself, so every write to the issue is audited", true
+	case "git":
+		if reason, ok := gitReadOnly(argv[1:]); !ok {
+			return reason, true
+		}
+	case "find":
+		for _, a := range argv[1:] {
+			for _, f := range findWriteFlags {
+				if a == f {
+					return "find " + f + " changes or runs things; use find_files to look, and the file tools to change", true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// commandVectors normalizes the two shell tools into argument vectors, one
+// per simple command. Leading NAME=value assignments are dropped, the way the
+// shell (and the shipped policy's firstProgram) drop them: `GIT_AUTHOR_NAME=x
+// git commit` runs git, and a guard that read argv[0] would see an
+// environment variable.
+func commandVectors(in core.BeforeToolCallContext) [][]string {
 	switch in.ToolName {
 	case "execute":
 		cmd, _ := in.Arguments["command"].(string)
-		return strings.Fields(cmd)
-	case "run_command":
-		raw, _ := in.Arguments["argv"].([]any)
-		out := make([]string, 0, len(raw))
-		for _, v := range raw {
-			if s, ok := v.(string); ok {
-				out = append(out, s)
+		var out [][]string
+		for _, seg := range shellSegments(cmd) {
+			if argv := commandWords(strings.Fields(seg)); len(argv) > 0 {
+				out = append(out, argv)
 			}
 		}
 		return out
+	case "run_command":
+		raw, _ := in.Arguments["argv"].([]any)
+		words := make([]string, 0, len(raw))
+		for _, v := range raw {
+			if s, ok := v.(string); ok {
+				words = append(words, s)
+			}
+		}
+		if argv := commandWords(words); len(argv) > 0 {
+			return [][]string{argv}
+		}
 	}
 	return nil
 }
 
-// firstSubcommand skips git's global flags (`git -C dir commit`) to find the
-// verb. A guard that read argv[1] blindly would wave that call straight
-// through.
-func firstSubcommand(args []string) string {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if !strings.HasPrefix(a, "-") {
-			return a
+// commandWords drops leading environment assignments and the quoting a
+// segment may carry, leaving the words the guard classifies.
+func commandWords(words []string) []string {
+	var out []string
+	for _, w := range words {
+		if out == nil {
+			if i := strings.IndexByte(w, '='); i > 0 && !strings.ContainsAny(w[:i], "/") {
+				continue
+			}
 		}
-		if a == "-C" || a == "-c" || a == "--git-dir" || a == "--work-tree" {
-			i++ // this flag takes a value
+		w = strings.TrimRight(strings.Trim(w, `"'`), ")")
+		if w != "" {
+			out = append(out, w)
 		}
 	}
-	return ""
+	return out
+}
+
+// shellSegments splits a POSIX-sh command line into its simple commands at
+// the unquoted `;`, `|`, `||`, `&&`, `&`, newline, subshell and command
+// substitution boundaries. Redirections (`2>&1`, `&>`) are not boundaries.
+// Quoting follows the shipped policy's grammar: nothing splits inside single
+// quotes; inside double quotes only backtick and `$(` start a new command.
+//
+// It is a classifier, not a parser: an odd construct yields a fragment that
+// looks like a program name and gets refused, which is the safe direction.
+func shellSegments(cmd string) []string {
+	var segs []string
+	var cur strings.Builder
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
+			segs = append(segs, s)
+		}
+		cur.Reset()
+	}
+	inSingle, inDouble := false, false
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		var next byte
+		if i+1 < len(cmd) {
+			next = cmd[i+1]
+		}
+		switch {
+		case inSingle:
+			if c == '\'' {
+				inSingle = false
+			}
+			cur.WriteByte(c)
+		case inDouble:
+			switch c {
+			case '"':
+				inDouble = false
+				cur.WriteByte(c)
+			case '\\':
+				cur.WriteByte(c)
+				if i+1 < len(cmd) {
+					i++
+					cur.WriteByte(cmd[i])
+				}
+			case '`':
+				flush()
+			case '$':
+				if next == '(' {
+					flush()
+					i++
+				} else {
+					cur.WriteByte(c)
+				}
+			default:
+				cur.WriteByte(c)
+			}
+		default:
+			switch c {
+			case '\'':
+				inSingle = true
+				cur.WriteByte(c)
+			case '"':
+				inDouble = true
+				cur.WriteByte(c)
+			case '\\':
+				cur.WriteByte(c)
+				if i+1 < len(cmd) {
+					i++
+					cur.WriteByte(cmd[i])
+				}
+			case ';', '\n', '|', '(', ')', '`':
+				flush()
+			case '&':
+				var prev byte
+				if i > 0 {
+					prev = cmd[i-1]
+				}
+				if prev == '>' || prev == '<' || next == '>' {
+					cur.WriteByte(c) // a redirection, not a list operator
+				} else {
+					flush()
+				}
+			case '$':
+				if next == '(' {
+					flush()
+					i++
+				} else {
+					cur.WriteByte(c)
+				}
+			default:
+				cur.WriteByte(c)
+			}
+		}
+	}
+	flush()
+	return segs
+}
+
+// withCommand is the interceptor context for one segment of a command.
+func withCommand(in core.BeforeToolCallContext, cmd string) core.BeforeToolCallContext {
+	args := make(map[string]any, len(in.Arguments))
+	for k, v := range in.Arguments {
+		args[k] = v
+	}
+	args["command"] = cmd
+	in.Arguments = args
+	return in
 }
 
 // maxLen sets the schema's upper length bound. The combinators cover the

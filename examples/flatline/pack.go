@@ -418,11 +418,16 @@ func (p *Pack) AssembleContext(arch Archetype, group int, memoryFacts []string) 
 		sections = append(sections, "## Architecture\n\n_(Omitted — not required for this session.)_")
 	}
 
-	if p.Steering != "" {
-		sections = append(sections, "## Steering Directives\n\n"+p.Steering)
-	}
-	if p.Project != "" {
-		sections = append(sections, "## Project Instructions\n\n"+p.Project)
+	// Steering and the project's own instructions are for the session that
+	// writes code. A gate runs commands and a verifier reads; neither needs
+	// the house style, and the tokens are better spent on the checklist.
+	if arch == Coder {
+		if p.Steering != "" {
+			sections = append(sections, "## Steering Directives\n\n"+p.Steering)
+		}
+		if p.Project != "" {
+			sections = append(sections, "## Project Instructions\n\n"+p.Project)
+		}
 	}
 	if len(memoryFacts) > 0 {
 		var b strings.Builder
@@ -438,9 +443,12 @@ func (p *Pack) AssembleContext(arch Archetype, group int, memoryFacts []string) 
 	return strings.Join(sections, "\n\n---\n\n")
 }
 
-// TestCommandsBlock is the Python renderer's `## Test Commands` section.
+// TestCommandsBlock is the Python renderer's `## Test Commands` section, plus
+// one line for the read-only sessions, whose shell has no operators: a
+// command with `&&` in it is run one side at a time.
 func TestCommandsBlock(tc afspec.TestCommands) string {
-	return fmt.Sprintf("## Test Commands\n\n- Spec tests: `%s`\n- All tests: `%s`\n- Linter: `%s`",
+	return fmt.Sprintf("## Test Commands\n\n- Spec tests: `%s`\n- All tests: `%s`\n- Linter: `%s`\n\n"+
+		"In a session whose shell refuses operators, run each side of an `&&` as its own command.",
 		tc.SpecTests, tc.AllTests, tc.Linter)
 }
 

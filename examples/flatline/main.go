@@ -16,8 +16,8 @@
 // ends up on one named after the spec — feature/{spec_id}_{spec_name} — so
 // the branch to merge is not something to work out by counting. After the
 // last group the three test commands run once more (agent-fox's post-merge
-// `make check`) and an informational verifier session records PASS/FAIL
-// verdicts per requirement.
+// `make check`) and, with --verifier, an informational verifier session
+// records PASS/FAIL verdicts per requirement.
 //
 // See examples/flatline/README.md for the mapping to agent-fox and for the
 // places where this program deliberately differs.
@@ -74,7 +74,8 @@ func run() int {
 	maxRetries := flag.Int("max-retries", 2, "retries per task group after the first attempt (agent-fox max_retries)")
 	sessionTimeout := flag.Duration("session-timeout", 45*time.Minute, "wall-clock ceiling per session (agent-fox session_timeout)")
 	checkTimeout := flag.Duration("check-timeout", 10*time.Minute, "timeout for one test command")
-	noVerifier := flag.Bool("no-verifier", false, "skip the informational verifier session after the last group")
+	verifier := flag.Bool("verifier", false, "run the informational verifier session after the last group (its verdicts are printed, never acted on)")
+	noVerifier := flag.Bool("no-verifier", false, "kept for compatibility: the verifier is off unless --verifier is given")
 	assumeDeps := flag.Bool("assume-deps", false, "treat the pack's cross-spec dependencies as already implemented instead of refusing the run")
 	journal := flag.String("journal", "", "append a JSONL record of every step to this file")
 	allow := flag.String("allow", "", "extra programs the coder's shell may run, comma-separated")
@@ -160,11 +161,13 @@ func run() int {
 		final = FinalBranchName(pack.Spec.SpecID, pack.Spec.SpecName)
 	}
 
+	// The pack's test commands are repository code and run without the
+	// credentials in this process's environment; git keeps its own.
 	opts := Options{
-		Pack: pack, Git: NewGit(ws.Root, execRunner), Brain: brain, Run: execRunner,
+		Pack: pack, Git: NewGit(ws.Root, execRunner), Brain: brain, Run: reducedEnvRunner,
 		Landing: landing, FinalBranch: final, Push: *push, PushAttempts: *pushAttempts,
 		MaxRetries: *maxRetries, MaxCostUSD: *maxCost, CheckTimeout: *checkTimeout,
-		RunVerifier: !*noVerifier, Out: os.Stderr, JournalPath: *journal, Verbose: *verbose,
+		RunVerifier: *verifier && !*noVerifier, Out: os.Stderr, JournalPath: *journal, Verbose: *verbose,
 	}
 
 	if *verbose {

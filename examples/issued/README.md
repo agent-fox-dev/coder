@@ -45,7 +45,7 @@ the code and work out why* — and turns every other part into a mechanism.
 | The issue-body markdown template | A `schema.Object` with required fields and enums. Go renders the markdown. |
 | "Ask the user how to label the issue (1/2/3)" | `--label`, parsed before the run starts. |
 | `gh issue create --repo …` | A `net/http` call in `main`, after the run, suppressed by `--dry-run`. The model has no network tool at all. |
-| "Halt until input is received." | `ErrNoInput` and exit 2, before a token is spent. |
+| "Halt until input is received." | `ErrNoInput` and exit 2, before a token is spent. So is a missing `GITHUB_TOKEN` when the run would file the issue. |
 | "One issue per invocation." | One `Issue` value, one terminating tool call. |
 
 None of the right-hand column depends on the model cooperating. That is the
@@ -188,8 +188,14 @@ is text a stranger wrote.
 
 `file_issue` sets `ToolResult.Terminate`, so `RunStopToolTerminate` is what
 "there is a diagnosis" means. A run that hits the turn limit or the budget
-returns an error naming the stop reason, and no issue. `StopAny(StopAfterTurns(30),
+returns an error naming the stop reason, and no issue. `StopAny(StopAfterTurns(100),
 StopOverBudget(2.00))` bounds a read loop that wanders.
+
+A long read loop also fills the context window. `NewTriager` installs
+`agentkit.NewContextTransform` with `SummarizationCompaction` at 60% of the
+window (`installCompaction` in [`triage.go`](triage.go)), so the transcript is
+summarized in place rather than the run ending on a context-length error
+before `file_issue` is ever called.
 
 ## Running it
 
@@ -203,7 +209,7 @@ go run ./examples/issued "<report>" [flags]
 | `--dir` | Workspace root. The analysis cannot read outside it. Default `.` |
 | `--repo owner/repo` | Target repository. Defaults to the issue the report came from, else the `origin` remote of `--dir`. |
 | `--dry-run` | Make no changes to GitHub; only print the rendered issue. |
-| `--overwrite` | Overwrite the input GitHub issue body in place instead of creating a new issue. |
+| `--overwrite` | Rewrite the input GitHub issue in place — title and body — instead of creating a new issue. Needs an issue URL as the input, and cannot be combined with `--label` or `--repo`; either is a usage error before the run. |
 | `--label a,b` | Labels for the created issue, e.g. `af:fix`. |
 | `--out FILE` | Also write the rendered issue to a file. |
 | `--debug` | Stream the model's reasoning text to stderr. |
@@ -211,9 +217,14 @@ go run ./examples/issued "<report>" [flags]
 
 Flags may come before or after the report. `AGENTKIT_MODEL` picks the model
 (`AGENTKIT_MODEL=openai/gpt-5.6-terra`); `GITHUB_TOKEN` or `GH_TOKEN`
-authenticates GitHub, and `GITHUB_API_URL` points at a GitHub Enterprise host.
-Reading a public issue needs no token; creating an issue does (unless
+authenticates GitHub, and `GITHUB_API_URL` points at a GitHub Enterprise host
+(its host is then also accepted as the `origin` remote's host when `--repo`
+is detected). Reading a public issue needs no token; filing one does, and a
+run that would file checks for the token before the model is called (unless
 `--dry-run` is passed).
+
+Exit codes: `0` filed or printed, `1` failed, `2` usage — no input, an
+undefined flag, or `--overwrite` without an issue URL or with `--label`/`--repo`.
 
 A typical session:
 
@@ -266,12 +277,13 @@ three files in it. Every claim this README makes is a test:
 | `TestARunThatNeverCallsFileIssueReturnsNoIssue` | A run that reaches no conclusion is a failure, not an empty issue. |
 | `TestTheRequestDeclaresFileIssueAndNoWriteTools` | What was actually sent on the wire. |
 | `TestRenderProducesEverySectionAndIsStable` | The document is complete and deterministic. |
-| `TestResolveInputClassifiesEverySource`, `TestParseIssueURL`, `TestParseRemote`, `TestAnOversizedReportIsTruncatedVisibly` | The dull decisions, decided in Go. |
+| `TestResolveInputClassifiesEverySource`, `TestParseIssueURL`, `TestParseRemote`, `TestAnOversizedReportIsTruncatedVisibly` | The dull decisions, decided in Go — including that an `origin` on GitLab is not a GitHub repository. |
 | `TestFlagParsingRejectsCreateAndAcceptsDryRun` | Flags accept `--dry-run` and reject `--create`. |
-| `TestFlagParsingOverwrite` | Flags parse `--overwrite`. |
+| `TestFlagParsingOverwrite` | Flags parse `--overwrite`; without an issue URL, or with `--label`/`--repo`, it is a usage error. |
+| `TestReadIssueHintsAtTheTokenOnlyOnAReal404` | The "set GITHUB_TOKEN" hint is keyed on the status code, not on digits in the message. |
 | `TestTargetRepoValidationHaltsWithoutDryRun` | Missing repository halts before analysis unless `--dry-run` is passed. |
 | `TestDryRunGating` | Gating prevents issue creation in dry-run mode and allows it by default. |
-| `TestGitHubUpdateIssue`, `TestFileOrDryRunOverwrite` | In-place issue body overwrite via GitHub PATCH API. |
+| `TestGitHubUpdateIssue`, `TestFileOrDryRunOverwrite` | In-place issue overwrite (title and body) via GitHub PATCH API. |
 | `TestFormatTokenTiming` | Token timing format renders duration and token counts correctly. |
 | `TestFlagParsingDebugAndVerbose` | Flags parse `--debug` and `--verbose`. |
 | `TestAC1DebugStreamsReasoningDeltas` | `--debug` streams reasoning text deltas, suppressed otherwise. |

@@ -163,7 +163,19 @@ func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose, debug bool) 
 		t.toolNames = append(t.toolNames, tool.Name)
 	}
 
-	agent, err := agentkit.NewAgent(cfg)
+	// Compaction. A triage that reads a dozen large files fills the context
+	// window before it reaches file_issue, and the run then ends on a
+	// provider error rather than on a diagnosis. The transform binds the
+	// agent's own history, so the history is made first and handed to the
+	// constructor.
+	history := core.NewConversationHistory()
+	installCompaction(&cfg, history, func(err error) {
+		t.outMu.Lock()
+		defer t.outMu.Unlock()
+		fmt.Fprintf(t.getOutput(), "  [compaction] %v\n", err)
+	})
+
+	agent, err := agentkit.NewAgentWithHistory(cfg, history)
 	if err != nil {
 		return nil, err
 	}
@@ -179,6 +191,34 @@ func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose, debug bool) 
 // ToolNames is the resolved set, for the startup banner and for the test that
 // asserts nothing mutating survived.
 func (t *Triager) ToolNames() []string { return t.toolNames }
+
+// compactionReserveTokens bounds the summary a compaction writes: its
+// max_tokens is 0.8 × this, clamped to the model's own ceiling.
+const compactionReserveTokens = 8000
+
+// installCompaction sets cfg.TransformContext to summarize the transcript in
+// place once it passes 60% of the model's context window. The summarizer
+// calls the provider directly, off the middleware path, which is why it needs
+// the provider rather than the agent. A model with no registered provider
+// gets no compaction — the run fails on the missing provider anyway.
+func installCompaction(cfg *core.AgentConfig, history *core.ConversationHistory, onError func(error)) {
+	if cfg.Model == nil || cfg.Providers == nil {
+		return
+	}
+	p, ok := cfg.Providers.Get(cfg.Model.API)
+	if !ok {
+		return
+	}
+	client := core.ClientFunc(p.Stream)
+	cfg.TransformContext = agentkit.NewContextTransform(agentkit.CompactionDeps{
+		Strategy:       agentkit.SummarizationCompaction{ThresholdFraction: 0.6},
+		Summarizer:     agentkit.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
+		TurnSummarizer: agentkit.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
+		History:        history,
+		Model:          cfg.Model,
+		OnError:        onError,
+	})
+}
 
 // SetOutput redirects diagnostic and progress output from stderr.
 func (t *Triager) SetOutput(w io.Writer) {
@@ -499,7 +539,9 @@ func (t *Triager) fileIssueTool() core.Tool {
 	}
 }
 
-// checkPaths returns the cited paths that do not exist in the workspace.
+// checkPaths returns the cited paths that are not regular files in the
+// workspace. A directory is refused too: "affected file: `session/`" is the
+// model naming the neighbourhood instead of the file it read.
 func (t *Triager) checkPaths(refs []FileRef) []string {
 	var missing []string
 	for _, f := range refs {
@@ -508,7 +550,7 @@ func (t *Triager) checkPaths(refs []FileRef) []string {
 			missing = append(missing, f.Path)
 			continue
 		}
-		if _, err := os.Stat(abs); err != nil {
+		if info, err := os.Stat(abs); err != nil || !info.Mode().IsRegular() {
 			missing = append(missing, f.Path)
 		}
 	}

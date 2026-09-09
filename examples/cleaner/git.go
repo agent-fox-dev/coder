@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/agentfox/agentkit-go/tools"
 )
 
 // Runner runs one external command and returns its combined output, its exit
@@ -22,11 +24,29 @@ type Runner func(ctx context.Context, dir string, argv []string, stdin ...string
 // commands are read by humans in a log, and interleaved stderr is what makes a
 // failing command's message appear next to the command that produced it.
 func execRunner(ctx context.Context, dir string, argv []string, stdin ...string) (string, int, error) {
+	return runCommand(ctx, dir, argv, nil, stdin...)
+}
+
+// reducedEnvRunner is execRunner with the credential variables stripped from
+// the environment — the model vendors' keys, and anything named *_TOKEN,
+// *_SECRET, *_API_KEY or *_PASSWORD. It is what the verification command runs
+// under: a test suite is repository code, and a repository that this program
+// is fixing on someone's report is not something to hand the API key to. git
+// and gh keep the full environment, because gh's own token lives there.
+func reducedEnvRunner(ctx context.Context, dir string, argv []string, stdin ...string) (string, int, error) {
+	return runCommand(ctx, dir, argv, tools.ReducedEnv(nil), stdin...)
+}
+
+// runCommand is the shared body. A nil env inherits the process environment.
+func runCommand(ctx context.Context, dir string, argv, env []string, stdin ...string) (string, int, error) {
 	if len(argv) == 0 {
 		return "", -1, fmt.Errorf("empty command")
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
+	if env != nil {
+		cmd.Env = env
+	}
 	if len(stdin) > 0 {
 		cmd.Stdin = strings.NewReader(strings.Join(stdin, ""))
 	}
@@ -115,6 +135,11 @@ func (g *Git) CurrentBranch(ctx context.Context) (string, error) {
 // is wrong on every repository that still uses `master`, on a fork whose
 // default is a release branch, and on any repo where the work is landing on a
 // long-lived integration branch.
+//
+// The "checked out now" fallback is only right BEFORE the feature branch is
+// created, which is why the pipeline asks once, in pre-flight, and keeps the
+// answer: asked after the checkout it would name the feature branch and the
+// squash merge would land the branch on itself.
 func (g *Git) BaseBranch(ctx context.Context) string {
 	if out, code, err := g.git(ctx, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil && code == 0 {
 		if b := strings.TrimPrefix(strings.TrimSpace(out), "origin/"); b != "" {
@@ -199,7 +224,7 @@ func (g *Git) Push(ctx context.Context, branch string, attempts int, log func(st
 		if err != nil {
 			last = err
 		}
-		if i == attempts || ctx.Err() != nil {
+		if i == attempts || ctx.Err() != nil || nonRetryablePush(out) {
 			break
 		}
 		log(fmt.Sprintf("push failed, retrying in %s (attempt %d/%d)", delay, i, attempts))
@@ -207,6 +232,22 @@ func (g *Git) Push(ctx context.Context, branch string, attempts int, log func(st
 		delay *= 2
 	}
 	return last
+}
+
+// nonRetryablePush recognizes the failures after which another attempt cannot
+// succeed — a bad credential, a missing repository, a host that does not
+// resolve. Retrying those only makes the operator wait through the backoff
+// for the same answer.
+func nonRetryablePush(out string) bool {
+	l := strings.ToLower(out)
+	for _, p := range []string{"authentication failed", "permission denied", "could not resolve host",
+		"connection refused", "connection timed out", "repository not found",
+		"no anonymous write access", "terminal prompts disabled", "could not read username"} {
+		if strings.Contains(l, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // SquashMergeInto lands the branch on base as a single commit, reusing the

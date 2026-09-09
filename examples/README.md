@@ -1,9 +1,10 @@
 # AgentKit examples
 
-Fifteen examples, smallest first. Each of the first twelve is a single
-self-contained `main.go` you can read top to bottom and copy into your own
-project — they deliberately repeat their setup rather than sharing a helper
-package, so nothing you need is in a file you have not opened. The last three,
+Fifteen examples, smallest first. The first twelve are small and
+self-contained — most are a single `main.go` you can read top to bottom and
+copy into your own project, and `testing` is a test file — and they
+deliberately repeat their setup rather than sharing a helper package, so
+nothing you need is in a file you have not opened. The last three,
 [`issued`](issued), [`cleaner`](cleaner) and [`flatline`](flatline), are the
 opposite on purpose: finished applications, which is what the others look like
 once they stop being examples.
@@ -42,7 +43,7 @@ skill rebuilt as a program. The third rebuilds an orchestrator's simplest path:
 |---|---|---|
 | [`issued`](issued) | `go run ./examples/issued "<a bug report>"` · `go test ./examples/issued/ -v` | **A whole application.** The read-only mandate becomes a tool policy, the issue template becomes a schema, "cite real files" becomes a check in a tool handler, and filing lives where no model output can reach it. Its test suite needs no key. |
 | [`cleaner`](cleaner) | `go run ./examples/cleaner https://github.com/{owner}/{repo}/issues/{n}` · `go test ./examples/cleaner/` | **A whole application.** Two model phases with different tool scopes, structured hand-off through terminating tools, an application-specific authorization guard, verification the model cannot fake, and an end-to-end test of all of it against a scripted provider. Its test suite needs no key. |
-| [`flatline`](flatline) | `cd examples/flatline && go run . --dir ~/src/widgets 3` · `go test ./...` | **A whole application, and a nested module.** agent-fox's `af code` for one spec pack with no dependencies: a session per task group with the spec rendered and scoped to it, memory carried from group to group, the pack's own test commands as gates, retries with the failure in the prompt, per-group squash landings, and an informational verifier — driven by the spec library it imports. Needs a sibling checkout of `agent-fox-dev/spec`; its test suite needs no key. |
+| [`flatline`](flatline) | `cd examples/flatline && go run . --dir ~/src/widgets 3` · `go test ./...` | **A whole application, and a nested module.** agent-fox's `af code` for one spec pack with no dependencies: a session per task group with the spec rendered and scoped to it, memory carried from group to group, the pack's own test commands as gates, retries with the failure in the prompt, per-group squash landings, and an optional informational verifier — driven by the spec library it imports. Needs a sibling checkout of `agent-fox-dev/spec`; its test suite needs no key. |
 
 There is also [`agentdemo`](agentdemo), which needs **no API key and no
 network**: it drives the real loop against a scripted provider and prints
@@ -237,9 +238,18 @@ level as construction inputs; use `NewAgentFromSession`. See
 **Nothing streams** — a non-streaming provider emits no delta events at all.
 Deltas are an optimization; the authoritative events always arrive.
 
-## Not yet covered by an example
+## Compaction
 
-**Compaction.** `agentkit.NewContextTransform` installs a context transform
-that summarizes a growing transcript in place. Once a summary checkpoint
-exists it is always re-applied; the threshold only decides whether to extend
-it. The naive "compact when over threshold" reading oscillates.
+`agentkit.NewContextTransform` installs a context transform that summarizes a
+growing transcript in place. Once a summary checkpoint exists it is always
+re-applied; the threshold only decides whether to extend it. The naive
+"compact when over threshold" reading oscillates.
+
+The three applications install it — see `installCompaction` in
+[`issued/triage.go`](issued/triage.go), [`cleaner/phases.go`](cleaner/phases.go)
+and [`flatline/phases.go`](flatline/phases.go). The shape is the same in each:
+make the `core.ConversationHistory` first, bind it into `CompactionDeps`
+alongside `ModelSummarizer` and `ModelTurnSummarizer` over the registered
+provider, set `cfg.TransformContext`, and construct the agent with
+`agentkit.NewAgentWithHistory(cfg, history)` so the transform and the agent
+share one history. None of the small examples set it up.

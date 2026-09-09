@@ -114,15 +114,15 @@ func checkFailureText(failed []CheckRun) string {
 	return b.String()
 }
 
-// checkPrograms is the first word of each command — the programs the coder's
-// shell allowlist must include, or the agent cannot run the suite it is judged
-// by. `sh` itself is never added.
+// checkPrograms is the first word of each simple command in each test
+// command — the programs the coder's shell allowlist must include, or the
+// agent cannot run the suite it is judged by. `sh` itself is never added.
 func checkPrograms(tc afspec.TestCommands) []string {
 	var out []string
 	for _, c := range []string{tc.Linter, tc.SpecTests, tc.AllTests} {
-		for _, part := range strings.Split(c, "&&") {
-			if f := strings.Fields(part); len(f) > 0 {
-				out = append(out, baseName(f[0]))
+		for _, seg := range shellSegments(c) {
+			if argv := commandWords(strings.Fields(seg)); len(argv) > 0 {
+				out = append(out, baseName(argv[0]))
 			}
 		}
 	}
