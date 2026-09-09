@@ -42,6 +42,12 @@ every match (~25–40% of the result), and `execute` carried `exit_code` and
   `list_files`/`find_files` (one entry per line).
 - The byte and line caps of REQ-TOOL-09 apply to the same underlying content
   as before; the marker sentences of REQ-TOOL-09b/09c are unchanged.
+- `find_files` and `list_files` default to 200 results/entries where
+  REQ-TOOL-09's table implied the cap (1000 and 500) was also the default.
+  The caps are unchanged and the truncation marker names `limit=400`, a call
+  that works. A default that hands the model a thousand paths it will not
+  use is ~8–12k tokens per call for a listing whose first screen was the
+  point.
 
 ## What did not change
 
