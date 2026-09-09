@@ -156,12 +156,26 @@ func SummaryComment(imp Implementation, class Classification, branch, prURL stri
 // FailureComment is what makes this program safe to leave running: a run that
 // could not finish says so on the issue, in the same place a successful one
 // would have, instead of dying in a terminal nobody is watching.
-func FailureComment(stage string, cause error, branch string, after VerifyResult) string {
+//
+// The sentence about where the work is has to be accurate, because it is the
+// first thing the human who picks this up will act on: a WIP commit on a
+// branch that is no longer checked out is a different starting point from
+// edits sitting loose in the working tree.
+func FailureComment(stage string, cause error, branch, commit, wip string, after VerifyResult) string {
 	var b strings.Builder
 	b.WriteString(marker + "\n## Automated fix attempt failed\n\n")
 	fmt.Fprintf(&b, "`cleaner` stopped during **%s**:\n\n```\n%s\n```\n\n", stage, strings.TrimSpace(cause.Error()))
-	if branch != "" {
-		fmt.Fprintf(&b, "Whatever was written is on the local branch `%s` — nothing was merged and nothing was pushed by this run.\n\n", branch)
+	switch {
+	case wip != "":
+		fmt.Fprintf(&b, "The unverified change is committed on the local branch `%s` as `%s` (a `wip:` commit, "+
+			"not for landing as is). Nothing was merged and nothing was pushed by this run; the checkout is back "+
+			"on the branch it started from.\n\n", branch, wip)
+	case commit != "":
+		fmt.Fprintf(&b, "The change is committed on the local branch `%s` as `%s`; landing it did not finish — "+
+			"see the error above for what was and was not done.\n\n", branch, commit)
+	case branch != "":
+		fmt.Fprintf(&b, "Whatever was written is uncommitted on the local branch `%s`, which is still checked out. "+
+			"Nothing was merged and nothing was pushed by this run.\n\n", branch)
 	}
 	if after.Command != "" && !after.Skipped {
 		fmt.Fprintf(&b, "Last `%s` run: %s\n\n```\n%s\n```\n\n", after.Command, after.Status(), after.Output)

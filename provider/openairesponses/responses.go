@@ -38,14 +38,15 @@ type request struct {
 	// prompt does not occupy an item and cannot be confused for one.
 	Instructions string `json:"instructions,omitzero"`
 	Input        []item `json:"input"`
-	Tools        []tool `json:"tools,omitzero"`
-	// AdditionalTools is REQ-CACHE-10's Responses arm: a tool that appeared
-	// MID-SESSION is declared here instead of in `tools`, so the cached prompt
-	// prefix — of which `tools` is the head — stays byte-identical to the
-	// previous turn's. Prepending one added tool to `tools` invalidates the
-	// entire provider-side cache for the rest of the session.
-	AdditionalTools []tool `json:"additional_tools,omitzero"`
-	ToolChoice      string `json:"tool_choice,omitzero"`
+	// Tools is the head of the cached prompt prefix. A tool that appeared
+	// MID-SESSION is NOT prepended here (REQ-CACHE-10): the Responses API has
+	// no `additional_tools` parameter — the PRD's field does not exist on this
+	// wire (ruling L-10) — so a late arrival is withheld from the array and
+	// re-declared in prose at its transcript position, exactly as the Chat
+	// Completions wire does. Prepending it would invalidate the entire
+	// provider-side cache for the rest of the session.
+	Tools      []tool `json:"tools,omitzero"`
+	ToolChoice string `json:"tool_choice,omitzero"`
 
 	MaxOutputTokens *int     `json:"max_output_tokens,omitzero"`
 	Temperature     *float64 `json:"temperature,omitzero"`
@@ -178,6 +179,13 @@ type Compat struct {
 	// SupportsReasoningSummary asks for a readable summary alongside the
 	// encrypted blob.
 	SupportsReasoningSummary bool `json:"supports_reasoning_summary"`
+	// SupportsSamplingParams: reasoning models on this wire reject
+	// temperature and top_p outright, the same rejection the Chat Completions
+	// profile's supports_temperature gates. When false both are omitted,
+	// whatever the caller set. The key is spelled differently from the Chat
+	// Completions one on purpose: §4.2 requires the two profiles' keys to be
+	// disjoint, so a flag written for one wire is never read by the other.
+	SupportsSamplingParams bool `json:"supports_sampling_params"`
 }
 
 // DefaultCompat is the api.openai.com profile. Every other vendor turns
@@ -192,6 +200,7 @@ func DefaultCompat() Compat {
 		SupportsFunctionStrict:     true,
 		SupportsStoreFlag:          true,
 		SupportsReasoningSummary:   true,
+		SupportsSamplingParams:     true,
 	}
 }
 
@@ -227,27 +236,14 @@ func BuildRequestCached(m *core.Model, req core.Request,
 	compat := CompatFor(m)
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeCallID))
 
-	out := &request{
-		Model:       m.ID,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stream:      true,
+	out := &request{Model: m.ID, Stream: true}
+	if compat.SupportsSamplingParams {
+		// Reasoning models reject both fields outright; omitting them is the
+		// only request that is not a 400, and the 400 names sampling rather
+		// than the model, sending the reader to the wrong knob.
+		out.Temperature = req.Temperature
+		out.TopP = req.TopP
 	}
-
-	sys := systemText(req.System)
-	if sys != "" {
-		if compat.UseInstructionsField {
-			out.Instructions = sys
-		} else {
-			out.Input = append(out.Input, item{
-				Type: "message", Role: "system",
-				Content: []part{{Type: "input_text", Text: sys}},
-			})
-		}
-	}
-	out.Input = append(out.Input, encodeItems(repaired, compat)...)
-
-	out.MaxOutputTokens = clampTokens(m, req)
 
 	// REQ-CACHE-06/NFR-PERF-03: ONE Sync over the WHOLE tool list, before the
 	// REQ-CACHE-10 split. Syncing the two halves separately would make each
@@ -273,17 +269,36 @@ func BuildRequestCached(m *core.Model, req core.Request,
 		}
 		return out
 	}
-	// REQ-CACHE-10: a tool the transcript introduced mid-session rides in
-	// additional_tools; everything else stays in the cached `tools` prefix.
+	// REQ-CACHE-10: a tool the transcript introduced mid-session is WITHHELD
+	// from `tools` and re-declared in prose at its transcript position
+	// (deferredDeclaration); everything else stays in the cached prefix.
 	// SplitDeferredTools owns the safety valve — with nothing immediate there
 	// is no prefix to anchor against and every tool is promoted back.
 	split := provider.SplitDeferredTools(req.Tools, req.Messages)
 	for _, tw := range split.Immediate {
 		out.Tools = append(out.Tools, encode(tw))
 	}
-	for _, tw := range split.Deferred {
-		out.AdditionalTools = append(out.AdditionalTools, encode(tw))
+	decl := deferredDeclaration(split.Deferred, schemas, req.Tools)
+
+	sys := systemText(req.System)
+	if sys != "" {
+		if compat.UseInstructionsField {
+			out.Instructions = sys
+		} else {
+			out.Input = append(out.Input, item{
+				Type: "message", Role: "system",
+				Content: []part{{Type: "input_text", Text: sys}},
+			})
+		}
 	}
+	// Stateless replay is decided here, before the items are encoded: with
+	// store:false the server keeps nothing between turns, and a reasoning
+	// item is replayable only by its encrypted content (encodeAssistant).
+	stateless := compat.SupportsStoreFlag
+	out.Input = append(out.Input, encodeItems(repaired, compat, stateless, decl)...)
+
+	out.MaxOutputTokens = clampTokens(m, req)
+
 	if req.ToolChoice.IsSet() {
 		// The same two words as the Chat Completions wire, and unlike it a
 		// bare string rather than an object. Absent stays absent: REQ-TOOL-16
@@ -291,6 +306,7 @@ func BuildRequestCached(m *core.Model, req core.Request,
 		out.ToolChoice = string(req.ToolChoice)
 	}
 	applyReasoning(out, m, req, compat)
+	applyInclude(out, compat)
 	applyCaching(out, req, compat)
 	return out, rep, sync, nil
 }
@@ -355,10 +371,18 @@ func encodeSchemas(tools []core.ToolWire, supportsStrict bool,
 		if t, ok := plan[s]; ok {
 			s = t
 		}
+		if s == nil {
+			// A tool with no schema takes no arguments; `parameters: null`
+			// is a 400, and an empty object is what the API documents.
+			return json.RawMessage(EmptyParameters), nil
+		}
 		return json.Marshal(s)
 	})
 	return raws, strict, rep, err
 }
+
+// EmptyParameters is the schema sent for a tool with no InputSchema.
+const EmptyParameters = `{"type":"object","properties":{}}`
 
 // strictTarget is REQ-TOOL-03 for this wire: the schema is PROBED through the
 // strict-subset rewrite before anything is sent, and strict:true rides only on
@@ -444,11 +468,20 @@ func applyReasoning(out *request, m *core.Model, req core.Request, compat Compat
 	if compat.SupportsReasoningSummary {
 		out.Reasoning.Summary = "auto"
 	}
+}
+
+// applyInclude asks for encrypted reasoning on EVERY request the profile
+// allows it on, independent of the thinking level.
+//
+// Without it the response carries no encrypted_content, and a stateless
+// caller — which is what AgentKit is, since it does not rely on server-side
+// conversation state — has nothing to replay. That was gated on a thinking
+// level being set, and a reasoning model reasons whether or not the caller
+// named a level: the first turn's reasoning items came back with an item id
+// and no blob, were replayed by id alone, and the second turn was a 400 under
+// store:false. The chain was not silently lost; the session was.
+func applyInclude(out *request, compat Compat) {
 	if compat.SupportsEncryptedReasoning {
-		// Without this the response carries no encrypted_content, and a
-		// stateless caller — which is what AgentKit is, since it does not rely
-		// on server-side conversation state — has nothing to replay. The chain
-		// is silently lost between turns rather than reported.
 		out.Include = append(out.Include, "reasoning.encrypted_content")
 	}
 }
@@ -468,17 +501,74 @@ func applyCaching(out *request, req core.Request, compat Compat) {
 	}
 }
 
+// deferredDecl is the REQ-CACHE-10 declaration: the tools withheld from
+// `tools`, and the message item that re-declares them.
+type deferredDecl struct {
+	names map[string]bool
+	item  item
+}
+
+// deferredDeclaration renders the withheld tools as prose, in a system
+// message item placed after the tool-result run that introduced them.
+//
+// This is the same arm the Chat Completions wire uses, for the same reason:
+// `tools` is a prefix-position array, and this wire has no other way to
+// declare a tool at its transcript position — the `additional_tools`
+// parameter the PRD described does not exist on the Responses API (ruling
+// L-10), and a request carrying it is rejected or has the field silently
+// dropped, which is a tool the model can neither see nor call. Prose is weaker
+// than a field — the model may call a tool absent from `tools`, and some
+// servers reject that — and still cheaper than rewriting the cached prefix.
+// The schemas are the ones the REQ-CACHE-06 prefix already serialized, so the
+// declaration costs no extra marshalling.
+func deferredDeclaration(deferred []core.ToolWire, schemas []json.RawMessage, all []core.ToolWire) *deferredDecl {
+	if len(deferred) == 0 {
+		return nil
+	}
+	index := make(map[string]int, len(all))
+	for i, tw := range all {
+		index[tw.Name] = i
+	}
+	d := &deferredDecl{names: make(map[string]bool, len(deferred))}
+	var b strings.Builder
+	b.WriteString("Additional tools became available at this point in the conversation " +
+		"and may be called from here on:\n")
+	for _, tw := range deferred {
+		d.names[tw.Name] = true
+		b.WriteString("\n- " + tw.Name)
+		if tw.Description != "" {
+			b.WriteString(": " + tw.Description)
+		}
+		if i, ok := index[tw.Name]; ok && len(schemas[i]) > 0 {
+			b.WriteString("\n  parameters: " + string(schemas[i]))
+		}
+	}
+	d.item = item{Type: "message", Role: "system",
+		Content: []part{{Type: "input_text", Text: b.String()}}}
+	return d
+}
+
 // encodeItems flattens canonical messages into wire items.
-func encodeItems(msgs core.Messages, compat Compat) []item {
+//
+// stateless says the request carries store:false, which decides whether a
+// reasoning item can be replayed by item id alone (encodeAssistant). decl is
+// REQ-CACHE-10's re-declaration; it lands after the LAST run of tool results
+// that announced a deferred tool, and at the end when no marker survived the
+// repair pass — still after every tool result, and better than dropping a
+// tool the model can then neither see nor call.
+func encodeItems(msgs core.Messages, compat Compat, stateless bool, decl *deferredDecl) []item {
 	var out []item
+	insertAt, inRun := -1, false
 	for _, m := range msgs {
 		switch v := m.(type) {
 		case core.UserMessage:
+			inRun = false
 			out = append(out, item{Type: "message", Role: "user",
 				Content: encodeParts(v.Content, "input")})
 
 		case core.AssistantMessage:
-			out = append(out, encodeAssistant(v, compat)...)
+			inRun = false
+			out = append(out, encodeAssistant(v, compat, stateless)...)
 
 		case core.ToolResultMessage:
 			callID, _ := SplitID(v.ToolUseID)
@@ -486,7 +576,27 @@ func encodeItems(msgs core.Messages, compat Compat) []item {
 				Type: "function_call_output", CallID: callID,
 				Output: v.Content.Text(),
 			})
+			if decl != nil {
+				if !inRun {
+					for _, n := range v.AddedToolNames {
+						if decl.names[n] {
+							inRun = true
+							break
+						}
+					}
+				}
+				if inRun {
+					insertAt = len(out)
+				}
+
+			}
 		}
+	}
+	if decl != nil {
+		if insertAt < 0 {
+			insertAt = len(out)
+		}
+		out = append(out[:insertAt], append([]item{decl.item}, out[insertAt:]...)...)
 	}
 	return out
 }
@@ -494,7 +604,7 @@ func encodeItems(msgs core.Messages, compat Compat) []item {
 // encodeAssistant is where the item model bites: one assistant message becomes
 // SEVERAL items — reasoning, then text, then one per tool call — and their
 // order is the order the model produced them.
-func encodeAssistant(m core.AssistantMessage, compat Compat) []item {
+func encodeAssistant(m core.AssistantMessage, compat Compat, stateless bool) []item {
 	var (
 		out  []item
 		text []part
@@ -519,8 +629,12 @@ func encodeAssistant(m core.AssistantMessage, compat Compat) []item {
 				// outcome as sending it and being refused, minus the error.
 				continue
 			}
+			it, ok := decodeThinkingSignature(v, compat, stateless)
+			if !ok {
+				continue
+			}
 			flushText()
-			out = append(out, decodeThinkingSignature(v, compat))
+			out = append(out, it)
 
 		case core.ToolUseBlock:
 			flushText()
@@ -550,8 +664,14 @@ type thinkingSignature struct {
 // Signature is documented as provider-issued and opaque, never inspected by
 // anything outside its own provider — so packing structured data into it is
 // legitimate here and nowhere else.
+//
+// An item id with no encrypted content yields NO signature. A stateless
+// caller cannot replay such an item — the id names server-side state that
+// store:false never kept, and sending it is a 400 on the next turn — so the
+// block is left unsigned on purpose: REQ-PROV-11 rule 4 then demotes it to
+// text rather than letting an unreplayable reference reach the wire.
 func EncodeThinkingSignature(itemID, encrypted string) string {
-	if itemID == "" && encrypted == "" {
+	if encrypted == "" {
 		return ""
 	}
 	b, err := json.Marshal(thinkingSignature{ItemID: itemID, Encrypted: encrypted})
@@ -561,22 +681,33 @@ func EncodeThinkingSignature(itemID, encrypted string) string {
 	return string(b)
 }
 
-func decodeThinkingSignature(v core.ThinkingBlock, compat Compat) item {
+// decodeThinkingSignature turns a signed block back into a reasoning item. ok
+// is false when the block cannot be replayed on this request and must be
+// dropped: a signature another provider issued names an item this server
+// never created (REQ-PROV-11 rule 3 strips it on cross-model replay anyway),
+// and under store:false an item with no encrypted content is a reference to
+// state the server does not hold.
+func decodeThinkingSignature(v core.ThinkingBlock, compat Compat, stateless bool) (item, bool) {
 	var sig thinkingSignature
 	if err := json.Unmarshal([]byte(v.Signature), &sig); err != nil {
-		// A signature from another provider. It cannot be replayed here, and
-		// REQ-PROV-11 rule 3 strips it on cross-model replay anyway; emitting
-		// an item with a foreign id would be rejected.
-		return item{Type: "reasoning"}
+		return item{}, false
 	}
-	it := item{Type: "reasoning", ID: sig.ItemID}
+	if sig.ItemID == "" && sig.Encrypted == "" {
+		return item{}, false
+	}
+	if stateless && (sig.Encrypted == "" || !compat.SupportsEncryptedReasoning) {
+		return item{}, false
+	}
+	// summary is ALWAYS present and never null: the API validates the field
+	// on a replayed reasoning item, and a Go nil slice marshals as null.
+	it := item{Type: "reasoning", ID: sig.ItemID, Summary: []summaryPart{}}
 	if compat.SupportsEncryptedReasoning {
 		it.EncryptedContent = sig.Encrypted
 	}
 	if v.Thinking != "" {
 		it.Summary = []summaryPart{{Type: "summary_text", Text: v.Thinking}}
 	}
-	return it
+	return it, true
 }
 
 func encodeParts(c core.Content, kind string) []part {

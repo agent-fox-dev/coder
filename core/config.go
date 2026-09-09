@@ -86,9 +86,13 @@ const (
 // TransformContext) are required by requirement text but absent from §5's
 // table.
 type AgentConfig struct {
-	Model        *Model
-	Provider     string // vendor id; credential resolution + catalog only
-	MaxTokens    *int   // REQ-PROV-16 presence; an upper bound (REQ-CAT-04)
+	Model    *Model
+	Provider string // vendor id; credential resolution + catalog only
+	// MaxTokens is an upper bound, clamped to the model (REQ-CAT-04). Nil is
+	// the SDK default (agentkit.DefaultMaxTokens), NOT the model's cap: the
+	// cap is 128K on current models and providers reserve rate-limit budget
+	// from max_tokens at request start (REQ-PROV-16 presence).
+	MaxTokens    *int
 	Temperature  *float64
 	TopP         *float64
 	SystemPrompt string

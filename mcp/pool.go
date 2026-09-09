@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -334,13 +335,16 @@ func (p *Pool) adapt(c *ServerConnection, d ToolDefinition, qualified string) co
 		MCPServer:   c.Name(),
 		InputSchema: schemaFrom(d.InputSchema),
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
-			args := map[string]any{}
-			if len(in) > 0 {
-				if err := json.Unmarshal(in, &args); err != nil {
-					return core.ErrResult("invalid_arguments", err.Error())
-				}
+			// The model's bytes go through VERBATIM. Decoding them into a
+			// map[string]any here laundered every number through a float64:
+			// an id of 9007199254740993 reached the server as
+			// 9007199254740992, and 1.10 as 1.1. Validity is checked, the
+			// value is not decoded.
+			args := bytes.TrimSpace(in)
+			if len(args) > 0 && (args[0] != '{' || !json.Valid(args)) {
+				return core.ErrResult("invalid_arguments", "tool arguments must be a JSON object")
 			}
-			res, err := c.Call(ctx, unqualified, args)
+			res, err := c.CallRaw(ctx, unqualified, args)
 			if err != nil {
 				return core.ErrResult("mcp_call_failed", err.Error())
 			}

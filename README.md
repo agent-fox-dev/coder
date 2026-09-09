@@ -130,7 +130,11 @@ transcript — on the turn an MCP server connects, which is when the transcript
 is longest. `SplitDeferredTools` is a single forward pass and later usage
 cannot un-defer a tool: a tool used on the turn *after* it appeared is the
 normal case, and un-deferring there promotes it exactly when promotion costs
-most.
+most. On the Anthropic wire the late tool is appended **visible and
+unstamped**, never with `defer_loading`: that flag belongs to the tool-search
+feature and a deferred tool is not shown to the model unless a tool-search
+server tool finds it, so "declared at its transcript position" was, on that
+wire, "hidden for the rest of the session" (ruling L-10).
 
 **Ignore rules are layered, and a nested repository is its own root**
 ([`tools/ignore.go`](tools/ignore.go)). A deeper `.gitignore` overrides a
@@ -263,7 +267,15 @@ client forever. Three rounds, then an error.
 client names the types it wants and the server MUST NOT send one it did not
 name. A connection with no subscription receives nothing — which is why the
 tool cache also honours the `ttlMs` hint every list result now carries, since a
-client that never subscribed has no other way to learn its cache went stale.
+client that never subscribed has no other way to learn its cache went stale. An
+explicit `ttlMs: 0` means *do not cache* — the list is fetched on every use —
+while an absent hint keeps the list until a `list_changed` arrives; the two
+used to be read the same way, which for the server that sent `0` was the
+opposite of what it asked. The default HTTP client also does **not follow
+redirects**: the configured headers carry the server's bearer token, and
+`net/http` would forward them (and, on a 307, the body) to whatever address the
+endpoint named. A caller supplying its own `http.Client` should set the same
+`CheckRedirect`.
 
 **Routing headers are derived from the body, never accepted from a caller.**
 Every POST carries `MCP-Protocol-Version`, `Mcp-Method` and — for `tools/call`
@@ -311,7 +323,10 @@ a declared 2³¹ wraps negative, sails past a `> max` check, and panics on a
 negative slice bound, which is a remote crash from a header field. And **no
 buffer is sized to a declared length**: a peer announcing 16 MiB and sending
 one byte must cost one byte, or the number in the header is a free allocation
-primitive.
+primitive. A fourth bound, **`MaxNodes`**, caps the total number of values in
+one message: a decoded value is 96 bytes and its shortest encoding is two, so
+the size, container and depth limits together still let a 16 MiB message
+materialize as a tree sixty-four times its size.
 
 **Field matching is case-sensitive**, unlike `encoding/json`. `id` and `Id` are
 two distinct keys, so duplicate-key rejection does not catch them; case-folded
@@ -367,7 +382,35 @@ unmap first.
 **Compaction applies its checkpoint before estimating.** The naive reading
 oscillates: the compacted request reports small usage → the threshold passes →
 full history returns → it fails again. Each swing invalidates the provider's
-cache prefix and re-sends content already paid to summarize.
+cache prefix and re-sends content already paid to summarize. **And extending
+a checkpoint summarizes only the delta** ([`compaction.go`](compaction.go)):
+the messages since the previous cut, with the previous summary handed to the
+summarizer to build on. Re-summarizing from message 0 on every extension is
+O(history) tokens each time and fails outright once the history has outgrown
+the window — which is exactly when the second extension is due
+([`docs/errata/compaction_extension.md`](docs/errata/compaction_extension.md)).
+
+**A tool result reaches the model as text, not as a JSON envelope**
+([`core/tool.go`](core/tool.go), `ToolResult.Text`). REQ-TOOL-08's envelope is
+the right Go type and the wrong wire shape: a source file inside a JSON string
+pays for every newline, tab and quote twice — 9–13% more bytes on Go code and
+an estimated 15–30% more tokens, on the results that dominate an agent's
+context — and the model then reads code through a layer of escaping it has to
+undo when it writes an edit. The built-in tools render their own text
+(`read_file` raw, `execute` raw with a status line only when it says
+something, `search_files` grep-style grouped by file); `Data` stays populated
+for interceptors, the audit trail and MCP bridging, and a custom tool that
+sets no `Text` gets the envelope byte for byte
+([`docs/errata/tool_result_rendering.md`](docs/errata/tool_result_rendering.md)).
+
+**`ThinkingLevel` on a current Claude model is `effort`, not a budget**
+([`provider/anthropic/stream.go`](provider/anthropic/stream.go)). The rows
+for Claude 4.6 and later speak in effort tokens, and the adapter sends
+`thinking: {type: "adaptive"}` plus `output_config.effort` for them;
+`budget_tokens` is a 400 on those models, so translating an effort into a
+budget — the previous behaviour — could only be omitted, which left every
+level inert. `off` consults the row first: Fable has no off switch, and
+sending `disabled` to it was a 400 on every request.
 
 **A non-unique `old_string` is a rejection, not a replace-all**
 ([`tools/edit.go`](tools/edit.go)). There is deliberately no `{replaced: N}`
@@ -704,9 +747,10 @@ requirement ledger, fixed and deferred alike, is [`docs/GAPS.md`](docs/GAPS.md).
 
 Three wire-level limits are consequences rather than omissions, and are
 recorded as rulings in [`docs/PROVIDERS.md`](docs/PROVIDERS.md) so they are not
-rediscovered as bugs: on `openai-completions` a deferred tool is re-declared in
-**prose** because that wire has neither `defer_loading` nor `additional_tools`,
-and a model may call a tool absent from `tools`; on Gemini a deferred tool is
+rediscovered as bugs: on both OpenAI wires a late-added tool is re-declared in
+**prose** because neither has a field for it (`additional_tools` does not
+exist on the Responses API), and a model may call a tool absent from `tools`;
+on Gemini a deferred tool is
 not callable at all, because that wire gates calling on `functionDeclarations`;
 and on Ollama `is_error` has nowhere to go and rides as an `Error: ` text
 prefix.

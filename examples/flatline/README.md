@@ -70,13 +70,13 @@ Read from `agent-fox` v4.9.1, `packages/agentfox/agentfox/`.
 | Context | `## Requirements` · `## Test Specification` · `## Tasks` scoped by `render_individual_scoped(group, max_tokens=30_000)` · `## Architecture` · `## Steering Directives` · `## Memory Facts`, joined by `---` (`session/context.py`) | `Pack.AssembleContext`, via `afspec.RenderIndividualScoped` |
 | Task prompt | "Implement task group N from specification `x`… Do not modify tasks.json… commit… run the relevant test suite and linter" (`session/prompt.py:129`) | same text, two sentences changed (below) |
 | Retry note | "**Note:** This is retry attempt N. The previous attempt failed with: …" (`session_lifecycle.py:383`) | verbatim |
-| Tools | the CLI's toolset; Bash gated by a program allowlist and a shell-operator ban (`core/security.py`) | AgentKit's file tools + `execute` under `RestrictedPolicy` with agent-fox's allowlist |
+| Tools | the CLI's toolset; Bash gated by a program allowlist and a shell-operator ban (`core/security.py`) | AgentKit's file tools + `execute` under `RestrictedPolicy` with agent-fox's allowlist. The coder may use shell operators — the pack's own test commands need `&&` — and every simple command on a line is checked; the gate and the verifier get no operators. `git` is limited to read-only subcommands, and an environment assignment in front of a program does not hide it |
 | Bounds | Sonnet, `max_turns=300`, `max_budget_usd=20`, session timeout 45 min, `max_retries=2` | the same defaults |
 | Done | the orchestrator marks the subtasks done and commits `chore: mark task group N subtasks done` (`session_lifecycle.py:774`) | same message, through `TransitionSubtask` |
 | Landing | `git merge --squash` into `main` with the last non-housekeeping commit's message (`workspace/harvest.py`) | `SquashMergeInto` + `SquashMessage` |
 | Blocked | retries exhausted → node blocked, dependents blocked in cascade, branch renamed `stalled/…` | the same; on a chain the cascade is "stop" |
 | Final check | `make check` once the graph drains → `COMPLETED` or `COMPLETED_DIRTY` (`engine.py:738`) | the pack's three commands → exit 0 or 4 |
-| Verifier | read-only session with a requirement-to-test checklist; PASS/FAIL verdicts, never gating (`profiles/verifier.md`) | same, `--no-verifier` to skip |
+| Verifier | read-only session with a requirement-to-test checklist; PASS/FAIL verdicts, never gating (`profiles/verifier.md`) | same, but off unless `--verifier` is given: a session whose verdicts change nothing is a cost the operator opts into |
 | Exit codes | completed 0 · stalled 2 · cost limit 3 · interrupted 130 | 0 · 1 · 3 · 130, plus 2 usage and 4 dirty |
 
 ### Where it deliberately differs
@@ -116,12 +116,21 @@ Each of these is a choice, not an omission.
    `rejected_approaches` each completed group submitted are injected into every
    later group's context.
 5. **No pre-flight reviewer, no audit-review, no coverage-regression
-   finding, no compaction.** The first three feed and read the knowledge
-   store; the last is a transcript transform this example does not set up.
-6. **AGENTS.md / CLAUDE.md are rendered into the context.** agent-fox relies
-   on the Claude CLI picking them up from the worktree; an AgentKit agent has
-   no such implicit behaviour, so the file is a `## Project Instructions`
-   section instead.
+   finding.** All three feed and read the knowledge store. Compaction *is*
+   set up: every session installs `agentkit.NewContextTransform` with
+   `SummarizationCompaction` at 60% of the context window (`installCompaction`
+   in [`phases.go`](phases.go)), so a long coder session summarizes its own
+   transcript instead of ending on a context-length error.
+6. **AGENTS.md / CLAUDE.md and steering are rendered into the coder's
+   context only.** agent-fox relies on the Claude CLI picking them up from
+   the worktree; an AgentKit agent has no such implicit behaviour, so the
+   file is a `## Project Instructions` section instead — for the session that
+   writes code. A gate runs commands and a verifier reads; neither needs the
+   house style.
+7. **The test commands run without credentials.** The pack's `test_commands`
+   are repository code; flatline runs them with the model vendors' keys and
+   every `*_TOKEN` / `*_SECRET` / `*_API_KEY` variable stripped from the
+   environment (`tools.ReducedEnv`). The model's own shell is not reduced.
 
 ### Three things the library port made necessary
 
@@ -182,7 +191,7 @@ unless `--assume-deps` is given.
 | `--max-retries` | `2` | Retries per group after the first attempt: three attempts in all. |
 | `--session-timeout` | `45m` | Wall-clock ceiling per session. |
 | `--check-timeout` | `10m` | Timeout for one test command. |
-| `--no-verifier` | off | Skip the informational verifier session. |
+| `--verifier` | off | Run the informational verifier session after the last group. Its verdicts are printed and journaled, never acted on. (`--no-verifier` is kept for compatibility.) |
 | `--assume-deps` | off | Treat the pack's cross-spec `dependencies` as already implemented instead of refusing the run. Each is reported as a warning and rendered into the coder's context as a `## Dependencies` table. |
 | `--journal` | — | Append a JSONL record of every step to this file. |
 | `--allow` | — | Extra programs the coder's shell may run. The pack's own test commands are always allowed. |
@@ -192,7 +201,7 @@ unless `--assume-deps` is given.
 | Exit | Meaning |
 |---|---|
 | `0` | Completed: every group landed and the final checks pass. |
-| `1` | Failed: a step errored, or a group exhausted its retries (agent-fox's *stalled*). The stage is named on stderr; the last attempt is on `stalled/feature/{spec}/{N}`. |
+| `1` | Failed: a step errored, or a group exhausted its retries (agent-fox's *stalled*). The stage is named on stderr; the last attempt is on `stalled/feature/{spec}/{N}` (with a numeric suffix if an earlier run already left one there). |
 | `2` | Usage error, or a pack that does not validate. Nothing was branched. |
 | `3` | The `--max-cost` ceiling was reached between groups. |
 | `4` | Completed *dirty*: every group landed, but the final checks fail. |
@@ -245,8 +254,9 @@ seven scripted turns.
   `TestPipelineRefusesADirtyTree`, `TestLoadPackRefusesDependenciesAndSealedSpecs`.
 - `TestMarkGroupDoneWalksTheStateMachine` — dropped subtasks stay dropped;
   the file is the library's canonical encoding.
-- `TestToolGuard` — `git commit`, `git -C . push`, `git checkout` are refused;
-  `git log` and `go test` are not; a read-only session cannot `write_file`.
+- `TestToolGuard` — `git commit`, `git -C . push`, `git checkout`, `git branch -D`
+  are refused; `git log` and `go test` are not; a read-only session cannot
+  `write_file`.
 
 ## What it does not do
 
@@ -263,7 +273,10 @@ seven scripted turns.
 - **Session persistence.** Each session is a fresh agent; a crashed run is
   re-run, and the preflight skips the groups that already landed.
 - **It is not a sandbox.** `go`, `make` and `uv` can run arbitrary code from
-  the repository. Anything genuinely untrusted belongs in a container.
+  the repository, and the coder's shell has operators. The guard checks every
+  simple command on a line against the allowlist and the git rules, but it is
+  a classifier over shell syntax, not a shell. Anything genuinely untrusted
+  belongs in a container.
 
 ## Related
 

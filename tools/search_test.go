@@ -12,8 +12,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/tools"
@@ -619,4 +621,93 @@ func insertPNGChunk(src []byte, typ string, payload []byte) []byte {
 	out = append(out, chunk...)
 	out = append(out, src[at:]...)
 	return out
+}
+
+// ---- review fixes
+
+// TestTheAcceleratedPathReadsTheSameIgnoreSourcesAsTheNativeOne is B3. The
+// native engine reads the global excludes, .git/info/exclude and .gitignore
+// files from the search ROOT down (REQ-TOOL-05.2). rg by default also walks
+// the root's PARENT directories for .gitignore and honours .ignore files, so a
+// search rooted in a subdirectory returned different files depending on which
+// backend answered. Both must return all three matches here.
+func TestTheAcceleratedPathReadsTheSameIgnoreSourcesAsTheNativeOne(t *testing.T) {
+	top := t.TempDir()
+	write := func(rel, body string) {
+		t.Helper()
+		p := filepath.Join(top, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(".gitignore", "*.log\n")  // a PARENT of the search root
+	write("sub/.ignore", "*.txt\n") // an .ignore file, which is rg's, not git's
+	write("sub/a.log", "needle\n")
+	write("sub/b.txt", "needle\n")
+	write("sub/c.md", "needle\n")
+	root := filepath.Join(top, "sub")
+	for _, backend := range bothBackends(t) {
+		t.Run(string(backend.name), func(t *testing.T) {
+			res, err := backend.run(t, root, tools.SearchParams{Pattern: "needle"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(names(res), " "); got != "a.log:1 b.txt:1 c.md:1" {
+				t.Fatalf("got %q; a parent .gitignore and an .ignore file are not ignore "+
+					"sources the native engine reads, so the accelerated path must not "+
+					"read them either", got)
+			}
+		})
+	}
+}
+
+// TestRipgrepIsStoppedOnceTheResultIsFull is B4. A fake rg emits five matches
+// and then hangs; with max_matches=2 the tool must return promptly rather than
+// wait for rg to finish a search whose remainder it will never read.
+func TestRipgrepIsStoppedOnceTheResultIsFull(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake rg is a shell script")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("needle\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(t.TempDir(), "rg")
+	script := `#!/bin/sh
+printf '%s\n' '{"type":"begin","data":{"path":{"text":"./a.txt"}}}'
+for i in 1 2 3 4 5; do
+  printf '{"type":"match","data":{"path":{"text":"./a.txt"},"lines":{"text":"needle\\n"},"line_number":%d}}\n' $i
+done
+printf '%s\n' '{"type":"end","data":{"path":{"text":"./a.txt"}}}'
+exec sleep 15
+`
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	restore := tools.SetRipgrepLookup(func() (string, bool) { return fake, true })
+	defer restore()
+
+	start := time.Now()
+	res, backend, err := tools.SearchIn(context.Background(), root,
+		tools.SearchParams{Pattern: "needle", MaxMatches: 2}, tools.NoGlobalExcludes())
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend != tools.BackendRipgrep {
+		t.Fatalf("backend = %q; the fake rg must have answered", backend)
+	}
+	if len(res.Matches) != 2 || !res.Truncated {
+		t.Fatalf("want 2 matches, truncated; got %d, %v", len(res.Matches), res.Truncated)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("the search took %v: rg must be killed once max_matches is reached, not "+
+			"waited for", elapsed)
+	}
 }

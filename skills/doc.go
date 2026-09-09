@@ -10,6 +10,31 @@
 // directory — git clone, cd, run. Config.TrustProject is a bool whose zero
 // value is false, so an embedder that says nothing gets nothing (REQ-SKILL-12).
 //
+// Three consequences of that stance are easy to lose in a refactor, so they
+// are stated here as well as at the code:
+//
+//   - The user-global tier is trusted by ORIGIN, so it must not be resolvable
+//     from inside the untrusted project. A relative HOME is refused
+//     (ResolveHome), and an absolute HOME that is the working directory or
+//     lies inside it is skipped at discovery, at selection and for the
+//     context file — otherwise <cwd>/.nightshift would be both tiers at once.
+//   - Trusting the project is trusting THIS repository. The context-file
+//     walk of REQ-CTX-02 starts at the outermost enclosing git root, or at
+//     the home directory when that is nearer, and never above; /tmp/AGENTS.md
+//     is not a project file. Candidates that are symlinks are refused on the
+//     same terms as a symlinked prompt.md (REQ-SEC-06).
+//   - Reads are bounded. A manifest over MaxManifestBytes rejects the skill;
+//     a context file over Config.MaxContextBytes (DefaultMaxContextBytes when
+//     zero) is cut at a line boundary, marked as truncated where the model
+//     can see it, and reported as a diagnostic.
+//
+// Everything interpolated into the assembled section is escaped per
+// POSITION (REQ-SKILL-06.5, REQ-CTX-04): attribute values escape the full
+// XML set, because a quote can end an attribute; element content — a skill's
+// description, a context file's body — escapes only '<', because only a tag
+// can close the container and the reader is a model, not a parser, so
+// "&amp;" in markdown prose would be noise it has to read past.
+//
 // The other half of the design is progressive disclosure (REQ-SKILL-06). A
 // skill contributes exactly three things to the prompt — name, description and
 // the absolute path to its prompt file — so the cost of offering N skills is

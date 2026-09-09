@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -71,7 +73,8 @@ func (g *GitHub) ReadIssue(ref IssueRef) (ghIssue, []ghComment, error) {
 	var issue ghIssue
 	path := fmt.Sprintf("/repos/%s/%s/issues/%d", ref.Owner, ref.Repo, ref.Number)
 	if err := g.do(http.MethodGet, path, nil, &issue); err != nil {
-		if strings.Contains(err.Error(), "404") && g.Token == "" {
+		var he *httpError
+		if errors.As(err, &he) && he.Status == http.StatusNotFound && g.Token == "" {
 			return issue, nil, fmt.Errorf("%w (set GITHUB_TOKEN if the repository is private)", err)
 		}
 		return issue, nil, err
@@ -100,12 +103,18 @@ func (g *GitHub) CreateIssue(owner, repo, title, body string, labels []string) (
 	return created.HTMLURL, nil
 }
 
-// UpdateIssue updates the issue's body and returns its URL.
-func (g *GitHub) UpdateIssue(owner, repo string, number int, body string) (string, error) {
+// UpdateIssue replaces the issue's title and body and returns its URL. The
+// title goes too: the triage names the defect, and an issue whose body says
+// "session: resume folds a trailing tool call" under the reporter's "it
+// crashed??" is half rewritten. An empty title leaves the existing one.
+func (g *GitHub) UpdateIssue(owner, repo string, number int, title, body string) (string, error) {
 	if g.Token == "" {
 		return "", fmt.Errorf("updating an issue needs a token: set GITHUB_TOKEN (or GH_TOKEN)")
 	}
 	payload := map[string]any{"body": body}
+	if strings.TrimSpace(title) != "" {
+		payload["title"] = title
+	}
 	var updated ghIssue
 	if err := g.do(http.MethodPatch, fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repo, number), payload, &updated); err != nil {
 		return "", err
@@ -146,13 +155,25 @@ func (g *GitHub) do(method, path string, payload any, out any) error {
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, firstLine(string(raw)))
+		return &httpError{Method: method, Path: path, Status: resp.StatusCode,
+			Text: resp.Status + ": " + firstLine(string(raw))}
 	}
 	if out == nil {
 		return nil
 	}
 	return json.Unmarshal(raw, out)
 }
+
+// httpError carries the status code as a number, so a caller that wants to
+// know about a 404 asks for the 404 rather than searching the message for the
+// digits — which would also match a body that happens to mention them.
+type httpError struct {
+	Method, Path string
+	Status       int
+	Text         string
+}
+
+func (e *httpError) Error() string { return fmt.Sprintf("%s %s: %s", e.Method, e.Path, e.Text) }
 
 // DetectRepo reads `git remote get-url origin` and parses owner/repo out of
 // it, handling both the SSH and HTTPS spellings. A repository with no origin
@@ -168,9 +189,29 @@ func DetectRepo(dir string) (owner, repo string, ok bool) {
 }
 
 // ParseRemote handles git@github.com:owner/repo.git, https://github.com/owner/repo
-// and ssh://git@github.com/owner/repo.git.
+// and ssh://git@github.com/owner/repo.git. The host has to be GitHub — or the
+// host GITHUB_API_URL points at — because an origin on GitLab or an internal
+// mirror would otherwise be turned into a github.com owner/repo that happens
+// to share the name, and the issue filed there.
 func ParseRemote(remote string) (owner, repo string, ok bool) {
-	s := strings.TrimSuffix(remote, ".git")
+	return parseRemote(remote, githubHosts(os.Getenv("GITHUB_API_URL")))
+}
+
+// githubHosts is the set of remote hosts a repository may live on: github.com,
+// and the enterprise host behind GITHUB_API_URL, with or without its `api.`
+// prefix (`api.ghe.example.com` serves `ghe.example.com`).
+func githubHosts(apiURL string) map[string]bool {
+	hosts := map[string]bool{"github.com": true}
+	if u, err := url.Parse(strings.TrimSpace(apiURL)); err == nil && u.Host != "" && u.Hostname() != "api.github.com" {
+		h := strings.ToLower(u.Hostname())
+		hosts[h] = true
+		hosts[strings.TrimPrefix(h, "api.")] = true
+	}
+	return hosts
+}
+
+func parseRemote(remote string, hosts map[string]bool) (owner, repo string, ok bool) {
+	s := strings.TrimSuffix(strings.TrimSpace(remote), ".git")
 	if i := strings.Index(s, "://"); i >= 0 {
 		s = s[i+3:]
 		if at := strings.Index(s, "@"); at >= 0 {
@@ -182,6 +223,13 @@ func ParseRemote(remote string) (owner, repo string, ok bool) {
 	}
 	parts := strings.Split(strings.Trim(s, "/"), "/")
 	if len(parts) < 3 {
+		return "", "", false
+	}
+	host := strings.ToLower(strings.TrimPrefix(parts[0], "www."))
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i] // a port
+	}
+	if !hosts[host] {
 		return "", "", false
 	}
 	owner, repo = parts[len(parts)-2], parts[len(parts)-1]

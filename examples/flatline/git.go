@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/agentfox/agentkit-go/tools"
 )
 
 // Runner runs one external command and returns its combined output, its exit
@@ -17,11 +19,28 @@ type Runner func(ctx context.Context, dir string, argv []string) (string, int, e
 
 // execRunner is the production Runner.
 func execRunner(ctx context.Context, dir string, argv []string) (string, int, error) {
+	return runCommand(ctx, dir, argv, nil)
+}
+
+// reducedEnvRunner is execRunner with the credential variables stripped from
+// the environment — the model vendors' keys, and anything named *_TOKEN,
+// *_SECRET, *_API_KEY or *_PASSWORD. It is what the pack's test commands run
+// under: a test suite is repository code, and it does not need the API key.
+// git keeps the full environment.
+func reducedEnvRunner(ctx context.Context, dir string, argv []string) (string, int, error) {
+	return runCommand(ctx, dir, argv, tools.ReducedEnv(nil))
+}
+
+// runCommand is the shared body. A nil env inherits the process environment.
+func runCommand(ctx context.Context, dir string, argv, env []string) (string, int, error) {
 	if len(argv) == 0 {
 		return "", -1, fmt.Errorf("empty command")
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
+	if env != nil {
+		cmd.Env = env
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		var ee *exec.ExitError

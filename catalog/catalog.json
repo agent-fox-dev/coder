@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-09-07",
-  "note": "SNAPSHOT. Every number below was correct on catalog_version and is stale the moment a vendor changes a price or ships a model. Regenerating this file is the REQ-CAT-06 ritual, and two fields must be diffed per model on every regeneration because they change the request body: thinking_level_map (REQ-PROV-15 -- an entry that silently disappears turns a clamped request into a 400, and an entry that silently appears sends a level the model does not know) and cost, including the vendor of fallback-served rows (REQ-PROV-05.5 -- dropping it bills a fallback at the wrong rate, silently). Everything else in a row is a capability hint the clamp and the budget gate can survive being slightly wrong about. This catalog is NOT an allowlist: an unknown id under a known vendor clones that vendor's default_model row (REQ-CAT-03), so a model released after this snapshot works without an SDK release. Two vendor-wide facts that do not fit in a row: (1) all three vendors have moved their reasoning control from a token budget to a discrete level -- output_config.effort on Anthropic, reasoning_effort on OpenAI, thinkingLevel on Gemini -- and only the OpenAI adapter emits its vendor's current field, so several rows below record levels as PRESENT-AND-NULL: checked, and not expressible on the wire this SDK sends. Present-null and absent are runtime-identical (ruling P-28); the runtime effect of a fully null ladder is that the thinking parameter is omitted, which on every such row means the vendor's own default, never a 400. (2) The google rows are the AI Studio deployment; Vertex AI is the same wire behind a different host and credential and is selected by configuration (Options.VertexProject or a Vertex base URL), never by a catalog row.",
+  "catalog_version": "2026-09-09",
+  "note": "SNAPSHOT. Every number below was correct on catalog_version and is stale the moment a vendor changes a price or ships a model. Regenerating this file is the REQ-CAT-06 ritual, and two fields must be diffed per model on every regeneration because they change the request body: thinking_level_map (REQ-PROV-15 -- an entry that silently disappears turns a clamped request into a 400, and an entry that silently appears sends a level the model does not know) and cost, including the vendor of fallback-served rows (REQ-PROV-05.5 -- dropping it bills a fallback at the wrong rate, silently). Everything else in a row is a capability hint the clamp and the budget gate can survive being slightly wrong about. This catalog is NOT an allowlist: an unknown id under a known vendor clones that vendor's default_model row (REQ-CAT-03), so a model released after this snapshot works without an SDK release. Two vendor-wide facts that do not fit in a row: (1) all three vendors have moved their reasoning control from a token budget to a discrete level -- output_config.effort on Anthropic, reasoning_effort on OpenAI, thinkingLevel on Gemini. The Anthropic and OpenAI adapters emit their vendor's current field: on an anthropic row an INTEGER wire value is a budget_tokens and an effort TOKEN (low..max) is sent as output_config.effort with adaptive thinking, and a row that rejects temperature/top_p says so with compat.supports_sampling false. The google adapter does not yet speak thinkingLevel, so its rows record levels as PRESENT-AND-NULL: checked, and not expressible on the wire this SDK sends. Present-null and absent are runtime-identical (ruling P-28); the runtime effect of a fully null ladder is that the thinking parameter is omitted, which on every such row means the vendor's own default, never a 400. An `off` entry that is present-and-null means the model cannot stop thinking and the anthropic adapter omits the key for a request of off rather than sending a rejected disable. (2) The google rows are the AI Studio deployment; Vertex AI is the same wire behind a different host and credential and is selected by configuration (Options.VertexProject or a Vertex base URL), never by a catalog row.",
   "vendors": {
     "anthropic": {
       "name": "Anthropic",
@@ -17,16 +17,36 @@
           "cost": { "input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5 },
           "input": ["text", "image"],
           "reasoning": true,
+          "compat": { "supports_sampling": false },
           "thinking_level_map": {
             "off": null,
-            "minimal": null,
-            "low": null,
-            "medium": null,
-            "high": null,
-            "xhigh": null,
-            "max": null
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
           },
-          "note": "Thinking is ALWAYS ON here: the model has no off switch, and `thinking.budget_tokens` -- the only thinking field the anthropic-messages adapter emits -- is rejected outright. Depth is output_config.effort, which this adapter does not send. So every level is present-and-null, the adapter omits the thinking key, and the model runs its own always-on reasoning: the correct request, reached by recording an absence rather than by guessing a budget. HAZARD, recorded because there is nowhere better to record it: `off` bypasses the clamp in applyThinking by design (ruling P-27's other half), so a caller who asks THIS row for `off` still gets {\"type\":\"disabled\"} on the wire and a 400 back. The map cannot stop it; the adapter is where that fix belongs. Cache read is 0.025x input on this row -- a quarter of the 0.1x every other Anthropic row charges -- which is exactly the kind of per-row exception REQ-PROV-05.5 exists for. Cache write is the 5-minute rate (1.25x input); a 1h write bills at 2x input and is priced by provider.ComputeCost, not from this row."
+          "note": "Thinking is always on and cannot be disabled: `off` is present-and-null, so the adapter omits the thinking key ({\"type\":\"disabled\"} is a 400 here). Every other level is an output_config.effort token sent with {\"type\":\"adaptive\"}; budget_tokens is rejected on this model, and so are temperature/top_p (compat.supports_sampling false drops them). Forced tool_choice any/tool is also a 400; the adapter only sends auto/none. Cache read is 0.025x input on this row -- a quarter of the 0.1x every other Anthropic row charges. Cache write is the 5-minute rate (1.25x input); a 1h write is priced by provider.ComputeCost, not from this row."
+        },
+        "claude-fable-5": {
+          "name": "Claude Fable 5",
+          "context_window": 1000000,
+          "max_tokens": 128000,
+          "cost": { "input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "compat": { "supports_sampling": false },
+          "thinking_level_map": {
+            "off": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "note": "Predecessor of claude-fable-5-1 at the same per-token price and the same always-on thinking: `off` is present-and-null (disabled is a 400), levels are effort tokens with adaptive thinking, budget_tokens and temperature/top_p are rejected. The one billing difference is cache read at the standard 0.1x input rather than Fable 5.1's 0.025x."
         },
         "claude-opus-5": {
           "name": "Claude Opus 5",
@@ -35,16 +55,72 @@
           "cost": { "input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25 },
           "input": ["text", "image"],
           "reasoning": true,
+          "compat": { "supports_sampling": false },
           "thinking_level_map": {
             "off": "disabled",
-            "minimal": null,
-            "low": null,
-            "medium": null,
-            "high": null,
-            "xhigh": null,
-            "max": null
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
           },
-          "note": "Effort-style reasoning on a wire this adapter does not speak. The vendor's control is output_config.effort (low through max) and budget_tokens is a 400 on this model, so no level above off can be priced into the request applyThinking builds: they are present-and-null, the thinking key is omitted, and omission on Opus 5 means ADAPTIVE thinking, which is on by default. That is the right default and not an accident -- but note that the SDK cannot currently ask this model for MORE or LESS thinking, only for none. `off` is \"disabled\" and is accepted, because the adapter never sends an effort and the model's default effort is high (disabling is rejected only at xhigh and max). Cache write is the 5-minute rate (1.25x input); cache read is 0.1x input."
+          "note": "Effort-style row: every level above off is an output_config.effort token sent with {\"type\":\"adaptive\"}. Omitting the key also means adaptive on this model (thinking is on by default), and `off` is \"disabled\", which the model accepts only at effort high or below -- the adapter sends no effort alongside disabled, so the default (high) applies. budget_tokens and temperature/top_p are 400s here (compat.supports_sampling false). Cache write is the 5-minute rate (1.25x input); cache read is 0.1x input."
+        },
+        "claude-opus-4-8": {
+          "name": "Claude Opus 4.8",
+          "context_window": 1000000,
+          "max_tokens": 128000,
+          "cost": { "input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "compat": { "supports_sampling": false },
+          "thinking_level_map": {
+            "off": "disabled",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "note": "Same request surface as claude-opus-4-7: effort tokens with adaptive thinking, `off` is \"disabled\", budget_tokens and temperature/top_p are 400s. Unlike Opus 5, omitting the thinking key means NO thinking on this model, which is why every level above off must be sent explicitly as adaptive."
+        },
+        "claude-opus-4-7": {
+          "name": "Claude Opus 4.7",
+          "context_window": 1000000,
+          "max_tokens": 128000,
+          "cost": { "input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "compat": { "supports_sampling": false },
+          "thinking_level_map": {
+            "off": "disabled",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "note": "The generation that removed budget_tokens and the sampling parameters and introduced the xhigh effort: levels are effort tokens with adaptive thinking, `off` is \"disabled\", temperature/top_p are 400s (compat.supports_sampling false). Omitting the thinking key means no thinking here."
+        },
+        "claude-opus-4-6": {
+          "name": "Claude Opus 4.6",
+          "context_window": 1000000,
+          "max_tokens": 128000,
+          "cost": { "input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "thinking_level_map": {
+            "off": "disabled",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "max": "max"
+          },
+          "note": "First adaptive-thinking generation: levels are effort tokens sent with {\"type\":\"adaptive\"} and `off` is \"disabled\". xhigh is ABSENT -- it arrived with Opus 4.7 -- so a request for xhigh clamps UP to max (REQ-PROV-15). budget_tokens still works but is deprecated and this adapter never sends it to an effort row; temperature/top_p are still accepted."
         },
         "claude-sonnet-5": {
           "name": "Claude Sonnet 5",
@@ -53,16 +129,66 @@
           "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.5 },
           "input": ["text", "image"],
           "reasoning": true,
+          "compat": { "supports_sampling": false },
           "thinking_level_map": {
             "off": "disabled",
-            "minimal": null,
-            "low": null,
-            "medium": null,
-            "high": null,
-            "xhigh": null,
-            "max": null
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
           },
-          "note": "Same effort-vs-budget story as claude-opus-5, one tier down: adaptive thinking when the key is omitted, {\"type\":\"disabled\"} accepted for off. The $2/$10 rate began as introductory pricing through 2026-08-31 and became the standard rate; the scheduled rise to $3/$15 did not happen, so this is the number to diff against next time, not a promotion to expire. 1M context at standard pricing -- no long-context tier, which is why cost.tiers is absent here and present on every openai row. Vendor default_model: the clone template for unknown anthropic ids, and therefore the row an id released after this snapshot inherits its window, cap and price from."
+          "note": "Vendor default_model: the clone template for unknown anthropic ids, and therefore the row an id released after this snapshot inherits its window, cap, price and effort-style ladder from. Levels are effort tokens with adaptive thinking, `off` is \"disabled\", budget_tokens and temperature/top_p are 400s (compat.supports_sampling false). $2/$10 is the standard rate; the once-scheduled rise to $3/$15 did not happen. 1M context at one price -- no long-context tier, which is why cost.tiers is absent here and present on every openai row."
+        },
+        "claude-sonnet-4-6": {
+          "name": "Claude Sonnet 4.6",
+          "context_window": 1000000,
+          "max_tokens": 128000,
+          "cost": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "thinking_level_map": {
+            "off": "disabled",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "max": "max"
+          },
+          "note": "Same ladder and rules as claude-opus-4-6 one tier down: effort tokens with adaptive thinking, `off` is \"disabled\", no xhigh (clamps up to max), temperature/top_p accepted, budget_tokens deprecated and never sent by this adapter."
+        },
+        "claude-opus-4-5": {
+          "name": "Claude Opus 4.5",
+          "context_window": 200000,
+          "max_tokens": 64000,
+          "cost": { "input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "thinking_level_map": {
+            "off": "disabled",
+            "minimal": "1024",
+            "low": "4096",
+            "medium": "16384",
+            "high": "32768"
+          },
+          "note": "Budget-wire row: the values are thinking token budgets for {\"type\":\"enabled\",\"budget_tokens\":N}, 1024 is the vendor minimum, and `off` is \"disabled\". xhigh and max are ABSENT, so a request for either clamps DOWN to high. 200k window and 64k output cap -- a sibling clone of the default_model would get 1M/128k and be wrong about this one."
+        },
+        "claude-sonnet-4-5": {
+          "name": "Claude Sonnet 4.5",
+          "context_window": 200000,
+          "max_tokens": 64000,
+          "cost": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 },
+          "input": ["text", "image"],
+          "reasoning": true,
+          "thinking_level_map": {
+            "off": "disabled",
+            "minimal": "1024",
+            "low": "4096",
+            "medium": "16384",
+            "high": "32768"
+          },
+          "note": "Budget-wire row like claude-opus-4-5: token budgets, 1024 minimum, `off` is \"disabled\", xhigh/max absent and clamped down to high. 200k window, 64k output cap. output_config.effort is an error on this model, which is why the ladder is budgets and not tokens."
         },
         "claude-haiku-4-5": {
           "name": "Claude Haiku 4.5",
@@ -78,7 +204,7 @@
             "medium": "16384",
             "high": "32768"
           },
-          "note": "The last Anthropic row that still speaks the budget wire, and the only one whose levels this adapter can actually send: the values are thinking token budgets, deliberately opaque to everything above the adapter, and 1024 is the vendor minimum. xhigh and max are ABSENT rather than null -- nothing was checked, they are opt-in -- so a request for max clamps DOWN to high, REQ-PROV-15's worked example. Also the only current Anthropic row with a 200k window rather than 1M; a sibling clone of the default_model would get 1M and be wrong about this one, which is why it is spelled out."
+          "note": "The smallest current row and a budget-wire one: the values are thinking token budgets, 1024 is the vendor minimum, `off` is \"disabled\". xhigh and max are ABSENT rather than null -- nothing was checked, they are opt-in -- so a request for max clamps DOWN to high, REQ-PROV-15's worked example. 200k window and 64k cap; output_config.effort is an error here, so the ladder stays in budgets."
         }
       }
     },

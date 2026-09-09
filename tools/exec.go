@@ -230,9 +230,14 @@ func runArgv(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, 
 	waitErr := cmd.Wait()
 	close(done)
 	elapsed := time.Since(start)
+	// The outcome is classified from the state AT EXIT. A cancellation that
+	// arrives during the drain below — after the command has already finished
+	// — must not turn a completed command into an aborted one.
+	aborted := ctx.Err() != nil
+	timedOut := !aborted && runCtx.Err() != nil
 	// Duration is measured at the child's exit, above: the drain that follows
 	// is the SDK waiting on a descendant, not the command running.
-	drainAfterExit(pr, copyDone, sink, opts.DrainIdle, opts.DrainCeiling)
+	drainAfterExit(runCtx, pr, copyDone, sink, opts.DrainIdle, opts.DrainCeiling)
 
 	exitCode := 0
 	signaled := false
@@ -249,9 +254,6 @@ func runArgv(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, 
 			signaled = true
 		}
 	}
-
-	aborted := ctx.Err() != nil
-	timedOut := !aborted && runCtx.Err() != nil
 
 	return ExecResult{
 		Output:     acc.String(),
@@ -314,8 +316,9 @@ func (s *drainSink) stop() {
 // every read, and stop only once the pipe has been QUIET for idle. The ceiling
 // is the second bound and a different question: idle answers "is anyone still
 // writing", ceiling answers "how long will we wait on someone who never
-// stops".
-func drainAfterExit(pr *os.File, copyDone <-chan struct{}, sink *drainSink, idle, ceiling time.Duration) {
+// stops". Cancellation is the third: once the caller has given up, nothing a
+// descendant might still write is worth waiting for.
+func drainAfterExit(ctx context.Context, pr *os.File, copyDone <-chan struct{}, sink *drainSink, idle, ceiling time.Duration) {
 	if idle <= 0 {
 		idle = defaultDrainIdle
 	}
@@ -342,6 +345,8 @@ func drainAfterExit(pr *os.File, copyDone <-chan struct{}, sink *drainSink, idle
 			}
 			drained = true
 		case <-ceilingTimer.C:
+			drained = true
+		case <-ctx.Done():
 			drained = true
 		}
 	}
@@ -390,16 +395,25 @@ func lookPathAny(names ...string) (string, bool) {
 // Dropping PATH is the obvious reading of "reduced environment" and it breaks
 // every command, so it is not what this does. What it removes is credentials,
 // which a subprocess has no business reading and which would otherwise be one
-// `env` away from any command the model writes (REQ-SEC-08). Two rules:
+// `env` away from any command the model writes (REQ-SEC-08). Three rules, all
+// matched on the UPPER-CASED name so `anthropic_api_key` is as gone as
+// `ANTHROPIC_API_KEY`:
 //
-//   - provider PREFIXES, for the keys the SDK itself knows about; and
-//   - generic SUFFIXES — *_TOKEN, *_SECRET, *_API_KEY, *_PASSWORD,
-//     *_CREDENTIALS — because a provider list is only ever the providers
-//     someone thought of, and GITHUB_TOKEN or NPM_TOKEN in a developer's shell
-//     is at least as valuable to exfiltrate as an Anthropic key.
+//   - provider PREFIXES, for the keys the SDK itself knows about;
+//   - generic SUFFIXES — *_TOKEN, *_SECRET, *_KEY, *_PASSWORD, *_PASS, *_PWD,
+//     *_PAT, *_AUTH, *_CREDENTIALS, *_PRIVATE_KEY — because a provider list is
+//     only ever the providers someone thought of, and GITHUB_TOKEN or
+//     NPM_TOKEN in a developer's shell is at least as valuable to exfiltrate
+//     as an Anthropic key;
+//   - the bare names TOKEN, API_KEY, SECRET and PASSWORD, which no suffix
+//     rule reaches.
 //
-// PATH, HOME, LANG, TMPDIR and TERM are kept unconditionally: no suffix rule
-// touches them, and they are what a command needs to run at all.
+// A short list is kept unconditionally, checked BEFORE the prefix rule: PATH,
+// HOME, LANG, TMPDIR and TERM, which a command needs to run at all, and the
+// non-secret provider settings — AWS_PROFILE, AWS_REGION, AWS_DEFAULT_REGION,
+// GOOGLE_CLOUD_PROJECT — without which a cloud CLI in the workspace stops
+// working while gaining no protection, since they name where to look and not
+// what to say.
 //
 // This is a real but LIMITED protection, and the limit is worth stating: a
 // command can still read the keys from any file the agent can read. The
@@ -410,6 +424,9 @@ func ReducedEnv(base []string, extraPrefixes ...string) []string {
 		"OPENROUTER_", "AZURE_OPENAI_", "AWS_", "MISTRAL_", "COHERE_",
 		"TOGETHER_", "FIREWORKS_", "XAI_", "AGENTKIT_",
 	}, extraPrefixes...)
+	for i, p := range prefixes {
+		prefixes[i] = strings.ToUpper(p)
+	}
 	if base == nil {
 		base = os.Environ()
 	}
@@ -428,18 +445,36 @@ func ReducedEnv(base []string, extraPrefixes ...string) []string {
 
 // credentialSuffixes is the generic half of REQ-SEC-08's rule, matched
 // case-insensitively: `github_token` is as much a token as `GITHUB_TOKEN`.
-var credentialSuffixes = []string{"_TOKEN", "_SECRET", "_API_KEY", "_PASSWORD", "_CREDENTIALS"}
+// `_KEY` subsumes `_API_KEY` and `_PRIVATE_KEY`; they are listed anyway so
+// the intent survives someone narrowing `_KEY` later.
+var credentialSuffixes = []string{
+	"_TOKEN", "_SECRET", "_API_KEY", "_KEY", "_PRIVATE_KEY", "_PASSWORD",
+	"_PASS", "_PWD", "_PAT", "_AUTH", "_CREDENTIALS",
+}
+
+// credentialNames are bare names no suffix rule reaches.
+var credentialNames = map[string]bool{"TOKEN": true, "API_KEY": true, "SECRET": true, "PASSWORD": true}
 
 // keptEnv names variables ReducedEnv never drops, whatever they are called.
-var keptEnv = map[string]bool{"PATH": true, "HOME": true, "LANG": true, "TMPDIR": true, "TERM": true}
+// The provider entries are the non-secret half of a cloud CLI's config: they
+// name where to look, not what to say, and a prefix rule that dropped them
+// broke `aws` and `gcloud` in the workspace for no gain.
+var keptEnv = map[string]bool{
+	"PATH": true, "HOME": true, "LANG": true, "TMPDIR": true, "TERM": true,
+	"AWS_PROFILE": true, "AWS_REGION": true, "AWS_DEFAULT_REGION": true,
+	"GOOGLE_CLOUD_PROJECT": true,
+}
 
 func credentialName(name string, prefixes []string) bool {
 	upper := strings.ToUpper(name)
 	if keptEnv[upper] {
 		return false
 	}
+	if credentialNames[upper] {
+		return true
+	}
 	for _, p := range prefixes {
-		if strings.HasPrefix(name, p) {
+		if strings.HasPrefix(upper, p) {
 			return true
 		}
 	}

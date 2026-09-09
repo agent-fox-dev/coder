@@ -112,6 +112,8 @@ type scanner struct {
 	i     int
 	lim   Limits
 	depth int
+	// nodes counts every value decoded so far, for MaxNodes.
+	nodes int
 	// build is false for Guard: the walk is identical, nothing is
 	// materialized, and the two paths cannot disagree about what is legal
 	// because there is only one of them.
@@ -152,6 +154,15 @@ func (s *scanner) value(parent, seg string) (Value, error) {
 	s.ws()
 	if s.i >= len(s.data) {
 		return Value{}, failf(RuleSyntax, join(parent, seg), "unexpected end of input")
+	}
+	// Counted on entry, which is BEFORE the append into the parent container
+	// that would hold this value — the same "bounded before it allocates"
+	// discipline as the other limits, and the same on the Guard path, so the
+	// two cannot disagree about how many values a message may carry.
+	s.nodes++
+	if s.nodes > s.lim.MaxNodes {
+		return Value{}, failf(RuleNodes, join(parent, seg), "message has more than %d values",
+			s.lim.MaxNodes)
 	}
 	switch c := s.data[s.i]; {
 	case c == '{':

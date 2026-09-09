@@ -159,9 +159,11 @@ func run() int {
 		verbose:       *verbose,
 	}
 
+	// The verification command is repository code and runs without the
+	// credentials in this process's environment; git and gh keep theirs.
 	opts := Options{
 		Ref: ref, Dir: ws.Root, Hub: hub, Git: NewGit(ws.Root, execRunner), Brain: brain,
-		Run: execRunner, VerifyCommand: verify, VerifyTimeout: *verifyTimeout,
+		Run: reducedEnvRunner, VerifyCommand: verify, VerifyTimeout: *verifyTimeout,
 		Landing: landing, DryRun: *dryRun, PushAttempts: *pushAttempts,
 		Out: os.Stderr, JournalPath: *journal, Verbose: *verbose,
 	}
@@ -173,10 +175,12 @@ func run() int {
 	summary(res, runErr, *verbose)
 
 	switch {
-	case res.NeedsClarification:
+	case res.NeedsClarification && runErr == nil:
+		// "Stopped on purpose" is only true when the question reached the
+		// issue; a question that could not be posted is a failed run.
 		return exitClarification
 	case runErr != nil && res.Stage == "verify":
-		return exitUnverified
+		return exitUnverified // code was written, and the checks reject it
 	case runErr != nil:
 		return exitFailed
 	default:
@@ -211,8 +215,10 @@ func summary(res *Result, err error, verbose bool) {
 func summaryTo(w io.Writer, res *Result, err error, verbose bool) {
 	fmt.Fprintln(w)
 	switch {
-	case res.NeedsClarification:
+	case res.NeedsClarification && err == nil:
 		fmt.Fprintf(w, "[cleaner] ? issue #%d is ambiguous — a question was posted and nothing was changed.\n", res.Ref.Number)
+	case res.NeedsClarification:
+		fmt.Fprintf(w, "[cleaner] ✗ issue #%d is ambiguous, and the question could not be posted; nothing was changed.\n", res.Ref.Number)
 	case err != nil:
 		fmt.Fprintf(w, "[cleaner] ✗ issue #%d NOT fixed (failed during %s).\n", res.Ref.Number, res.Stage)
 	default:
@@ -226,6 +232,9 @@ func summaryTo(w io.Writer, res *Result, err error, verbose bool) {
 	}
 	line("branch", res.Branch)
 	line("commit", res.Commit)
+	if res.WIPCommit != "" {
+		line("wip", fmt.Sprintf("%s on %s (unverified; the checkout is back on %s)", res.WIPCommit, res.Branch, res.BaseBranch))
+	}
 	line("pr", res.PRURL)
 	if res.Verification.Command != "" {
 		line("verify", fmt.Sprintf("%s — %s", res.Verification.Command, res.Verification.Status()))

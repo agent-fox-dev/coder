@@ -42,11 +42,14 @@ func encodeTools(t *testing.T, m *core.Model, req core.Request, r core.CacheRete
 // TestADeferredToolIsDeclaredAfterThePrefixAndCarriesNoBreakpoint is
 // REQ-CACHE-10's Anthropic arm.
 //
-// Two things have to be true together and each is easy to get alone: the
+// Three things have to be true together and each is easy to get alone: the
 // deferred tool must come AFTER every immediate one, so the cached prefix is
-// byte-identical to the previous turn's, and it must carry no cache_control,
+// byte-identical to the previous turn's; it must carry no cache_control,
 // because a breakpoint there sits past the very content the deferral exists to
-// keep cached.
+// keep cached; and it must still be VISIBLE to the model. The arm used to mark
+// it `defer_loading: true`, which on this wire hides the tool until a
+// tool-search server tool finds it — and no such tool was declared, so every
+// late-added tool was invisible for the rest of the session.
 func TestADeferredToolIsDeclaredAfterThePrefixAndCarriesNoBreakpoint(t *testing.T) {
 	m := testModel()
 	req := core.Request{
@@ -72,18 +75,21 @@ func TestADeferredToolIsDeclaredAfterThePrefixAndCarriesNoBreakpoint(t *testing.
 		t.Fatalf("tools[0] = %q, want read_file first: appending late arrivals is what "+
 			"keeps the cached prefix byte-identical", tools[0].Name)
 	}
-	if tools[0].DeferLoading != nil {
-		t.Fatal("an established tool must not be marked deferred")
-	}
 	if len(tools[0].CacheControl) == 0 {
 		t.Fatal("the breakpoint belongs on the last IMMEDIATE tool")
 	}
-	if tools[1].DeferLoading == nil || !*tools[1].DeferLoading {
-		t.Fatalf("tools[1] = %+v, want defer_loading: true", tools[1])
+	if tools[1].Name != "mcp__db__query" {
+		t.Fatalf("tools[1] = %q, want the late-added tool declared after the prefix", tools[1].Name)
 	}
 	if len(tools[1].CacheControl) != 0 {
 		t.Fatal("a deferred tool carries NO cache_control: a breakpoint there sits past " +
 			"the prefix the deferral exists to preserve")
+	}
+	for _, tl := range tools {
+		if tl.DeferLoading != nil {
+			t.Fatalf("%s carries defer_loading: without a tool-search server tool in the "+
+				"request that HIDES the tool from the model rather than positioning it", tl.Name)
+		}
 	}
 }
 

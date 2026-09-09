@@ -129,7 +129,29 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 	if r := req.Options.CacheRetention; r != nil {
 		retention = *r
 	}
-	body, rep, compat, sync, err := buildRequest(m, req, retention, c.prefix)
+	// The compat profile is inferred from the host the request will GO to
+	// (REQ-PROV-12): the environment override (OPENAI_BASE_URL and the
+	// vendor table's siblings) beats the catalog row, exactly as
+	// provider.ResolveBaseURL orders them, so an `openai` row pointed at
+	// DeepSeek through the environment gets DeepSeek's profile. Two layers
+	// are deliberately NOT consulted here. The credential store may name a
+	// base URL, but reading it can refresh a token, which is run's job. And
+	// Options.BaseURL is the embedder's compiled-in default, not a host the
+	// inference table knows; an embedder who compiles one in owns the row's
+	// compat, and a corporate gateway in front of api.openai.com must keep
+	// api.openai.com's profile.
+	env := provider.Env{Override: req.Options.Env, Getenv: c.opts.Getenv}
+	table := AuthFor(m.Provider)
+	if c.opts.Auth != nil {
+		table = *c.opts.Auth
+	}
+	inferFrom := m.BaseURL
+	if table.BaseURLVar != "" {
+		if u := strings.TrimRight(env.Get(table.BaseURLVar), "/"); u != "" {
+			inferFrom = u
+		}
+	}
+	body, rep, compat, sync, err := buildRequest(m, req, retention, c.prefix, inferFrom)
 	if err != nil {
 		return core.ErrorStream(nil, fmt.Errorf("openai: building request: %w", err))
 	}
@@ -357,9 +379,21 @@ type wireChunk struct {
 
 // ReasoningContentSignature marks a thinking block that this wire CAN replay:
 // see the reasoning case in snapshot. It is not a credential and carries no
-// provider state; the vendors with no documented replay leave the signature
-// empty so REQ-PROV-11 rule 4 degrades the block to text.
+// provider state.
 const ReasoningContentSignature = "openai-completions/reasoning_content"
+
+// ReasoningMarkerSignature marks native reasoning this wire received on a
+// profile with NO documented replay shape — OpenRouter's `reasoning` deltas,
+// a chat-template server's `reasoning_content`.
+//
+// It exists so the block is NOT demoted to text. Unsigned, REQ-PROV-11 rule 4
+// turns it into a TextBlock and the reasoning is re-sent as visible assistant
+// prose on every later turn, re-billed each time, conditioning the model on
+// its own chain as if it had said it aloud. Marked, the block survives rule 4
+// on a same-model replay and the encoder drops it (encodeMessages), which is
+// the only faithful thing this wire can do with it; rule 3 still downgrades
+// it for any other model, where the text is at least real context.
+const ReasoningMarkerSignature = "openai-completions/reasoning"
 
 // ---------------------------------------------------------------- assembler
 
@@ -370,6 +404,81 @@ type slot struct {
 	id    string
 	name  string
 	args  strings.Builder
+
+	// block is the tool call as LAST SUCCESSFULLY DECODED, and decodedAt the
+	// argument length it was decoded from (-1: never). A per-chunk snapshot
+	// reuses it rather than re-parsing and re-salvaging every call on every
+	// delta, which made each MessageUpdateEvent cost the whole argument
+	// stream so far. The decode is attempted when the brace scanner below
+	// sees the top-level value close, and forced — with salvage — at finish.
+	block     core.ToolUseBlock
+	decodedAt int
+	depth     int
+	opened    bool
+	inString  bool
+	escaped   bool
+}
+
+// scan advances the brace tracker over one argument fragment: O(fragment),
+// and complete reports whether the top-level object has closed since.
+func (s *slot) scan(frag string) (complete bool) {
+	for i := 0; i < len(frag); i++ {
+		c := frag[i]
+		switch {
+		case s.inString:
+			switch {
+			case s.escaped:
+				s.escaped = false
+			case c == '\\':
+				s.escaped = true
+			case c == '"':
+				s.inString = false
+			}
+		case c == '"':
+			s.inString = true
+		case c == '{' || c == '[':
+			s.depth++
+			s.opened = true
+		case c == '}' || c == ']':
+			s.depth--
+		}
+	}
+	return s.opened && s.depth <= 0
+}
+
+// decode materializes block from the accumulated arguments. With salvage the
+// bytes are repaired first (a cut-off stream), and a value that still does
+// not parse becomes an empty-argument call so the block is representable.
+func (s *slot) decode(salvage bool) {
+	raw := json.RawMessage(s.args.String())
+	if salvage {
+		if repaired, changed := provider.SalvageJSON(raw); changed {
+			raw = repaired
+		}
+	}
+	b, err := core.NewToolUse(s.id, s.name, raw)
+	if err != nil {
+		if !salvage {
+			return
+		}
+		b, _ = core.NewToolUse(s.id, s.name, nil)
+	}
+	s.block, s.decodedAt = b, s.args.Len()
+}
+
+// materialize returns the block a snapshot carries. final forces a decode of
+// anything not yet decoded, salvaging as needed; a per-chunk snapshot carries
+// the last decoded value with the current id and name.
+func (s *slot) materialize(final bool) core.ToolUseBlock {
+	if final && s.decodedAt != s.args.Len() {
+		s.decode(true)
+	}
+	b := s.block
+	if b.Input == nil {
+		b, _ = core.NewToolUse(s.id, s.name, nil)
+	}
+	b.ID, b.Name = s.id, s.name
+	return b
 }
 
 type decoder struct {
@@ -399,7 +508,7 @@ func (d *decoder) slotFor(key, kind string) *slot {
 	if s, ok := d.slots[key]; ok {
 		return s
 	}
-	s := &slot{kind: kind, index: len(d.order)}
+	s := &slot{kind: kind, index: len(d.order), decodedAt: -1}
 	d.slots[key] = s
 	d.order = append(d.order, key)
 	return s
@@ -409,13 +518,27 @@ func (d *decoder) consume(r *provider.SSEReader) error {
 	for {
 		ev, err := r.Next()
 		if err == io.EOF {
-			if !d.sawDone && len(d.order) == 0 {
+			if d.sawDone {
+				return nil
+			}
+			if !d.compat.SupportsFinishReason {
+				// A server whose finish_reason cannot be trusted offers no
+				// terminal signal at all; content is the only evidence, and
+				// only an empty stream is reported as cut.
+				if len(d.order) == 0 {
+					return provider.ErrSSETruncated
+				}
+				return nil
+			}
+			// A server that closes without [DONE] but did deliver a
+			// finish_reason is common enough among OpenAI-compatible gateways
+			// that demanding the sentinel would fail working deployments. A
+			// stream with NEITHER stopped before the model did: what arrived
+			// is a partial turn — and a partial tool call, salvaged into
+			// valid JSON, is a call the loop would otherwise execute.
+			if d.finishRs == "" {
 				return provider.ErrSSETruncated
 			}
-			// A server that closes without [DONE] but did deliver content is
-			// common enough among OpenAI-compatible gateways that treating it
-			// as truncation would fail working deployments. Content is the
-			// evidence; the sentinel is a convenience.
 			return nil
 		}
 		if err != nil {
@@ -511,6 +634,11 @@ func (d *decoder) chunk(data []byte) error {
 			}
 			if a := tc.Function.Arguments; a != "" {
 				s.args.WriteString(a)
+				if s.scan(a) {
+					// The top-level value just closed: decode ONCE here so
+					// the per-chunk snapshot below carries the real call.
+					s.decode(false)
+				}
 				d.s.Push(core.ToolInputDeltaEvent{BlockIndex: s.index, ToolUseID: s.id, Delta: a})
 				changed = true
 			}
@@ -526,7 +654,7 @@ func (d *decoder) chunk(data []byte) error {
 		// which defeats the purpose of a snapshot event. ClassSnapshot is
 		// explicitly "complete as of now, repeatable, never final", so a
 		// per-chunk cadence is within contract.
-		d.partial.Content = d.snapshot()
+		d.partial.Content = d.snapshot(false)
 		d.s.Push(core.MessageUpdateEvent{Message: d.partial})
 	}
 	return nil
@@ -543,7 +671,12 @@ func firstString(ps ...*string) string {
 
 // snapshot materializes the accumulators into canonical content, in block
 // order.
-func (d *decoder) snapshot() core.Content {
+//
+// It is O(blocks) per call, not O(bytes): text comes from a Builder without a
+// copy, and a tool call is carried as its last decoded value (slot.materialize)
+// rather than re-parsed. final — finish and fail — forces every call to be
+// decoded, salvaging a cut-off one.
+func (d *decoder) snapshot(final bool) core.Content {
 	keys := append([]string(nil), d.order...)
 	sort.SliceStable(keys, func(i, j int) bool {
 		return d.slots[keys[i]].index < d.slots[keys[j]].index
@@ -555,41 +688,30 @@ func (d *decoder) snapshot() core.Content {
 		case "text":
 			out = append(out, core.TextBlock{Text: s.text.String()})
 		case "reasoning":
-			// This wire carries no signature of its own, and REQ-PROV-11
-			// rule 4 demotes an unsigned thinking block to plain text on
-			// replay. That is the correct outcome everywhere except the one
-			// profile that documents a round trip: DeepSeek reads
-			// reasoning_content back on the assistant message, and rule 4
-			// would strip exactly the block it wants (REQ-PROV-12
-			// ThinkingFormat).
-			//
-			// A signature is provider-issued and opaque — never inspected
-			// outside its own provider — so this one is a MARKER, not a
-			// credential. It survives rule 4 for a same-model replay and is
-			// downgraded to text by rule 3 for any other model, which is
-			// precisely the intended reach of a format-specific round trip.
-			tb := core.ThinkingBlock{Thinking: s.text.String()}
+			// This wire carries no signature of its own, so the block gets
+			// a MARKER — provider-issued and opaque, never inspected outside
+			// this package, and not a credential. It survives REQ-PROV-11
+			// rule 4 on a same-model replay and is downgraded to text by
+			// rule 3 for any other model. Which marker decides what the
+			// encoder does with it: DeepSeek documents a round trip and reads
+			// reasoning_content back (REQ-PROV-12 ThinkingFormat); every
+			// other profile drops the block, because the alternative — the
+			// unsigned block demoted to text — re-sends the model's reasoning
+			// as its own visible prose on every later turn.
+			tb := core.ThinkingBlock{Thinking: s.text.String(), Signature: ReasoningMarkerSignature}
 			if d.compat.ThinkingFormat == "deepseek" {
 				tb.Signature = ReasoningContentSignature
 			}
 			out = append(out, tb)
 		case "tool":
-			raw := json.RawMessage(s.args.String())
-			if repaired, changed := provider.SalvageJSON(raw); changed {
-				raw = repaired
-			}
-			b, err := core.NewToolUse(s.id, s.name, raw)
-			if err != nil {
-				b, _ = core.NewToolUse(s.id, s.name, nil)
-			}
-			out = append(out, b)
+			out = append(out, s.materialize(final))
 		}
 	}
 	return out
 }
 
 func (d *decoder) finish(m *core.Model, lookup func(string) *core.Model) {
-	content := d.snapshot()
+	content := d.snapshot(true)
 
 	// Block ends, in block order, after the stream has fully ended
 	// (REQ-OBS-08.3).
@@ -626,7 +748,7 @@ func (d *decoder) finish(m *core.Model, lookup func(string) *core.Model) {
 
 func (d *decoder) fail(text string, err error) {
 	final := d.partial
-	final.Content = d.snapshot()
+	final.Content = d.snapshot(true)
 	final.Usage = d.usage
 	if text == provider.AbortText {
 		final.StopReason = core.StopReasonAborted
@@ -660,7 +782,7 @@ func DecodeResponse(m *core.Model, data []byte, lookup func(string) *core.Model)
 	if err := d.chunk(data); err != nil {
 		return nil, err
 	}
-	content := d.snapshot()
+	content := d.snapshot(true)
 	msg := d.partial
 	msg.Content = content
 	msg.ResponseID = d.respID

@@ -59,14 +59,19 @@ type SSRFGuard struct {
 // validates the proxy, and that is a different thing than this.
 func (g *SSRFGuard) Transport() *http.Transport {
 	return &http.Transport{
-		Proxy:                 nil,
-		DialContext:           g.DialContext,
-		TLSClientConfig:       g.TLSClientConfig,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          8,
-		IdleConnTimeout:       30 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: time.Second,
+		Proxy:             nil,
+		DialContext:       g.DialContext,
+		TLSClientConfig:   g.TLSClientConfig,
+		ForceAttemptHTTP2: true,
+		// Headers are read into memory before the body cap applies, so
+		// without this a server can hand the tool a multi-megabyte header
+		// block that no cap ever sees. 64 KiB is well above anything a
+		// legitimate response carries.
+		MaxResponseHeaderBytes: 64 << 10,
+		MaxIdleConns:           8,
+		IdleConnTimeout:        30 * time.Second,
+		TLSHandshakeTimeout:    10 * time.Second,
+		ExpectContinueTimeout:  time.Second,
 	}
 }
 
@@ -155,6 +160,17 @@ func BlockedAddress(a netip.Addr) (bool, string) {
 	if a.Is4In6() {
 		a = a.Unmap()
 	}
+	// The IPv4-COMPATIBLE form (::a.b.c.d, ::/96) is the mapped form's
+	// deprecated sibling. It is refused outright — no modern stack routes it,
+	// so a request to one is a probe, not a fetch — but the embedded address
+	// is classified first so the refusal can say "link-local" for
+	// ::169.254.169.254 rather than the generic reason.
+	if a.Is6() && ipv4Compatible.Contains(a) {
+		if blocked, why := BlockedAddress(netip.AddrFrom4([4]byte(a.AsSlice()[12:16]))); blocked {
+			return true, "IPv4-compatible IPv6 embedding " + why
+		}
+		return true, "IPv4-compatible IPv6 (deprecated ::/96)"
+	}
 
 	switch {
 	case a.IsUnspecified():
@@ -191,6 +207,7 @@ type reserved struct {
 // netip.Addr.IsPrivate covers only RFC1918 and fc00::/7, so carrier-grade NAT,
 // the benchmarking range and the documentation ranges all pass it.
 var reservedRanges = []reserved{
+	{netip.MustParsePrefix("0.0.0.0/8"), "this network"},
 	{netip.MustParsePrefix("100.64.0.0/10"), "carrier-grade NAT"},
 	{netip.MustParsePrefix("192.0.0.0/24"), "IETF protocol assignments"},
 	{netip.MustParsePrefix("192.0.2.0/24"), "documentation (TEST-NET-1)"},
@@ -200,7 +217,12 @@ var reservedRanges = []reserved{
 	{netip.MustParsePrefix("240.0.0.0/4"), "reserved for future use"},
 	{netip.MustParsePrefix("255.255.255.255/32"), "broadcast"},
 	{netip.MustParsePrefix("64:ff9b::/96"), "NAT64"},
+	{netip.MustParsePrefix("64:ff9b:1::/48"), "local-use NAT64"},
 	{netip.MustParsePrefix("100::/64"), "discard-only"},
 	{netip.MustParsePrefix("2001:db8::/32"), "documentation"},
 	{netip.MustParsePrefix("2002::/16"), "6to4 relay"},
 }
+
+// ipv4Compatible is ::/96, handled in BlockedAddress rather than in the table
+// because the embedded address decides the reason.
+var ipv4Compatible = netip.MustParsePrefix("::/96")

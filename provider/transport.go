@@ -31,6 +31,25 @@ import (
 // caller decide; clamping to 60s guarantees a second failure.
 var ErrRetryDelayTooLong = errors.New("agentkit: server-dictated retry delay exceeds the ceiling")
 
+// RetryDelayError is the value Do returns for ErrRetryDelayTooLong; errors.Is
+// against the sentinel keeps working through Unwrap, and the status that
+// carried the delay is a FIELD rather than part of the text. The text used to
+// end in "(status 429)", and REQ-PROV-14's semantic classifier matches the
+// bare substring "429" — so the one abandonment that must not be retried was
+// re-classified as retryable by the layer above and retried anyway.
+type RetryDelayError struct {
+	Delay      time.Duration // what the server asked for
+	Ceiling    time.Duration // RetryPolicy.MaxRetryDelay
+	StatusCode int           // the response that carried the delay
+}
+
+func (e *RetryDelayError) Error() string {
+	return fmt.Sprintf("%v: server asked for %s, ceiling is %s",
+		ErrRetryDelayTooLong, e.Delay, e.Ceiling)
+}
+
+func (e *RetryDelayError) Unwrap() error { return ErrRetryDelayTooLong }
+
 // RetryPolicy configures Do.
 type RetryPolicy struct {
 	// MaxRetries counts RETRIES, not attempts: 0 means a single attempt, which
@@ -129,8 +148,8 @@ func Do(ctx context.Context, hc *http.Client, newReq func() (*http.Request, erro
 		// (REQ-PROV-13).
 		if dictated && serverDelay > p.MaxRetryDelay {
 			drain(resp)
-			return nil, fmt.Errorf("%w: server asked for %s, ceiling is %s (status %d)",
-				ErrRetryDelayTooLong, serverDelay, p.MaxRetryDelay, resp.StatusCode)
+			return nil, &RetryDelayError{Delay: serverDelay, Ceiling: p.MaxRetryDelay,
+				StatusCode: resp.StatusCode}
 		}
 
 		d := backoffDelay(p, attempt)

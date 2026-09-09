@@ -1,7 +1,10 @@
 package google_test
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -640,5 +643,189 @@ func TestAnUnpricedLevelIsClampedNotDefaulted(t *testing.T) {
 	b = w.GenerationConfig.ThinkingConfig.ThinkingBudget
 	if b == nil || *b != 1024 {
 		t.Fatalf("thinkingBudget = %v for minimal on a row that starts at low, want 1024 (clamped up)", b)
+	}
+}
+
+// ---------------------------------------------------------------- streaming
+
+// drive runs one streamed turn against a canned SSE body with no network and
+// no key (NFR-TEST-01), so a replay test starts from what the DECODER
+// produced rather than from a hand-built block.
+func drive(t *testing.T, sse string) *core.AssistantMessage {
+	t.Helper()
+	req := core.Request{
+		Messages: core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}},
+		Options: core.RequestOptions{
+			Env: map[string]string{"GEMINI_API_KEY": "k"},
+			Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Header: http.Header{},
+					Body: io.NopCloser(strings.NewReader(sse))}, nil
+			}),
+		},
+	}
+	return google.Provider(google.Options{Getenv: func(string) string { return "" }}).
+		Stream(context.Background(), model(), req, core.ProviderStreamOptions{}).Result()
+}
+
+func data(chunks ...string) string {
+	var b strings.Builder
+	for _, c := range chunks {
+		b.WriteString("data: " + c + "\n\n")
+	}
+	return b.String()
+}
+
+// TestAStreamWithoutAFinishReasonIsTruncated is REQ-PROV-04 with the case
+// that matters: the connection drops mid functionCall. A candidate's
+// finishReason is this wire's terminal signal; a stream that ends without one
+// stopped before the model did, and reporting it as tool_use would execute a
+// call whose arguments the model never finished.
+func TestAStreamWithoutAFinishReasonIsTruncated(t *testing.T) {
+	cut := data(
+		`{"responseId":"r1","modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}`,
+		`{"responseId":"r1","modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"delete_file","args":{"path":"/etc"}}}]}}]}`,
+	)
+	msg := drive(t, cut)
+	if msg.StopReason != core.StopReasonError {
+		t.Fatalf("stop = %q (%q), want error: no candidate carried a finishReason, so the "+
+			"model had not finished and the call must not run", msg.StopReason, msg.ErrorMessage)
+	}
+	if !strings.Contains(msg.ErrorMessage, "stream ended before") {
+		t.Fatalf("error = %q, want the truncation text the REQ-PROV-14 allowlist retries on",
+			msg.ErrorMessage)
+	}
+	if msg.Content.Text() != "Hello" {
+		t.Fatalf("content = %q, want the partial text kept alongside the failure", msg.Content.Text())
+	}
+
+	whole := data(
+		`{"responseId":"r1","modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"delete_file","args":{"path":"/etc"}}}]},"finishReason":"STOP"}]}`,
+	)
+	if msg := drive(t, whole); msg.StopReason != core.StopReasonToolUse {
+		t.Fatalf("stop = %q (%q) with a finishReason, want tool_use", msg.StopReason, msg.ErrorMessage)
+	}
+}
+
+// TestAThoughtSignatureOnATextPartIsKeptAndReplayed is the Gemini 3 shape: a
+// turn with no function call attaches the signature to its LAST text part,
+// and a replay without it loses the chain. The canonical TextBlock has no
+// signature field, so the signature rides as a signature-only ThinkingBlock
+// at that position and goes back as a signature-only part.
+func TestAThoughtSignatureOnATextPartIsKeptAndReplayed(t *testing.T) {
+	for name, sse := range map[string]string{
+		"on the text part": data(
+			`{"responseId":"r1","modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"text":"Hello","thoughtSignature":"SIG"}]},"finishReason":"STOP"}]}`),
+		"on a signature-only part": data(
+			`{"responseId":"r1","modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"text":"Hello"},{"thoughtSignature":"SIG"}]},"finishReason":"STOP"}]}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			msg := drive(t, sse)
+			if msg.Content.Text() != "Hello" {
+				t.Fatalf("text = %q", msg.Content.Text())
+			}
+			var sig string
+			for _, b := range msg.Content {
+				if tb, ok := b.(core.ThinkingBlock); ok {
+					sig = tb.Signature
+				}
+			}
+			if sig != "SIG" {
+				t.Fatalf("content = %v, want the signature kept on a block", msg.Content)
+			}
+
+			raw, _ := build(t, model(), core.Request{Messages: core.Messages{
+				core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}, *msg,
+				core.UserMessage{Content: core.Content{core.TextBlock{Text: "more"}}},
+			}})
+			if !strings.Contains(string(raw), `"thoughtSignature":"SIG"`) {
+				t.Fatalf("the signature did not reach the replay: %s", raw)
+			}
+			if strings.Contains(string(raw), `"thought":true`) {
+				t.Fatalf("a signature-only part was sent as an empty thought: %s", raw)
+			}
+		})
+	}
+}
+
+// TestUnsignedThoughtsAreMarkedAndDroppedOnReplayNotSentAsText. A thought
+// part with no signature carries nothing the model would replay; demoted to
+// text by REQ-PROV-11 rule 4 it was re-sent as the model's own visible prose
+// on every later turn, re-billed each time. The decoder marks it so rule 4
+// keeps it, and the encoder drops it; a thought that DID carry a signature is
+// still sent back as the signed thought part it was.
+func TestUnsignedThoughtsAreMarkedAndDroppedOnReplayNotSentAsText(t *testing.T) {
+	unsigned := data(
+		`{"responseId":"r1","modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"text":"let me think","thought":true},{"text":"Hello"}]},"finishReason":"STOP"}]}`)
+	msg := drive(t, unsigned)
+	var think *core.ThinkingBlock
+	for _, b := range msg.Content {
+		if tb, ok := b.(core.ThinkingBlock); ok {
+			think = &tb
+		}
+	}
+	if think == nil || think.Thinking != "let me think" {
+		t.Fatalf("thinking = %+v, want the thought decoded", think)
+	}
+	if think.Signature != google.ThoughtMarkerSignature {
+		t.Fatalf("signature = %q, want the marker that keeps rule 4 from demoting it", think.Signature)
+	}
+	replay := core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}, *msg,
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "more"}}},
+	}}
+	raw, w := build(t, model(), replay)
+	if strings.Contains(string(raw), "let me think") {
+		t.Fatalf("the model's unsigned reasoning was re-sent on replay: %s", raw)
+	}
+	if strings.Contains(string(raw), google.ThoughtMarkerSignature) {
+		t.Fatalf("the marker reached the wire: %s", raw)
+	}
+	if w.Contents[1].Role != google.RoleModel || w.Contents[1].Parts[0].Text != "Hello" {
+		t.Fatalf("contents = %+v, want the answer replayed alone", w.Contents)
+	}
+
+	// Cross-model, rule 3 downgrades it to text: another model sees context.
+	other := model()
+	other.ID = "gemini-y"
+	raw, _ = build(t, other, replay)
+	if !strings.Contains(string(raw), "let me think") {
+		t.Fatalf("on ANOTHER model the reasoning must degrade to text (rule 3): %s", raw)
+	}
+
+	signed := data(
+		`{"responseId":"r1","modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"text":"let me think","thought":true,"thoughtSignature":"SIG"},{"text":"Hello"}]},"finishReason":"STOP"}]}`)
+	msg = drive(t, signed)
+	raw, _ = build(t, model(), core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}, *msg,
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "more"}}},
+	}})
+	if !strings.Contains(string(raw), `"thought":true,"thoughtSignature":"SIG"`) {
+		t.Fatalf("a SIGNED thought must be replayed as the thought part it was: %s", raw)
+	}
+}
+
+// TestSynthesizedCallIDsDoNotRepeatAcrossResponses: without a responseId the
+// fallback minted "<model>-0" on every turn, and the repair pass — which keys
+// results by id — could answer one turn's call with another's result.
+func TestSynthesizedCallIDsDoNotRepeatAcrossResponses(t *testing.T) {
+	noID := data(
+		`{"modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"t","args":{}}}]},"finishReason":"STOP"}]}`)
+	a := core.ExtractToolUse(drive(t, noID))
+	b := core.ExtractToolUse(drive(t, noID))
+	if len(a) != 1 || len(b) != 1 {
+		t.Fatalf("calls: %d and %d, want one each", len(a), len(b))
+	}
+	if a[0].ID == b[0].ID {
+		t.Fatalf("two responses minted the same id %q", a[0].ID)
+	}
+	if a[0].ID == "" || !strings.HasPrefix(a[0].ID, "gemini-x-") {
+		t.Fatalf("id = %q, want the model-scoped fallback with a per-response nonce", a[0].ID)
+	}
+
+	// With a responseId the id is scoped to it and stable across paths.
+	withID := data(
+		`{"responseId":"resp_9","modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"t","args":{}}}]},"finishReason":"STOP"}]}`)
+	if got := core.ExtractToolUse(drive(t, withID))[0].ID; got != "resp_9-0" {
+		t.Fatalf("id = %q, want resp_9-0", got)
 	}
 }

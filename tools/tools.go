@@ -242,6 +242,16 @@ func (f *fileTools) readFile() core.Tool {
 			if err != nil {
 				return core.ErrResult("path_not_allowed", err.Error())
 			}
+			fi, err := os.Stat(abs)
+			if err != nil {
+				return core.ErrResult("read_failed", err.Error())
+			}
+			// Only a regular file is read. A directory is a list_files
+			// question; a FIFO or a device would block the tool — and the
+			// whole batch behind it — on a read that never returns.
+			if !fi.Mode().IsRegular() {
+				return core.ErrResult("not_a_file", notAFile(f.ws.Rel(abs), fi.Mode()))
+			}
 			fh, err := os.Open(abs)
 			if err != nil {
 				return core.ErrResult("read_failed", err.Error())
@@ -253,10 +263,16 @@ func (f *fileTools) readFile() core.Tool {
 			// extension. `screenshot.txt` is still a PNG if its first eight
 			// bytes say so, and splitting one into "lines" hands the model
 			// several kilobytes of mojibake. Only the header is peeked; the
-			// whole file is loaded for an image alone, whose size the
-			// normalizer bounds.
+			// whole file is loaded for an image alone — and only up to a
+			// ceiling, checked on the size BEFORE the load: the normalizer
+			// bounds what it decodes, but it cannot bound what it is handed.
 			head, _ := br.Peek(imageSniffBytes)
 			if mime, isImage := imagex.Sniff(head); isImage {
+				if fi.Size() > ImageFileMaxBytes {
+					return core.ErrResult("image_too_large", fmt.Sprintf(
+						"%s is a %s image of %d bytes, over the %d byte limit for an image read; "+
+							"downscale it first", f.ws.Rel(abs), mime, fi.Size(), ImageFileMaxBytes))
+				}
 				data, err := io.ReadAll(br)
 				if err != nil {
 					return core.ErrResult("read_failed", err.Error())
@@ -309,8 +325,14 @@ func (f *fileTools) readFile() core.Tool {
 				// lines, so the offset it names is the next unseen line.
 				body = append(body, ReadOffsetMarker(from, page.to, page.total))
 			}
-			r := core.OKResult(map[string]any{"content": strings.Join(body, "\n"), "encoding": "utf-8"})
+			content := strings.Join(body, "\n")
+			r := core.OKResult(map[string]any{"content": content, "encoding": "utf-8"})
 			r.Metadata = md
+			// The model reads the file itself, not a JSON string containing
+			// it (core.ToolResult.Text): no envelope, no escaping, the
+			// continuation and long-line markers in place as lines of the
+			// text. Data keeps the envelope shape for programmatic readers.
+			r.Text = content
 			return r
 		},
 	}
@@ -319,6 +341,33 @@ func (f *fileTools) readFile() core.Tool {
 // imageSniffBytes is how much of a file's head imagex.Sniff needs. The longest
 // signature it knows (RIFF....WEBP) is twelve bytes.
 const imageSniffBytes = 16
+
+// ImageFileMaxBytes is the largest image file read_file will load. It is
+// checked against the file's size before the bytes are read, so the ceiling
+// is on memory as well as on what reaches the normalizer.
+const ImageFileMaxBytes = 32 << 20
+
+// EditFileMaxBytes is the largest file edit_file will load. The tool holds
+// the whole file plus its normalised copy plus the result; a 500 MB log is
+// not what exact-match editing is for, and the message names what is.
+const EditFileMaxBytes = 16 << 20
+
+// notAFile is the not_a_file detail: it says what the path IS, since the fix
+// differs — list a directory, use execute on a device or pipe.
+func notAFile(shown string, mode fs.FileMode) string {
+	kind := "not a regular file"
+	switch {
+	case mode.IsDir():
+		kind = "a directory; use list_files"
+	case mode&fs.ModeNamedPipe != 0:
+		kind = "a named pipe"
+	case mode&fs.ModeSocket != 0:
+		kind = "a socket"
+	case mode&fs.ModeDevice != 0:
+		kind = "a device"
+	}
+	return fmt.Sprintf("%s is %s", shown, kind)
+}
 
 // readPage is what readLines returns: the selected window, and the counts the
 // markers need.
@@ -456,10 +505,9 @@ func readImage(abs, shown string, data []byte, mime string) core.ToolResult {
 				"%s: WebP image of %d bytes exceeds the provider's inline limit and "+
 					"cannot be downscaled by this build; re-encode it smaller", shown, len(data)))
 		}
-		out := core.OKResult(map[string]any{
-			"note":      fmt.Sprintf("[%s: %s image, dimensions unknown]", shown, mime),
-			"mime_type": mime,
-		})
+		note := fmt.Sprintf("[%s: %s image, dimensions unknown]", shown, mime)
+		out := core.OKResult(map[string]any{"note": note, "mime_type": mime})
+		out.Text = note
 		out.Blocks = []core.ContentBlock{core.ImageBlock{
 			Data: base64.StdEncoding.EncodeToString(data), MimeType: mime}}
 		return out
@@ -488,6 +536,7 @@ func readImage(abs, shown string, data []byte, mime string) core.ToolResult {
 		"width":     res.Width,
 		"height":    res.Height,
 	})
+	out.Text = note
 	out.Blocks = []core.ContentBlock{core.ImageBlock{Data: res.Base64(), MimeType: res.MIMEType}}
 	return out
 }
@@ -497,6 +546,9 @@ func (f *fileTools) writeFile() core.Tool {
 		Name:        "write_file",
 		Description: "Write a file, creating or replacing it.",
 		Builtin:     true,
+		PromptGuidelines: []string{
+			"Prefer edit_file for an existing file; write_file replaces the whole file.",
+		},
 		// Sequential: a write has workspace-wide side effects, and one
 		// Sequential tool demotes the whole batch (REQ-LOOP-05a).
 		ExecutionMode: core.Sequential,
@@ -523,14 +575,16 @@ func (f *fileTools) writeFile() core.Tool {
 			release := f.locks.acquire(key)
 			defer release()
 
-			if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-				return core.ErrResult("write_failed", err.Error())
-			}
-			// Re-checked under the lock, immediately before the open
-			// (REQ-SEC-01): a link planted here since Resolve would be
-			// followed by WriteFile.
+			// Re-checked under the lock, BEFORE MkdirAll and the open
+			// (REQ-SEC-01): a link planted since Resolve — on the leaf or on
+			// any parent — would otherwise be followed first by MkdirAll,
+			// which builds the missing directories wherever the link points,
+			// and then by WriteFile.
 			if err := f.ws.CheckWriteTarget(abs); err != nil {
 				return core.ErrResult("path_not_allowed", err.Error())
+			}
+			if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+				return core.ErrResult("write_failed", err.Error())
 			}
 			if err := os.WriteFile(abs, []byte(a.Content), 0o644); err != nil {
 				return core.ErrResult("write_failed", err.Error())
@@ -580,6 +634,18 @@ func (f *fileTools) editFile() core.Tool {
 			release := f.locks.acquire(key)
 			defer release()
 
+			fi, err := os.Stat(abs)
+			if err != nil {
+				return core.ErrResult("read_failed", err.Error())
+			}
+			if !fi.Mode().IsRegular() {
+				return core.ErrResult("not_a_file", notAFile(f.ws.Rel(abs), fi.Mode()))
+			}
+			if fi.Size() > EditFileMaxBytes {
+				return core.ErrResult("file_too_large", fmt.Sprintf(
+					"%s is %d bytes, over edit_file's %d byte limit; use execute with sed "+
+						"or a script for a file this size", f.ws.Rel(abs), fi.Size(), EditFileMaxBytes))
+			}
 			raw, err := os.ReadFile(abs)
 			if err != nil {
 				return core.ErrResult("read_failed", err.Error())
@@ -658,12 +724,14 @@ func repairEditArgs(args map[string]any) map[string]any {
 
 func (f *fileTools) listFiles() core.Tool {
 	return core.Tool{
-		Name:        "list_files",
-		Description: "List the entries of a directory.",
-		Builtin:     true,
+		Name: "list_files",
+		Description: "List the entries of a directory, directories with a trailing /. " +
+			"Does not apply .gitignore.",
+		Builtin: true,
 		InputSchema: schema.Object(
 			schema.Opt("path", schema.String("Directory to list (default the workspace root)")),
-			schema.Opt("limit", schema.Int("Maximum entries")),
+			schema.Opt("limit", schema.Int(fmt.Sprintf("Maximum entries (default %d, at most %d)",
+				ListEntryDefault, ListEntryCap))),
 		),
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
@@ -684,14 +752,20 @@ func (f *fileTools) listFiles() core.Tool {
 			if err != nil {
 				return core.ErrResult("list_failed", err.Error())
 			}
-			limit := a.Limit
-			if limit <= 0 || limit > ListEntryCap {
-				limit = ListEntryCap
-			}
+			limit := clampLimit(a.Limit, ListEntryDefault, ListEntryCap)
 			entries := make([]string, 0, len(des))
 			for _, de := range des {
 				n := de.Name()
-				if de.IsDir() {
+				isDir := de.IsDir()
+				if !isDir && de.Type()&fs.ModeSymlink != 0 {
+					// A symlink to a directory lists like a directory: the
+					// model's next call is list_files on it, and without the
+					// suffix it would read_file it and be told not_a_file.
+					if st, err := os.Stat(filepath.Join(abs, n)); err == nil && st.IsDir() {
+						isDir = true
+					}
+				}
+				if isDir {
 					n += "/"
 				}
 				entries = append(entries, n)
@@ -699,15 +773,18 @@ func (f *fileTools) listFiles() core.Tool {
 			sort.Strings(entries)
 			truncated := len(entries) > limit
 			r := core.OKResult(map[string]any{"entries": entries, "truncated": truncated})
+			note := ""
 			if truncated {
 				entries = entries[:limit]
 				r.Data["entries"] = entries
 				// The marker is a separate key, as in find_files. Appended to
 				// `entries` it was indistinguishable from a file called
 				// "[500 entries limit reached...]" (REQ-TOOL-09b).
-				r.Data["note"] = ListMarker(limit)
+				note = ListMarker(limit)
+				r.Data["note"] = note
 				r.Metadata = &core.ToolMetadata{Truncated: true, TruncatedBy: string(TruncatedByLines)}
 			}
+			r.Text = renderList(entries, note)
 			return r
 		},
 	}
@@ -722,7 +799,8 @@ func (f *fileTools) findFiles() core.Tool {
 			schema.Prop("pattern", schema.String("Glob pattern, e.g. **/*.go")),
 			schema.Opt("path", schema.String("Directory to search from (default the workspace root)")),
 			schema.Opt("file_type", schema.String("What to match: \"file\" (default), \"dir\" or \"any\"")),
-			schema.Opt("limit", schema.Int("Maximum results")),
+			schema.Opt("limit", schema.Int(fmt.Sprintf("Maximum results (default %d, at most %d)",
+				FindResultDefault, FindResultCap))),
 		),
 		Execute: func(ctx context.Context, in json.RawMessage) core.ToolResult {
 			var a struct {
@@ -755,10 +833,7 @@ func (f *fileTools) findFiles() core.Tool {
 			if err != nil {
 				return core.ErrResult("path_not_allowed", err.Error())
 			}
-			limit := a.Limit
-			if limit <= 0 || limit > FindResultCap {
-				limit = FindResultCap
-			}
+			limit := clampLimit(a.Limit, FindResultDefault, FindResultCap)
 			ig := newIgnoreEngine(root, f.ig)
 			var found []string
 			truncated := false
@@ -781,6 +856,10 @@ func (f *fileTools) findFiles() core.Tool {
 				if rerr != nil || rel == "." {
 					return nil
 				}
+				// Slash-separated on every platform, like search_files: the
+				// model pastes these paths into its next call and into code,
+				// and a backslash is an escape almost everywhere it lands.
+				rel = filepath.ToSlash(rel)
 				if ig.match(rel, d.IsDir()) {
 					if d.IsDir() {
 						return filepath.SkipDir
@@ -812,13 +891,43 @@ func (f *fileTools) findFiles() core.Tool {
 			sort.Strings(found)
 			data := map[string]any{"files": found, "truncated": truncated}
 			r := core.OKResult(data)
+			marker := ""
 			if truncated {
-				data["marker"] = FindMarker(limit)
+				marker = FindMarker(limit)
+				data["marker"] = marker
 				r.Metadata = &core.ToolMetadata{Truncated: true, TruncatedBy: string(TruncatedByLines)}
 			}
+			r.Text = renderList(found, marker)
 			return r
 		},
 	}
+}
+
+// clampLimit applies a tool's default and cap to a model-supplied limit:
+// absent or non-positive means the default, over the cap means the cap.
+func clampLimit(n, def, cap int) int {
+	switch {
+	case n <= 0:
+		return def
+	case n > cap:
+		return cap
+	}
+	return n
+}
+
+// renderList is the model-facing text for list_files and find_files: one
+// entry per line, then the truncation marker when there is one. An empty
+// list renders nothing, so the envelope — which says `[]` explicitly — is
+// what the model sees.
+func renderList(entries []string, marker string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	out := strings.Join(entries, "\n")
+	if marker != "" {
+		out += "\n" + marker
+	}
+	return out
 }
 
 // ------------------------------------------------------------------- execute
@@ -828,9 +937,11 @@ func executeTool(opts Options) core.Tool {
 	return core.Tool{
 		Name:    "execute",
 		Builtin: true,
-		Description: "Run a shell command. Pipes, redirection, && and $() all work. " +
-			"Output is truncated from the END if it is large, so the tail of a failing " +
-			"build is preserved.",
+		Description: "Run a shell command in the workspace root. Pipes, redirection, && and $() " +
+			"all work. Only the last 50 KB of output is kept, so the tail of a failing build " +
+			"is preserved. No default timeout; pass timeout_s for anything that may not exit. " +
+			"A background process must redirect its output (> log 2>&1 &) or it is killed " +
+			"when the tool returns.",
 		// Sequential: a command has process-wide side effects.
 		ExecutionMode: core.Sequential,
 		InputSchema: schema.Object(
@@ -862,7 +973,7 @@ func executeTool(opts Options) core.Tool {
 			if err != nil {
 				return core.ErrResult("exec_failed", err.Error())
 			}
-			return execResultToTool(res)
+			return execResultToTool(res, timeout)
 		},
 	}
 }
@@ -887,7 +998,13 @@ func timeoutArg(s *int) (time.Duration, error) {
 // Shared by execute, run_command and powershell: the envelope is a property of
 // having run a subprocess, not of how the command was spelled, and three
 // copies would drift on the next field added to ToolMetadata.
-func execResultToTool(res ExecResult) core.ToolResult {
+//
+// The model reads the output ITSELF (core.ToolResult.Text), followed by one
+// status line only when there is something to say: `[exit 1]`, `[timeout
+// after 30s]`, `[aborted]`, `[killed by signal 9]`. A command that exited 0
+// adds nothing — "exit_code":0,"outcome":"ok" on every successful call is
+// pure cost. Data keeps exit_code and outcome for programmatic readers.
+func execResultToTool(res ExecResult, timeout time.Duration) core.ToolResult {
 	code := res.ExitCode
 	md := &core.ToolMetadata{
 		Truncated:  res.Truncated,
@@ -908,7 +1025,36 @@ func execResultToTool(res ExecResult) core.ToolResult {
 	if !out.OK {
 		out.Error = "command_" + string(res.Outcome)
 	}
+	out.Text = res.Output
+	if status := execStatusLine(res, timeout); status != "" {
+		if out.Text != "" && !strings.HasSuffix(out.Text, "\n") {
+			out.Text += "\n"
+		}
+		out.Text += status
+	}
 	return out
+}
+
+// execStatusLine is the trailing status for a subprocess result, empty for a
+// clean exit.
+func execStatusLine(res ExecResult, timeout time.Duration) string {
+	switch res.Outcome {
+	case OutcomeExit:
+		return fmt.Sprintf("[exit %d]", res.ExitCode)
+	case OutcomeTimeout:
+		if timeout > 0 {
+			return fmt.Sprintf("[timeout after %s]", timeout)
+		}
+		return "[timeout]"
+	case OutcomeAbort:
+		return "[aborted]"
+	case OutcomeSignal:
+		if res.ExitCode > 128 {
+			return fmt.Sprintf("[killed by signal %d]", res.ExitCode-128)
+		}
+		return "[killed by signal]"
+	}
+	return ""
 }
 
 // runCommandTool is REQ-TOOL-06's structured variant.
@@ -961,7 +1107,7 @@ func runCommandTool(opts Options) core.Tool {
 			if err != nil {
 				return core.ErrResult("exec_failed", err.Error())
 			}
-			return execResultToTool(res)
+			return execResultToTool(res, timeout)
 		},
 	}
 }

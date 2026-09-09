@@ -255,3 +255,35 @@ func TestTOMLKeyOrderFollowsTheFileNotTheMap(t *testing.T) {
 		t.Fatalf("Keys() = %q, want written order", got)
 	}
 }
+
+// A manifest is untrusted input, and parseArray recurses once per '['. Without
+// a depth bound the stack is whatever the file says it is; with one, a file
+// that nests past the bound is a SyntaxError on the line that opened it, and
+// the process is still standing to report it.
+func TestTOMLArrayNestingIsBoundedNotRecursedWithoutLimit(t *testing.T) {
+	src := "a = " + strings.Repeat("[", 200_000)
+	_, _, err := ParseTOML([]byte(src))
+	if err == nil {
+		t.Fatal("want an error, got nil")
+	}
+	var se *SyntaxError
+	if !errors.As(err, &se) {
+		t.Fatalf("error %v is not a *SyntaxError", err)
+	}
+	if !strings.Contains(se.Msg, "nested deeper than") || se.Line != 1 {
+		t.Fatalf("error = %v, want the nesting bound named on line 1", err)
+	}
+
+	// The bound is on DEPTH, not on the presence of nesting: a nested array
+	// within it is still the documented "skipped with a diagnostic".
+	tbl, diags, err := ParseTOML([]byte("a = [[\"x\"]]\nb = \"kept\"\n"))
+	if err != nil {
+		t.Fatalf("a shallow nested array must still parse: %v", err)
+	}
+	if _, ok := tbl.Get("a"); ok {
+		t.Fatal("a nested array is not a supported value")
+	}
+	if len(diags) != 1 || tbl.vals["b"].Str != "kept" {
+		t.Fatalf("diags = %v, b = %+v", diags, tbl.vals["b"])
+	}
+}

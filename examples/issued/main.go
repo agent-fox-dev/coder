@@ -45,10 +45,23 @@ import (
 	"github.com/agentfox/agentkit-go/tools"
 )
 
+// Exit codes: 1 is a failed run, 2 is a usage error — nothing to triage, or
+// flags that do not make sense together — before a token is spent.
+const (
+	exitFailed = 1
+	exitUsage  = 2
+)
+
+// errUsage marks a failure the operator caused with the command line.
+var errUsage = errors.New("usage")
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		if errors.Is(err, errUsage) || errors.Is(err, ErrNoInput) {
+			os.Exit(exitUsage)
+		}
+		os.Exit(exitFailed)
 	}
 }
 
@@ -85,9 +98,27 @@ func parseCLI(argv []string) (*cliConfig, error) {
 	fs, cfg := newFlagSet()
 	operands, err := parseArgs(fs, argv)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", errUsage, err)
 	}
 	cfg.arg = strings.Join(operands, " ")
+
+	// -overwrite rewrites the issue the report came from, so it needs one,
+	// and the flags that only shape a NEW issue have nothing to apply to.
+	// Refused here rather than silently ignored after a paid run.
+	if cfg.overwrite {
+		if _, ok := ParseIssueURL(strings.TrimSpace(cfg.arg)); !ok {
+			return nil, fmt.Errorf("%w: -overwrite needs a GitHub issue URL as the input; it rewrites that issue in place", errUsage)
+		}
+		if cfg.labels != "" {
+			return nil, fmt.Errorf("%w: -overwrite updates the issue body only; -label applies to a new issue", errUsage)
+		}
+		if cfg.repo != "" {
+			return nil, fmt.Errorf("%w: -overwrite writes to the issue's own repository; -repo applies to a new issue", errUsage)
+		}
+	}
 	return cfg, nil
 }
 
@@ -101,12 +132,12 @@ func run() error {
 
 	// 1. Classify the input before anything expensive happens. An empty
 	//    argument is usage, not a run: the skill's "halt until input is
-	//    received" is a program that exits 2.
+	//    received" is a program that exits 2 (main maps ErrNoInput to it).
 	gh := NewGitHub()
 	report, err := ResolveInput(cfg.arg, os.Stdin, gh)
 	if errors.Is(err, ErrNoInput) {
 		usage()
-		return errors.New("nothing to triage")
+		return fmt.Errorf("nothing to triage: %w", ErrNoInput)
 	} else if err != nil {
 		return err
 	}
@@ -129,6 +160,12 @@ func run() error {
 	owner, repo, err := targetRepo(cfg.repo, cfg.dir, report)
 	if err != nil && !cfg.dryRun {
 		return err
+	}
+	// The same goes for the token: the GitHub write is the last step, and
+	// finding out it cannot happen after the model has been paid is the
+	// worst time to find out.
+	if !cfg.dryRun && gh.Token == "" {
+		return errors.New("filing the issue needs a token: set GITHUB_TOKEN (or GH_TOKEN), or pass --dry-run to only print it")
 	}
 
 	model, err := catalog.ResolveModel(modelSpec())
@@ -190,7 +227,7 @@ func run() error {
 
 type issueClient interface {
 	CreateIssue(owner, repo, title, body string, labels []string) (string, error)
-	UpdateIssue(owner, repo string, number int, body string) (string, error)
+	UpdateIssue(owner, repo string, number int, title, body string) (string, error)
 }
 
 func fileOrDryRun(w io.Writer, gh issueClient, dryRun, overwrite bool, upstream *IssueRef, owner, repo string, issue Issue, body string, labels []string) error {
@@ -204,7 +241,7 @@ func fileOrDryRun(w io.Writer, gh issueClient, dryRun, overwrite bool, upstream 
 		return nil
 	}
 	if overwrite && upstream != nil {
-		url, err := gh.UpdateIssue(upstream.Owner, upstream.Repo, upstream.Number, body)
+		url, err := gh.UpdateIssue(upstream.Owner, upstream.Repo, upstream.Number, issue.Title, body)
 		if err != nil {
 			return fmt.Errorf("%w\n\n(the issue body is above; you can file it by hand)", err)
 		}
@@ -309,6 +346,9 @@ Examples:
   kubectl logs deploy/api | issued -
 
 Files an issue to GitHub by default; pass --dry-run to only print the diagnosis.
+-overwrite needs an issue URL as the input and cannot be combined with -label or -repo.
+
+Exit codes: 0 filed (or printed) · 1 failed · 2 usage
 
 Flags:
 `)

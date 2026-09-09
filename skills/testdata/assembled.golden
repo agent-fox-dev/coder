@@ -3,7 +3,7 @@ A skill is a set of instructions kept in a file and NOT loaded here. Each entry 
 When a task matches a skill's description, read that file with the read_file tool and follow it; until you do, that skill's instructions are not in effect.
 When a skill file references a relative path, resolve it against the skill directory (the parent of the skill's prompt file) and use that absolute path in tool commands.
 <skill name="code-review" path="/opt/agentkit/_skills/code-review/prompt.md">Reviews a diff for correctness bugs before it is committed.</skill>
-<skill name="release-notes" path="/home/dev/.nightshift/skills/release-notes/prompt.md">Writes release notes from a commit range. Handles &lt;tags&gt; &amp; quotes.</skill>
+<skill name="release-notes" path="/home/dev/.nightshift/skills/release-notes/prompt.md">Writes release notes from a commit range. Handles &lt;tags> & quotes.</skill>
 </available_skills>
 
 <project_context>
@@ -13,6 +13,6 @@ Prefer small commits.
 </context_file>
 <context_file path="/work/repo/AGENTS.md">
 Run `go test ./...` before pushing.
-Mind tabs &amp; spaces.
+Mind tabs & spaces.
 </context_file>
 </project_context>

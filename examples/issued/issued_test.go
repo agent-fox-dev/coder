@@ -262,6 +262,10 @@ func TestAProposedNewFileIsAllowedButAnEscapeIsNot(t *testing.T) {
 	if missing := tr.checkPaths([]FileRef{{Path: "session/regression_test.go"}}); len(missing) != 1 {
 		t.Errorf("checkPaths accepted a file that does not exist: %v", missing)
 	}
+	// A directory is not a file the model read.
+	if missing := tr.checkPaths([]FileRef{{Path: "session"}, {Path: "session/store.go"}}); len(missing) != 1 || missing[0] != "session" {
+		t.Errorf("checkPaths on a directory = %v, want [session]", missing)
+	}
 }
 
 // --------------------------------------------------------------------- 3 --
@@ -457,7 +461,15 @@ func TestParseRemote(t *testing.T) {
 		"https://github.com/agent-fox-dev/coder":       "agent-fox-dev/coder",
 		"ssh://git@github.com/agent-fox-dev/coder.git": "agent-fox-dev/coder",
 		"https://token@github.com/o/r.git":             "o/r",
+		"https://www.github.com/o/r":                   "o/r",
 		"not a remote":                                 "",
+		// Another host with the same owner/repo layout is not GitHub, and
+		// filing there by name would land the issue on the wrong site.
+		"git@gitlab.com:agent-fox-dev/coder.git":  "",
+		"https://gitlab.com/agent-fox-dev/coder":  "",
+		"ssh://git@git.example.com/o/r.git":       "",
+		"https://ghe.example.com/o/r.git":         "", // only with GITHUB_API_URL, below
+		"https://github.com.evil.example/o/r.git": "",
 	}
 	for in, want := range cases {
 		owner, repo, ok := ParseRemote(in)
@@ -468,6 +480,17 @@ func TestParseRemote(t *testing.T) {
 		if got != want {
 			t.Errorf("ParseRemote(%q) = %q, want %q", in, got, want)
 		}
+	}
+
+	// An enterprise host is accepted once GITHUB_API_URL names it.
+	t.Setenv("GITHUB_API_URL", "https://api.ghe.example.com")
+	for _, in := range []string{"https://ghe.example.com/o/r.git", "git@api.ghe.example.com:o/r.git", "https://github.com/o/r"} {
+		if owner, repo, ok := ParseRemote(in); !ok || owner != "o" || repo != "r" {
+			t.Errorf("ParseRemote(%q) with GITHUB_API_URL = %q/%q %v, want o/r", in, owner, repo, ok)
+		}
+	}
+	if _, _, ok := ParseRemote("https://gitlab.com/o/r"); ok {
+		t.Error("GITHUB_API_URL must not widen the host check to everything")
 	}
 }
 
@@ -582,6 +605,33 @@ func TestFlagParsingOverwrite(t *testing.T) {
 			t.Errorf("cfg.overwrite = false, want true")
 		}
 	})
+
+	// The combinations that would be silently ignored after a paid run are
+	// refused before it, as usage errors.
+	for name, argv := range map[string][]string{
+		"without an issue URL":   {"-overwrite", "./crash.log"},
+		"with free text":         {"-overwrite", "the loop hangs"},
+		"with -label":            {"-overwrite", "-label", "bug", "https://github.com/owner/repo/issues/1"},
+		"with -repo":             {"-overwrite", "-repo", "o/r", "https://github.com/owner/repo/issues/1"},
+		"with -label after url":  {"https://github.com/owner/repo/issues/1", "-overwrite", "--label=bug"},
+		"with nothing at all":    {"-overwrite"},
+		"with an undefined flag": {"--create", "x"},
+	} {
+		t.Run("rejected "+name, func(t *testing.T) {
+			_, err := parseCLI(argv)
+			if err == nil {
+				t.Fatalf("parseCLI(%v) succeeded, want a usage error", argv)
+			}
+			if !errors.Is(err, errUsage) {
+				t.Errorf("parseCLI(%v) error %v is not a usage error", argv, err)
+			}
+		})
+	}
+	// A pull-request URL is an issue reference too, and -overwrite alone is
+	// fine with any of them.
+	if _, err := parseCLI([]string{"-overwrite", "https://github.com/owner/repo/pull/1"}); err != nil {
+		t.Errorf("-overwrite with a pull request URL: %v", err)
+	}
 }
 
 func TestTargetRepoValidationHaltsWithoutDryRun(t *testing.T) {
@@ -644,11 +694,12 @@ func (m *mockIssueCreator) CreateIssue(owner, repo, title, body string, labels [
 	return m.retURL, nil
 }
 
-func (m *mockIssueCreator) UpdateIssue(owner, repo string, number int, body string) (string, error) {
+func (m *mockIssueCreator) UpdateIssue(owner, repo string, number int, title, body string) (string, error) {
 	m.updateCalled = true
 	m.owner = owner
 	m.repo = repo
 	m.updateNumber = number
+	m.title = title
 	m.body = body
 	if m.err != nil {
 		return "", m.err
@@ -747,9 +798,12 @@ func TestGitHubUpdateIssue(t *testing.T) {
 			client:  srv.Client(),
 		}
 
-		url, err := gh.UpdateIssue("owner", "repo", 42, "updated issue body")
+		url, err := gh.UpdateIssue("owner", "repo", 42, "session: a better title", "updated issue body")
 		if err != nil {
 			t.Fatalf("UpdateIssue: %v", err)
+		}
+		if gotBody["title"] != "session: a better title" {
+			t.Errorf("payload title = %q, want the triaged title", gotBody["title"])
 		}
 		if url != "https://github.com/owner/repo/issues/42" {
 			t.Errorf("url = %q, want %q", url, "https://github.com/owner/repo/issues/42")
@@ -783,7 +837,7 @@ func TestGitHubUpdateIssue(t *testing.T) {
 			BaseURL: "https://api.github.com",
 			client:  http.DefaultClient,
 		}
-		_, err := gh.UpdateIssue("owner", "repo", 42, "body")
+		_, err := gh.UpdateIssue("owner", "repo", 42, "title", "body")
 		if err == nil {
 			t.Fatal("UpdateIssue succeeded without token, want error")
 		}
@@ -804,14 +858,39 @@ func TestGitHubUpdateIssue(t *testing.T) {
 			client:  srv.Client(),
 		}
 
-		_, err := gh.UpdateIssue("owner", "repo", 42, "body")
+		_, err := gh.UpdateIssue("owner", "repo", 42, "title", "body")
 		if err == nil {
 			t.Fatal("UpdateIssue succeeded on 404, want error")
 		}
 		if !strings.Contains(err.Error(), "404") {
 			t.Errorf("error = %v, want it to mention 404", err)
 		}
+		// The status is a number on the error, not digits in its text.
+		var he *httpError
+		if !errors.As(err, &he) || he.Status != http.StatusNotFound {
+			t.Errorf("error = %#v, want an *httpError with Status 404", err)
+		}
 	})
+}
+
+// TestReadIssueHintsAtTheTokenOnlyOnAReal404: the "set GITHUB_TOKEN" hint is
+// keyed on the status code, so a 500 whose body mentions 404 does not get it.
+func TestReadIssueHintsAtTheTokenOnlyOnAReal404(t *testing.T) {
+	serve := func(status int, body string) *GitHub {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, body, status)
+		}))
+		t.Cleanup(srv.Close)
+		return &GitHub{BaseURL: srv.URL, client: srv.Client()}
+	}
+	_, _, err := serve(http.StatusNotFound, `{"message": "Not Found"}`).ReadIssue(IssueRef{"o", "r", 1})
+	if err == nil || !strings.Contains(err.Error(), "GITHUB_TOKEN") {
+		t.Errorf("a 404 without a token should hint at the token, got %v", err)
+	}
+	_, _, err = serve(http.StatusInternalServerError, `{"message": "backend 404 upstream"}`).ReadIssue(IssueRef{"o", "r", 1})
+	if err == nil || strings.Contains(err.Error(), "GITHUB_TOKEN") {
+		t.Errorf("a 500 must not be mistaken for a 404, got %v", err)
+	}
 }
 
 func TestFileOrDryRunOverwrite(t *testing.T) {
@@ -838,6 +917,9 @@ func TestFileOrDryRunOverwrite(t *testing.T) {
 		if mock.owner != "agent-fox-dev" || mock.repo != "coder" || mock.updateNumber != 42 || mock.body != "new body" {
 			t.Errorf("unexpected UpdateIssue args: owner=%s, repo=%s, number=%d, body=%s",
 				mock.owner, mock.repo, mock.updateNumber, mock.body)
+		}
+		if mock.title != issue.Title {
+			t.Errorf("the triaged title must go with the body: got %q, want %q", mock.title, issue.Title)
 		}
 		if !strings.Contains(stderr.String(), "[issued] updated: https://github.com/agent-fox-dev/coder/issues/42") {
 			t.Errorf("stderr missing updated url: %s", stderr.String())

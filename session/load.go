@@ -219,6 +219,19 @@ func loadBytes(path string, data []byte) *Loaded {
 				Detail: "header line was written without its terminator"})
 			return l
 		}
+		// Not a header. It may still be one complete ENTRY that lost only its
+		// terminator — a file with no header and one entry, which is the
+		// missing-header case with the missing-newline case on top. Both are
+		// repairs the multi-line path already makes; a single line gets the
+		// same treatment, because discarding a provably complete entry loses
+		// a turn.
+		if _, err := DecodeEntry(fragment); err == nil {
+			l.report(Repair{Kind: RepairMissingHeader, Line: 1,
+				Detail: "the only line is an entry, not a session header"})
+			l.accept(fragment, 1, true)
+			l.checkAnchors()
+			return l
+		}
 		l.truncate = true
 		l.report(Repair{Kind: RepairTruncatedFinalLine, Line: 1,
 			Detail: "file contains a single incomplete line"})

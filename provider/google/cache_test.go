@@ -217,3 +217,162 @@ func TestTheContextCacheIsOffByDefaultAndBelowTheThreshold(t *testing.T) {
 		})
 	}
 }
+
+// TestAnExpiredCachedContentIsForgottenAndRecreated is the local half of the
+// resource's lifetime. The service deletes a CachedContent when its TTL runs
+// out and says nothing; an entry that never expired here kept referencing it,
+// and every turn after the TTL was a 400 for a cache the caller had opted into
+// an hour earlier. An expired entry reads as absent and creation runs AGAIN —
+// which a sync.Once cannot do.
+func TestAnExpiredCachedContentIsForgottenAndRecreated(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	created := make(chan string, 4)
+	var creates int
+	var bodies [][]byte
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if isCacheCreate(r) {
+			creates++
+			return &http.Response{StatusCode: 200,
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"name":"cachedContents/c` +
+					strings.Repeat("x", creates) + `","expireTime":"` +
+					now.Add(10*time.Minute).Format(time.RFC3339) + `"}`))}, nil
+		}
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, b)
+		return sseOK(), nil
+	})
+	p := google.Provider(google.Options{
+		Getenv: func(string) string { return "" },
+		Now:    func() time.Time { return now },
+		ContextCache: &google.ContextCacheOptions{
+			OnCreate: func(name string, err error) { created <- name },
+		},
+	})
+	req := cacheRequest(t, rt)
+	turn := func() {
+		t.Helper()
+		p.Stream(context.Background(), model(), req, core.ProviderStreamOptions{}).Result()
+	}
+	wait := func() string {
+		t.Helper()
+		select {
+		case n := <-created:
+			return n
+		case <-time.After(2 * time.Second):
+			t.Fatal("creation never completed")
+			return ""
+		}
+	}
+	cachedContentOf := func(i int) string {
+		var w struct {
+			CachedContent string `json:"cachedContent"`
+		}
+		_ = json.Unmarshal(bodies[i], &w)
+		return w.CachedContent
+	}
+
+	turn()
+	first := wait()
+	turn()
+	if cachedContentOf(1) != first {
+		t.Fatalf("turn 2 referenced %q, want the created resource %q", cachedContentOf(1), first)
+	}
+
+	// The service's expireTime passes.
+	now = now.Add(11 * time.Minute)
+	turn()
+	if cachedContentOf(2) != "" {
+		t.Fatalf("turn 3 referenced %q after the resource's expireTime; the service has "+
+			"deleted it and the request is a 400", cachedContentOf(2))
+	}
+	second := wait()
+	if second == first || second == "" {
+		t.Fatalf("no second creation ran after expiry (got %q, first was %q)", second, first)
+	}
+	turn()
+	if cachedContentOf(3) != second {
+		t.Fatalf("turn 4 referenced %q, want the recreated resource %q", cachedContentOf(3), second)
+	}
+	if creates != 2 {
+		t.Fatalf("%d creations, want exactly 2: one per lifetime, never one per turn", creates)
+	}
+}
+
+// TestACachedContentTheServiceRefusesIsClearedAndTheTurnRetriedOnce: a
+// resource deleted under us — or one the service will not pair with this
+// request — is a 4xx on a request that was otherwise fine. The entry is
+// cleared so the next turn recreates, and THIS turn goes out again without
+// the reference rather than failing for a cache it never needed.
+func TestACachedContentTheServiceRefusesIsClearedAndTheTurnRetriedOnce(t *testing.T) {
+	created := make(chan string, 4)
+	var bodies [][]byte
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if isCacheCreate(r) {
+			return &http.Response{StatusCode: 200,
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body:   io.NopCloser(strings.NewReader(`{"name":"cachedContents/gone"}`))}, nil
+		}
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, b)
+		if strings.Contains(string(b), "cachedContents/gone") {
+			return &http.Response{StatusCode: 400, Header: http.Header{},
+				Body: io.NopCloser(strings.NewReader(`{"error":{"message":"CachedContent not found"}}`))}, nil
+		}
+		return sseOK(), nil
+	})
+	p := google.Provider(google.Options{
+		Getenv: func(string) string { return "" },
+		ContextCache: &google.ContextCacheOptions{
+			OnCreate: func(name string, err error) { created <- name },
+		},
+	})
+	req := cacheRequest(t, rt)
+	p.Stream(context.Background(), model(), req, core.ProviderStreamOptions{}).Result()
+	select {
+	case <-created:
+	case <-time.After(2 * time.Second):
+		t.Fatal("creation never completed")
+	}
+
+	msg := p.Stream(context.Background(), model(), req, core.ProviderStreamOptions{}).Result()
+	if msg.StopReason == core.StopReasonError {
+		t.Fatalf("the turn failed instead of being retried without the refused reference: %s",
+			msg.ErrorMessage)
+	}
+	if len(bodies) != 3 {
+		t.Fatalf("%d model requests, want 3: the first turn, the refused cached one, and its "+
+			"retry", len(bodies))
+	}
+	var retry struct {
+		CachedContent     string          `json:"cachedContent"`
+		SystemInstruction json.RawMessage `json:"systemInstruction"`
+	}
+	if err := json.Unmarshal(bodies[2], &retry); err != nil {
+		t.Fatal(err)
+	}
+	if retry.CachedContent != "" {
+		t.Fatalf("the retry still referenced %q", retry.CachedContent)
+	}
+	if len(retry.SystemInstruction) == 0 {
+		t.Fatal("the retry withheld the system prompt the resource was supposed to carry")
+	}
+
+	// The entry is cleared: the next turn goes out uncached and creation
+	// runs again, rather than referencing the refused resource forever.
+	p.Stream(context.Background(), model(), req, core.ProviderStreamOptions{}).Result()
+	var third struct {
+		CachedContent string `json:"cachedContent"`
+	}
+	if err := json.Unmarshal(bodies[3], &third); err != nil {
+		t.Fatal(err)
+	}
+	if third.CachedContent != "" {
+		t.Fatalf("the turn after the refusal still referenced %q", third.CachedContent)
+	}
+	select {
+	case <-created:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no recreation was started after the service refused the resource")
+	}
+}

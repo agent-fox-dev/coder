@@ -470,7 +470,14 @@ func (scratchStore) OpenSession(_ context.Context, sessionID string) (core.Sessi
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return session.Create(filepath.Join(dir, sessionID+".jsonl"),
+	// The id names a file, so it is reduced to a single path element first:
+	// an id of "../../etc/x" is a path, not a session, and joining it
+	// verbatim would open a file outside dir.
+	name := filepath.Base(sessionID)
+	if name == "." || name == ".." || name == string(filepath.Separator) {
+		return nil, fmt.Errorf("scratch-store: %q is not a usable session id", sessionID)
+	}
+	return session.Create(filepath.Join(dir, name+".jsonl"),
 		core.SessionHeader{ID: sessionID}, session.Options{})
 }
 

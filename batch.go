@@ -437,12 +437,12 @@ func callAfter(ctx context.Context, report func(error), f core.AfterToolCall, in
 	return f(ctx, in)
 }
 
+// toolResultMessage renders a result for the transcript. The text block is
+// the tool's own rendering when it supplied one (core.ToolResult.Text), else
+// the REQ-TOOL-08 JSON envelope; either way the tool's extra blocks (images)
+// follow it.
 func toolResultMessage(c core.ToolUseBlock, r core.ToolResult) core.ToolResultMessage {
-	payload, err := json.Marshal(r.ToLLMMap())
-	if err != nil {
-		payload = []byte(`{"ok":false,"error":"marshal_failed"}`)
-	}
-	content := core.Content{core.TextBlock{Text: string(payload)}}
+	content := core.Content{core.TextBlock{Text: r.LLMText()}}
 	content = append(content, r.Blocks...)
 	return core.ToolResultMessage{
 		ToolUseID: c.ID,

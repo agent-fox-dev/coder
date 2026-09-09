@@ -61,9 +61,16 @@ type Options struct {
 
 // Result is what the run produced, whether or not it finished.
 type Result struct {
-	Ref            IssueRef
-	Branch         string
-	Commit         string
+	Ref IssueRef
+	// BaseBranch is where the fix lands and what a pull request targets. It
+	// is captured in pre-flight, before the feature branch exists.
+	BaseBranch string
+	Branch     string
+	Commit     string
+	// WIPCommit is set when the checks failed after the change: the work is
+	// committed on Branch under a `wip:` subject so the checkout can return to
+	// BaseBranch clean, and nothing is landed.
+	WIPCommit      string
 	PRURL          string
 	Analysis       Analysis
 	Implementation Implementation
@@ -158,7 +165,12 @@ func (r *runner) run(ctx context.Context) error {
 		if err != nil {
 			return "", err
 		}
-		return "clean tree at " + head, nil
+		// The base branch is decided HERE, while the branch the operator
+		// checked out is still the one checked out. Asked later, after the
+		// feature branch exists, git would answer with the feature branch on
+		// every repository whose origin does not advertise a default.
+		r.res.BaseBranch = o.Git.BaseBranch(ctx)
+		return "clean tree at " + head + " on " + r.res.BaseBranch, nil
 	}); err != nil {
 		return err
 	}
@@ -272,6 +284,7 @@ func (r *runner) run(ctx context.Context) error {
 		imp, stats, err := o.Brain.Implement(ctx, ImplementInput{
 			Ref: o.Ref, Issue: issue, Analysis: r.res.Analysis,
 			Baseline: r.res.Baseline, VerifyCommand: o.VerifyCommand, Branch: r.res.Branch,
+			Instructions: projectInstructions(o.Dir),
 		})
 		r.res.Stats = append(r.res.Stats, stats)
 		if err != nil {
@@ -283,10 +296,11 @@ func (r *runner) run(ctx context.Context) error {
 		return r.fail(ctx, "implement", err)
 	}
 
-	// 8. Verification, by this program rather than by the model's report of
-	//    it. The diff check is part of it: a run that changed nothing has not
-	//    fixed anything, however confident the summary sounds.
-	if err := r.step(ctx, "verify", func() (string, error) {
+	// 8. The diff. A run that changed nothing has not fixed anything, however
+	//    confident the summary sounds. It is its own stage so that "nothing
+	//    was written" and "something was written and the checks fail" reach
+	//    the caller as different exit codes.
+	if err := r.step(ctx, "diff", func() (string, error) {
 		changed, err := o.Git.ChangedFiles(ctx, "HEAD")
 		if err != nil {
 			return "", err
@@ -296,7 +310,17 @@ func (r *runner) run(ctx context.Context) error {
 			return "", fmt.Errorf("the implementation phase reported a fix but the working tree is "+
 				"identical to %s — nothing was changed", mustHead(ctx, o.Git))
 		}
+		return fmt.Sprintf("%d file(s) changed", len(changed)), nil
+	}); err != nil {
+		return r.fail(ctx, "diff", err)
+	}
 
+	// 9. Verification, by this program rather than by the model's report of
+	//    it. A failure parks the work as a WIP commit on the branch and
+	//    returns the checkout to the base branch, so the next run's pre-flight
+	//    finds a clean tree rather than this run's leftovers.
+	if err := r.step(ctx, "verify", func() (string, error) {
+		changed := r.res.Changed
 		r.res.Verification = Verify(ctx, o.Run, o.Dir, o.VerifyCommand, o.VerifyTimeout)
 		switch {
 		case r.res.Verification.Skipped:
@@ -314,15 +338,16 @@ func (r *runner) run(ctx context.Context) error {
 		return fmt.Sprintf("%d file(s) changed, `%s` %s", len(changed),
 			r.res.Verification.Command, r.res.Verification.Status()), nil
 	}); err != nil {
+		r.park(ctx)
 		return r.fail(ctx, "verify", err)
 	}
 
-	// 9. Land it.
+	// 10. Land it.
 	if err := r.landing(ctx); err != nil {
 		return r.fail(ctx, "land", err)
 	}
 
-	// 10. Report. Posted last, so the comment can name the pull request that
+	// 11. Report. Posted last, so the comment can name the pull request that
 	//     now exists — af-fix posts its summary before creating the PR, and
 	//     then has no link to include.
 	return r.step(ctx, "post-summary", func() (string, error) {
@@ -365,12 +390,12 @@ func (r *runner) landing(ctx context.Context) error {
 		if o.DryRun {
 			r.outMu.Lock()
 			fmt.Fprintf(o.Out, "  ~ dry run: would squash-merge %s into %s\n",
-				r.res.Branch, o.Git.BaseBranch(ctx))
+				r.res.Branch, r.res.BaseBranch)
 			r.outMu.Unlock()
 			return nil
 		}
 		return r.step(ctx, "merge", func() (string, error) {
-			base := o.Git.BaseBranch(ctx)
+			base := r.res.BaseBranch
 			if err := o.Git.SquashMergeInto(ctx, base, r.res.Branch, msg); err != nil {
 				return "", err
 			}
@@ -396,7 +421,7 @@ func (r *runner) landing(ctx context.Context) error {
 	}
 	return r.step(ctx, "pull-request", func() (string, error) {
 		url, err := o.Hub.CreatePR(ctx, o.Ref, PullRequestSpec{
-			Base: o.Git.BaseBranch(ctx), Head: r.res.Branch, Title: subject,
+			Base: r.res.BaseBranch, Head: r.res.Branch, Title: subject,
 			Body: PullRequestBody(r.res.Implementation, o.Ref, r.res.Baseline, r.res.Verification, r.res.Changed),
 		})
 		if err != nil {
@@ -415,11 +440,38 @@ func (r *runner) landing(ctx context.Context) error {
 // original error. Reporting the failure never replaces it.
 func (r *runner) fail(ctx context.Context, stage string, cause error) error {
 	r.res.Stage = stage
-	body := FailureComment(stage, cause, r.res.Branch, r.res.Verification)
+	body := FailureComment(stage, cause, r.res.Branch, r.res.Commit, r.res.WIPCommit, r.res.Verification)
 	if _, err := r.o.Hub.Comment(ctx, r.o.Ref, body); err != nil {
 		r.warn("could not post the failure comment: " + err.Error())
 	}
 	return cause
+}
+
+// park keeps an unverified change without landing it: a WIP commit on the
+// feature branch, then the base branch checked out again.
+//
+// Leaving the edits loose in the working tree would fail the NEXT run's
+// pre-flight ("uncommitted changes") on a tree this program dirtied itself,
+// and leaving the feature branch checked out would make the operator's next
+// `git pull` land on it. Neither failure is worth reporting on the issue, so
+// this never returns an error; what it could not do is warned about.
+func (r *runner) park(ctx context.Context) {
+	o := r.o
+	_ = r.step(ctx, "park", func() (string, error) {
+		msg := fmt.Sprintf("wip: unverified fix for #%d\n\n`%s` did not pass after this change; "+
+			"see the issue for the output. Not for landing as is.\n", o.Ref.Number, r.res.Verification.Command)
+		sha, err := o.Git.CommitAll(ctx, msg)
+		if err != nil {
+			r.warn("could not commit the unverified change; it is left uncommitted on " + r.res.Branch + ": " + err.Error())
+			return "", err
+		}
+		r.res.WIPCommit = sha
+		if err := o.Git.Checkout(ctx, r.res.BaseBranch); err != nil {
+			r.warn("could not return to " + r.res.BaseBranch + ": " + err.Error())
+			return "", err
+		}
+		return fmt.Sprintf("committed %s on %s as a WIP; back on %s", sha, r.res.Branch, r.res.BaseBranch), nil
+	})
 }
 
 // step runs one pipeline step, prints it, and journals the outcome.

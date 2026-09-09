@@ -9,6 +9,7 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -357,6 +358,92 @@ func TestDownscalingAveragesRatherThanSampling(t *testing.T) {
 	}
 }
 
+// ---- decoder bombs
+
+// TestAHeaderClaimingHugeDimensionsIsRefusedBeforeDecoding.
+//
+// A PNG whose IHDR says 30000×30000 is a few hundred bytes on disk and 3.6 GB
+// once decoded; a JPEG whose frame header says the same allocates 1.35 GB the
+// moment the scan starts. Both fixtures are tiny, and both must be refused from
+// the header alone: the assertion is on ALLOCATION, because a check that ran
+// after the decode would still return the right error — having already paid.
+func TestAHeaderClaimingHugeDimensionsIsRefusedBeforeDecoding(t *testing.T) {
+	const side = 30000
+	fixtures := map[string]struct {
+		data []byte
+		mime string
+	}{
+		"png":  {pngHeaderClaiming(t, side, side), imagex.MIMEPNG},
+		"jpeg": {baselineJPEG(t, 3, side, side), imagex.MIMEJPEG},
+	}
+	for name, fx := range fixtures {
+		t.Run(name, func(t *testing.T) {
+			if len(fx.data) > 4096 {
+				t.Fatalf("the fixture is %d bytes; it must be small so the file size cannot be what stops the decode", len(fx.data))
+			}
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			_, err := imagex.Normalize(fx.data, fx.mime)
+			runtime.ReadMemStats(&after)
+			if !errors.Is(err, imagex.ErrTooLarge) {
+				t.Fatalf("want ErrTooLarge, got %v", err)
+			}
+			if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 1<<20 {
+				t.Fatalf("refusing a %dx%d header allocated %d bytes; the dimensions must be "+
+					"checked from the header BEFORE any decode", side, side, alloc)
+			}
+		})
+	}
+
+	// Validate on its own must be as cheap: it used to full-decode a JPEG to
+	// learn its colour model, which made the validator the bomb.
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if err := imagex.Validate(fixtures["jpeg"].data, imagex.MIMEJPEG); err != nil {
+		t.Fatalf("a three-component JPEG validates: %v", err)
+	}
+	runtime.ReadMemStats(&after)
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 1<<20 {
+		t.Fatalf("Validate allocated %d bytes for a JPEG header; it must read the frame "+
+			"header (DecodeConfig), not decode the image", alloc)
+	}
+}
+
+// TestDimensionsJustInsideTheLimitStillDecode pins the limit from the other
+// side, so it cannot drift down to "refuse everything".
+func TestDimensionsJustInsideTheLimitStillDecode(t *testing.T) {
+	in := pngOf(t, 2500, 2500, color.White) // 6.25 MP, inside MaxPixels
+	if _, err := imagex.Normalize(in, imagex.MIMEPNG); err != nil {
+		t.Fatalf("an ordinary large image must still normalize: %v", err)
+	}
+}
+
+// pngHeaderClaiming is a syntactically valid PNG — signature, IHDR, IEND —
+// whose header declares w×h and which carries no pixel data at all.
+func pngHeaderClaiming(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	b.WriteString("\x89PNG\r\n\x1a\n")
+	chunk := func(typ string, payload []byte) {
+		n := uint32(len(payload))
+		b.Write([]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)})
+		b.WriteString(typ)
+		b.Write(payload)
+		crc := pngCRC(append([]byte(typ), payload...))
+		b.Write([]byte{byte(crc >> 24), byte(crc >> 16), byte(crc >> 8), byte(crc)})
+	}
+	ihdr := []byte{
+		byte(w >> 24), byte(w >> 16), byte(w >> 8), byte(w),
+		byte(h >> 24), byte(h >> 16), byte(h >> 8), byte(h),
+		8, 6, 0, 0, 0, // 8-bit RGBA, no interlace
+	}
+	chunk("IHDR", ihdr)
+	chunk("IEND", nil)
+	return b.Bytes()
+}
+
 // ---- helpers
 
 func wrap(s string, n int) string {
@@ -421,30 +508,41 @@ func pngCRC(b []byte) uint32 {
 // that is a real JPEG rather than a header that happens to parse.
 func cmykJPEG(t *testing.T) []byte {
 	t.Helper()
+	return baselineJPEG(t, 4, 8, 8)
+}
+
+// baselineJPEG assembles a baseline JPEG with comps components whose frame
+// header claims w×h, with a single all-zero scan. Four components carry the
+// Adobe marker that makes them CMYK.
+func baselineJPEG(t *testing.T, comps int, w, h int) []byte {
+	t.Helper()
 	var b bytes.Buffer
-	w := func(v ...byte) { b.Write(v) }
+	wr := func(v ...byte) { b.Write(v) }
 
-	w(0xFF, 0xD8) // SOI
+	wr(0xFF, 0xD8) // SOI
 
-	// APP14 Adobe with transform 0. This marker is what tells a decoder the
-	// four components are CMYK rather than an unknown four-channel space.
-	adobe := []byte{'A', 'd', 'o', 'b', 'e', 0, 100, 0, 0, 0, 0, 0, 0, 0, 0}
-	w(0xFF, 0xEE, byte((len(adobe)+2)>>8), byte(len(adobe)+2))
-	w(adobe...)
+	if comps == 4 {
+		// APP14 Adobe with transform 0. This marker is what tells a decoder
+		// the four components are CMYK rather than an unknown four-channel
+		// space.
+		adobe := []byte{'A', 'd', 'o', 'b', 'e', 0, 100, 0, 0, 0, 0, 0, 0, 0, 0}
+		wr(0xFF, 0xEE, byte((len(adobe)+2)>>8), byte(len(adobe)+2))
+		wr(adobe...)
+	}
 
 	// DQT: one 8-bit table, flat.
-	w(0xFF, 0xDB, 0x00, 0x43, 0x00)
+	wr(0xFF, 0xDB, 0x00, 0x43, 0x00)
 	for range 64 {
-		w(16)
+		wr(16)
 	}
 
-	// SOF0: 8x8, FOUR components, 1x1 sampling, quantization table 0.
-	sof := []byte{8, 0, 8, 0, 8, 4}
-	for c := byte(1); c <= 4; c++ {
+	// SOF0: w×h, comps components, 1x1 sampling, quantization table 0.
+	sof := []byte{8, byte(h >> 8), byte(h), byte(w >> 8), byte(w), byte(comps)}
+	for c := byte(1); c <= byte(comps); c++ {
 		sof = append(sof, c, 0x11, 0)
 	}
-	w(0xFF, 0xC0, byte((len(sof)+2)>>8), byte(len(sof)+2))
-	w(sof...)
+	wr(0xFF, 0xC0, byte((len(sof)+2)>>8), byte(len(sof)+2))
+	wr(sof...)
 
 	// Two Huffman tables, each holding a single 2-bit code "00": DC symbol 0
 	// (a zero difference) and AC symbol 0 (end-of-block).
@@ -453,23 +551,23 @@ func cmykJPEG(t *testing.T) []byte {
 		counts[1] = 1 // one code of length 2
 		dht := append([]byte{class}, counts...)
 		dht = append(dht, 0x00)
-		w(0xFF, 0xC4, byte((len(dht)+2)>>8), byte(len(dht)+2))
-		w(dht...)
+		wr(0xFF, 0xC4, byte((len(dht)+2)>>8), byte(len(dht)+2))
+		wr(dht...)
 	}
 
-	// SOS over all four components.
-	sos := []byte{4}
-	for c := byte(1); c <= 4; c++ {
+	// SOS over all components.
+	sos := []byte{byte(comps)}
+	for c := byte(1); c <= byte(comps); c++ {
 		sos = append(sos, c, 0x00)
 	}
 	sos = append(sos, 0, 63, 0)
-	w(0xFF, 0xDA, byte((len(sos)+2)>>8), byte(len(sos)+2))
-	w(sos...)
+	wr(0xFF, 0xDA, byte((len(sos)+2)>>8), byte(len(sos)+2))
+	wr(sos...)
 
-	// Entropy data: per component, DC "00" then EOB "00" — four bits of zeros,
-	// four components, sixteen bits, two bytes.
-	w(0x00, 0x00)
+	// Entropy data: per component, DC "00" then EOB "00" — four bits each,
+	// so two bytes cover up to four components of one MCU.
+	wr(0x00, 0x00)
 
-	w(0xFF, 0xD9) // EOI
+	wr(0xFF, 0xD9) // EOI
 	return b.Bytes()
 }

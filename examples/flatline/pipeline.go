@@ -396,7 +396,9 @@ func (r *runner) runGroup(ctx context.Context, g afspec.TaskGroup, out *GroupOut
 			if err := o.Git.Checkout(ctx, head); err != nil {
 				return "", err
 			}
-			stalled := "stalled/" + branch
+			// A previous run may have left a stalled/ branch of the same
+			// name; the rename gets a free one rather than failing on it.
+			stalled := UniqueBranchName(ctx, o.Git, "stalled/"+branch)
 			if _, err := o.Git.mustGit(ctx, "branch", "-m", branch, stalled); err != nil {
 				return "", err
 			}

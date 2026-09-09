@@ -113,3 +113,25 @@ func TestTheProhibitedSetCannotBeShortenedByACaller(t *testing.T) {
 		t.Fatal("a caller mutated the package's own prohibited set")
 	}
 }
+
+// A Go import path may be a RAW string literal. A lint that stripped only
+// the surrounding double quotes left `...` uninspected — and therefore
+// admitted — which is exactly the form somebody evading the lint would write.
+func TestARawStringImportPathIsLintedLikeAQuotedOne(t *testing.T) {
+	dir := t.TempDir()
+	writeGo(t, dir, "x.go", "package p\n\nimport `github.com/agentfox/agentkit-go/internal/toml`\n")
+	bad, err := plugins.LintImports(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad) != 1 || bad[0].Import != "github.com/agentfox/agentkit-go/internal/toml" || bad[0].Reason != "" {
+		t.Fatalf("violations = %+v, want the backquoted internal import flagged", bad)
+	}
+	bad, err = plugins.LintSkillImports(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad) != 1 {
+		t.Fatalf("skill lint violations = %+v, want the same finding", bad)
+	}
+}

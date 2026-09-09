@@ -46,6 +46,20 @@ func ApplyEdits(content string, edits []Edit) (string, int, error) {
 	if len(edits) == 0 {
 		return "", 0, &EditError{Phase: "empty", Text: "No edits were provided."}
 	}
+	// The edits get the same CRLF normalisation the file did (NormalizeForEdit).
+	// A model that copied its old_string out of a CRLF file it read through a
+	// path that kept the CRs sends "\r\n", the content it is matched against
+	// has "\n", and nothing matches; Restore then puts the CRs back on the
+	// new_string's lines along with everything else.
+	edits = normalizeEdits(edits)
+	// A rejection that names an edit by index only helps when there is more
+	// than one to tell apart; for a single edit the prefix is noise.
+	at := func(i int) string {
+		if len(edits) > 1 {
+			return fmt.Sprintf("edits[%d]: ", i)
+		}
+		return ""
+	}
 
 	// ---- Phase 1: empty old_string.
 	for i, e := range edits {
@@ -67,7 +81,7 @@ func ApplyEdits(content string, edits []Edit) (string, int, error) {
 				return out, n, nil
 			}
 			return "", 0, &EditError{Phase: "not_found", Index: i,
-				Text: fmt.Sprintf("edits[%d]: the string to replace was not found in the file.", i)}
+				Text: at(i) + "The string to replace was not found in the file." + notFoundHint(content, e.OldString)}
 		}
 	}
 
@@ -75,7 +89,7 @@ func ApplyEdits(content string, edits []Edit) (string, int, error) {
 	for i, e := range edits {
 		if n := countOverlapping(content, e.OldString); n > 1 {
 			return "", 0, &EditError{Phase: "not_unique", Index: i,
-				Text: fmt.Sprintf("Found %d occurrences of the string to replace. "+
+				Text: at(i) + fmt.Sprintf("Found %d occurrences of the string to replace. "+
 					"The text must be unique. Please provide more context to make it unique.", n)}
 		}
 	}
@@ -123,6 +137,72 @@ func ApplyEdits(content string, edits []Edit) (string, int, error) {
 			Text: "The edits would leave the file unchanged."}
 	}
 	return out, len(edits), nil
+}
+
+// normalizeEdits mirrors NormalizeForEdit's CRLF rule onto the edits.
+func normalizeEdits(edits []Edit) []Edit {
+	out := make([]Edit, len(edits))
+	for i, e := range edits {
+		out[i] = Edit{
+			OldString: strings.ReplaceAll(e.OldString, "\r\n", "\n"),
+			NewString: strings.ReplaceAll(e.NewString, "\r\n", "\n"),
+		}
+	}
+	return out
+}
+
+// notFoundHint is what makes a not_found rejection ACTIONABLE without a
+// re-read. It reports whether the needle's first non-blank line occurs in the
+// file and where, so the model can tell "I have the wrong file" from "the
+// lines after my anchor have changed" from "my indentation is off" — the
+// three failures that produce this rejection, each with a different fix.
+func notFoundHint(content, old string) string {
+	first := ""
+	for _, l := range strings.Split(old, "\n") {
+		if strings.TrimSpace(l) != "" {
+			first = l
+			break
+		}
+	}
+	if first == "" {
+		return ""
+	}
+	key := FoldLine(first)
+	loose := strings.TrimSpace(key)
+	var exact, indented []int
+	for n, l := range strings.Split(content, "\n") {
+		switch fl := FoldLine(l); {
+		case fl == key:
+			exact = append(exact, n+1)
+		case strings.TrimSpace(fl) == loose:
+			indented = append(indented, n+1)
+		}
+	}
+	const show = 3
+	lines := func(ns []int) string {
+		parts := make([]string, 0, show)
+		for i, n := range ns {
+			if i == show {
+				parts = append(parts, "…")
+				break
+			}
+			parts = append(parts, fmt.Sprint(n))
+		}
+		return strings.Join(parts, ", ")
+	}
+	multi := strings.Contains(strings.TrimSpace(old), "\n")
+	switch {
+	case len(exact) > 0 && multi:
+		return fmt.Sprintf(" Its first line occurs at line %s; the lines after it differ from the file.", lines(exact))
+	case len(exact) > 0:
+		// A single-line needle whose folded form is present but whose exact
+		// bytes are not: the fold failed for another edit in the batch, or the
+		// difference is one FoldLine does not cover.
+		return fmt.Sprintf(" A near match is at line %s; the difference is in whitespace or punctuation.", lines(exact))
+	case len(indented) > 0:
+		return fmt.Sprintf(" Its first line occurs at line %s with different indentation.", lines(indented))
+	}
+	return " Not even its first line occurs in the file; re-read the file before retrying."
 }
 
 // countOverlapping counts every occurrence of sub in s, INCLUDING overlapping

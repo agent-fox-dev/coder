@@ -438,10 +438,9 @@ func BuildRequestCached(m *core.Model, req core.Request, prefix *provider.ToolPr
 	compat := CompatFor(m)
 	repaired, rep := provider.RepairTranscript(req.Messages, provider.TargetFor(m, NormalizeToolCallID))
 
-	// REQ-CACHE-10, third arm. This wire has neither Anthropic's
-	// defer_loading nor Responses' additional_tools, so a tool added
-	// mid-session is WITHHELD from the top-level declarations and re-declared
-	// at the transcript position where it appeared. Prepending it to the
+	// REQ-CACHE-10, third arm. This wire has no defer_loading, so a tool
+	// added mid-session is WITHHELD from the top-level declarations and
+	// re-declared at the transcript position where it appeared. Prepending it to the
 	// declarations instead would rewrite the cached prefix and cost the whole
 	// provider-side cache over one added tool.
 	split := provider.SplitDeferredTools(req.Tools, req.Messages)
@@ -699,7 +698,18 @@ func encodeParts(c core.Content, nameByID map[string]string) []part {
 				// same-model transcript carrying one.
 				continue
 			}
-			if v.Thinking == "" && v.Signature == "" {
+			if v.Signature == "" || v.Signature == ThoughtMarkerSignature {
+				// Unsigned, or signed only with the decoder's marker: the
+				// model attaches nothing to a thought summary that would
+				// replay it — only the signature on a functionCall part
+				// matters — and sending the text back conditions the model
+				// on its own reasoning as prose. Dropped, not demoted.
+				continue
+			}
+			if v.Thinking == "" {
+				// A signature that arrived on a text part or alone: sent back
+				// as a signature-only part, the shape it came in.
+				out = append(out, part{ThoughtSignature: v.Signature})
 				continue
 			}
 			out = append(out, part{

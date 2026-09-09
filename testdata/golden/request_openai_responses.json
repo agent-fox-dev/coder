@@ -65,6 +65,9 @@
   "max_output_tokens": 1024,
   "temperature": 0.2,
   "top_p": 0.9,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
   "store": false,
   "stream": true
 }

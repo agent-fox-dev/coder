@@ -138,26 +138,32 @@ func resolveExistingPrefix(abs string) (string, error) {
 // maxSymlinkHops bounds resolveExistingPrefix's link following.
 const maxSymlinkHops = 40
 
-// CheckWriteTarget re-checks abs IMMEDIATELY before a write opens it
+// CheckWriteTarget re-checks abs IMMEDIATELY before a write touches it
 // (REQ-SEC-01). Resolve already returned a contained path, but a link created
-// at that path between the check and the open — by a concurrent command, or
-// by a hostile repository's own build step — would be followed by the open.
-// An open that follows a link whose target lies outside the root is refused
-// here, where the window is as small as the platform allows.
+// between the check and the open — by a concurrent command, or by a hostile
+// repository's own build step — would be followed by the open.
+//
+// The WHOLE path is re-resolved, not only its last component. An earlier
+// version looked at the leaf alone, and the leaf is not where the swap
+// happens: `ws/sub` replaced by `ws/sub -> /elsewhere` leaves
+// `ws/sub/file.txt` looking like a plain file (or an absent one) while the
+// write lands in /elsewhere — and the MkdirAll that precedes a write would
+// build the missing directories there too. So the callers run this BEFORE
+// MkdirAll, and it walks the existing prefix exactly as Resolve did.
 func (w *Workspace) CheckWriteTarget(abs string) error {
-	fi, err := os.Lstat(abs)
-	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		return nil // absent (about to be created) or a plain file
-	}
 	resolved, err := resolveExistingPrefix(abs)
 	if err != nil {
 		return err
 	}
-	if !within(w.Root, resolved) {
+	if within(w.Root, resolved) {
+		return nil
+	}
+	if fi, lerr := os.Lstat(abs); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("%w: %s is a symlink whose target %s lies outside the workspace root %s",
 			ErrPathNotAllowed, w.Rel(abs), resolved, w.Root)
 	}
-	return nil
+	return fmt.Errorf("%w: %s now resolves to %s, outside the workspace root %s",
+		ErrPathNotAllowed, w.Rel(abs), resolved, w.Root)
 }
 
 // within reports whether target is root or is inside it. It compares path

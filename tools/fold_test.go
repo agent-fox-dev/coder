@@ -201,3 +201,11 @@ func asEditError(err error, target **tools.EditError) bool {
 	}
 	return false
 }
+
+// TestFoldLineTrimsATrailingCarriageReturn is B1's fold half: a line copied
+// from a CRLF file with its CR intact is the same line.
+func TestFoldLineTrimsATrailingCarriageReturn(t *testing.T) {
+	if got := tools.FoldLine("x := 1 \r"); got != "x := 1" {
+		t.Fatalf("FoldLine = %q, want the CR trimmed with the trailing space", got)
+	}
+}

@@ -318,16 +318,55 @@ func TestShippedCatalogClamps(t *testing.T) {
 		t.Errorf("gpt-6-astra max_tokens = %d, want its 128000 output cap", got)
 	}
 
-	// A row whose whole ladder is present-and-null supports no reachable
-	// level, so the parameter is omitted rather than clamped: the current
-	// Anthropic models price reasoning in an effort field this wire does not
-	// carry (see the row notes), and guessing a budget for them is a 400.
+	// An effort-style row prices every level as an output_config.effort
+	// token, and the adapter sends the TOKEN, never a budget: a row whose
+	// wire values are words is how the catalog says "this generation rejects
+	// budget_tokens". minimal maps to low because no Anthropic model has a
+	// minimal effort.
 	opus, err := ResolveModel("anthropic/claude-opus-5")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok := ClampThinkingLevel(opus, core.ThinkingHigh); ok {
-		t.Error("claude-opus-5 prices no level above off; the parameter must be omitted, not clamped")
+	if lvl, wire, ok := ClampThinkingLevel(opus, core.ThinkingHigh); !ok || lvl != core.ThinkingHigh || wire != "high" {
+		t.Errorf("claude-opus-5 high -> (%q, %q, %v), want (high, high, true)", lvl, wire, ok)
+	}
+	if lvl, wire, ok := ClampThinkingLevel(opus, core.ThinkingMinimal); !ok || lvl != core.ThinkingMinimal || wire != "low" {
+		t.Errorf("claude-opus-5 minimal -> (%q, %q, %v), want (minimal, low, true)", lvl, wire, ok)
+	}
+	// The 4.6 generation has no xhigh: the entry is absent, so a request for
+	// it clamps UP to max — more thinking than asked, never silently less.
+	sonnet46, err := ResolveModel("anthropic/claude-sonnet-4-6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lvl, wire, _ := ClampThinkingLevel(sonnet46, core.ThinkingXHigh); lvl != core.ThinkingMax || wire != "max" {
+		t.Errorf("claude-sonnet-4-6 xhigh -> (%q, %q), want (max, max): upward first", lvl, wire)
+	}
+	// Fable cannot stop thinking: off is present-and-null, and the clamp
+	// reports that as unsupported so the adapter omits the key.
+	fable, err := ResolveModel("anthropic/claude-fable-5-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ThinkingWire(fable, core.ThinkingOff); ok {
+		t.Error("claude-fable-5-1 off must be present-and-null: {\"type\":\"disabled\"} is a 400 there")
+	}
+	if _, ok := ThinkingWire(opus, core.ThinkingOff); !ok {
+		t.Error("claude-opus-5 off must map to a wire value: the model accepts disabled")
+	}
+	// The 200k rows are spelled out so a sibling clone's 1M window is not
+	// applied to them.
+	for _, id := range []string{"anthropic/claude-opus-4-5", "anthropic/claude-sonnet-4-5"} {
+		m, err := ResolveModel(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.ContextWindow != 200000 || m.MaxTokens != 64000 {
+			t.Errorf("%s window/max = %d/%d, want 200000/64000", id, m.ContextWindow, m.MaxTokens)
+		}
+		if _, wire, _ := ClampThinkingLevel(m, core.ThinkingMax); wire != "32768" {
+			t.Errorf("%s max -> %q, want the budget ladder's high (32768)", id, wire)
+		}
 	}
 	if got := ClampMaxTokens(haiku, 64000, 190000); got != 5904 {
 		t.Errorf("haiku deep in a session: %d, want 5904", got)

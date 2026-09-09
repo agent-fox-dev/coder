@@ -296,3 +296,55 @@ func TestRepairsCarryTheLineTheyDescribe(t *testing.T) {
 		t.Errorf("Repair.String() = %q, want it to name the line", s)
 	}
 }
+
+// TestASingleUnterminatedEntryWithNoHeaderIsKept. A file holding exactly one
+// complete entry, no header and no trailing newline was discarded AND
+// truncated: the single-line path tried the fragment as a header, and when it
+// was not one, gave up. The multi-line path handles both damages — a missing
+// header is synthesized, a complete final entry without its terminator is
+// kept — and one line is owed the same repairs, because discarding a
+// provably complete entry loses a turn.
+func TestASingleUnterminatedEntryWithNoHeaderIsKept(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, []byte(msgLine("e1", "", "only")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	l := mustLoad(t, path)
+	if got := len(l.Entries()); got != 1 {
+		t.Fatalf("kept %d entries, want 1: the line is a complete entry", got)
+	}
+	if l.Entries()[0].ID != "e1" {
+		t.Fatalf("entry id = %q", l.Entries()[0].ID)
+	}
+	if !hasRepair(l.Repairs, RepairMissingHeader) || !hasRepair(l.Repairs, RepairMissingFinalNewline) {
+		t.Fatalf("repairs = %v; want the missing header and the missing terminator both reported", l.Repairs)
+	}
+	if hasRepair(l.Repairs, RepairTruncatedFinalLine) {
+		t.Fatalf("repairs = %v; a complete entry is not a truncated line", l.Repairs)
+	}
+	if l.HasLostData() {
+		t.Fatal("nothing was discarded, so nothing was lost")
+	}
+
+	// And the store reopens it with the entry intact and the terminator
+	// restored before the next append, rather than truncating it away.
+	s, _, err := Open(path, testOptions("f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if n := len(s.Entries()); n != 1 {
+		t.Fatalf("store has %d entries after reopen, want 1", n)
+	}
+
+	// A single line that is garbage is still the truncated case.
+	garbage := filepath.Join(t.TempDir(), "g.jsonl")
+	if err := os.WriteFile(garbage, []byte(`{"id":"e1","ty`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g := mustLoad(t, garbage)
+	if len(g.Entries()) != 0 || !hasRepair(g.Repairs, RepairTruncatedFinalLine) || !g.HasLostData() {
+		t.Fatalf("garbage: entries=%d repairs=%v", len(g.Entries()), g.Repairs)
+	}
+}

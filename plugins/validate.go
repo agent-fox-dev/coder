@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -202,19 +203,30 @@ func lintManifest(m Manifest) []Violation {
 	}
 	out := make([]Violation, 0, len(bad))
 	for _, b := range bad {
+		msg := fmt.Sprintf("imports %q; plugin code may not reach into agentkit internals", b.Import)
+		if b.Reason != "" {
+			msg = fmt.Sprintf("import %s: %s", b.Import, b.Reason)
+		}
 		out = append(out, Violation{
 			Plugin: m.Name, Rule: RuleForbiddenImport, Severity: SeverityError,
 			Path:    b.File,
-			Message: fmt.Sprintf("imports %q; plugin code may not reach into agentkit internals", b.Import),
+			Message: msg,
 		})
 	}
 	return out
 }
 
-// BadImport is one forbidden import.
+// BadImport is one forbidden import — or one the lint could not read.
 type BadImport struct {
-	File   string
+	File string
+	// Import is the unquoted import path, or the literal as written when
+	// Reason is set.
 	Import string
+	// Reason is empty for a forbidden import. It is set when the import
+	// literal could not be decoded, which is reported as a violation rather
+	// than skipped: an import the lint cannot read is an import it cannot
+	// clear, and a lint that passes what it did not read is not a lint.
+	Reason string
 }
 
 // LintImports is REQ-PLUGIN-09, and REQ-SEC-07's honest limit in one function.
@@ -268,8 +280,16 @@ func lintImports(dir string, forbidden func(string) bool) ([]BadImport, error) {
 			return nil // unparseable Go is the compiler's problem, not the lint's
 		}
 		for _, imp := range f.Imports {
-			p, uerr := strconvUnquote(imp.Path.Value)
+			// strconv.Unquote, not a hand-rolled strip of the surrounding
+			// double quotes: Go import paths may be RAW strings, and a
+			// `github.com/agentfox/agentkit-go/internal/x` in backquotes is
+			// the same import the compiler links. A stripper that only
+			// recognised "..." left the raw form uninspected and therefore
+			// admitted.
+			p, uerr := strconv.Unquote(imp.Path.Value)
 			if uerr != nil {
+				out = append(out, BadImport{File: path, Import: imp.Path.Value,
+					Reason: "import path literal could not be decoded: " + uerr.Error()})
 				continue
 			}
 			if forbidden(p) {
@@ -298,11 +318,4 @@ func lintImports(dir string, forbidden func(string) bool) ([]BadImport, error) {
 func forbiddenImport(path string) bool {
 	return strings.HasPrefix(path, InternalPrefix) ||
 		path == strings.TrimSuffix(InternalPrefix, "/")
-}
-
-func strconvUnquote(s string) (string, error) {
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1], nil
-	}
-	return "", fmt.Errorf("plugins: unquoted import path %s", s)
 }

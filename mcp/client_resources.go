@@ -15,6 +15,9 @@ import (
 // without any notification at all, so serving a stale one would be a worse
 // bargain than the round trip.
 func (c *ServerConnection) ListResources(ctx context.Context) ([]Resource, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
 	var all []Resource
 	cursor := ""
 	for {
@@ -43,6 +46,9 @@ func (c *ServerConnection) ListResources(ctx context.Context) ([]Resource, error
 // optional, and a client that treats "this server has none" as a failure
 // cannot talk to the servers that have none.
 func (c *ServerConnection) ListResourceTemplates(ctx context.Context) ([]ResourceTemplate, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
 	var res ResourceTemplatesListResult
 	if err := c.call(ctx, MethodResourceTemplatesList, struct{}{}, &res); err != nil {
 		var rpcErr *Error
@@ -56,6 +62,9 @@ func (c *ServerConnection) ListResourceTemplates(ctx context.Context) ([]Resourc
 
 // ReadResource fetches one resource by URI.
 func (c *ServerConnection) ReadResource(ctx context.Context, uri string) (ResourcesReadResult, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
 	var res ResourcesReadResult
 	if err := c.call(ctx, MethodResourcesRead, ResourcesReadParams{URI: uri}, &res); err != nil {
 		return ResourcesReadResult{}, fmt.Errorf("mcp: %s: resources/read %s: %w", c.cfg.Name, uri, err)

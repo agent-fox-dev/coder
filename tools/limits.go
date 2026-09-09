@@ -1,6 +1,9 @@
 package tools
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // REQ-TOOL-09's two-limit table. Two limits compose on every result — a
 // line/entry limit and a byte limit — and the result records WHICH one fired,
@@ -13,6 +16,14 @@ const (
 	SearchLineChars = 500
 	FindResultCap   = 1000
 	ListEntryCap    = 500
+
+	// The DEFAULTS for find_files and list_files sit well under their caps.
+	// A model that asks for "everything" almost never wants a thousand paths
+	// in its context; it wants enough to orient and a marker that names the
+	// call for more. The PRD's table puts the default at the cap; the cap is
+	// kept, and a caller that wants it asks for it (limit=1000 / limit=500).
+	FindResultDefault = 200
+	ListEntryDefault  = 200
 )
 
 // TruncatedBy names which limit fired. It is a closed enum: the 500-char
@@ -106,9 +117,19 @@ func capMarker(noun, param string, limit, max int, alternative string) string {
 // It names `execute` deliberately: `execute` is not path-contained
 // (REQ-SEC-01), so it can reach a line — or a spill file — that the file tools
 // cannot (ruling P-45).
+//
+// The path is single-quoted for the shell: a file called `my file.txt` or
+// `$HOME.txt` would otherwise name a command that does not read that file.
 func LongLineMarker(line int, size int64, limit int, path string) string {
 	return fmt.Sprintf("[Line %d is %s, exceeds %s limit. Use execute: sed -n '%dp' %s | head -c %d]",
-		line, humanBytes(size), humanBytes(int64(limit)), line, path, limit)
+		line, humanBytes(size), humanBytes(int64(limit)), line, ShellQuote(path), limit)
+}
+
+// ShellQuote wraps s in single quotes, the one quoting form under which a
+// POSIX shell interprets nothing. An embedded single quote is spelled '\”,
+// which closes the quote, escapes one quote, and reopens it.
+func ShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func humanBytes(n int64) string {

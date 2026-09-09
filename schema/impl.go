@@ -195,6 +195,25 @@ func strictCheck(s *Schema, path string) error {
 			}
 		}
 	}
+	// A dictionary object — additionalProperties carrying a SCHEMA — has no
+	// strict form. The strict subset requires additionalProperties:false and
+	// every key enumerated in properties, and a map of arbitrary keys is
+	// exactly what cannot be enumerated. The rewrite used to overwrite the
+	// value schema with `false` and call the result strict, which made the
+	// model unable to emit any key at all; so it is a rejection, which lets
+	// `prefer` fall back to the unconstrained schema and `require` fail with
+	// the reason instead of shipping a tool that cannot be called.
+	if s.AdditionalProperties != nil && s.AdditionalProperties.Schema != nil {
+		return &StrictRewriteError{Path: pathOr(path), Keyword: "additionalProperties",
+			Reason: "additionalProperties carries a schema (a dictionary object), which the " +
+				"strict subset cannot express: strict requires every key to be enumerated"}
+	}
+	// An array is only strict with its items declared. Array(nil) marshals as
+	// a bare {"type":"array"}, which strict mode rejects on the wire.
+	if s.Type == TypeArray && s.Items == nil {
+		return &StrictRewriteError{Path: pathOr(path), Keyword: "items",
+			Reason: "array declares no items schema, which the strict subset requires"}
+	}
 	for _, name := range s.PropertyList() {
 		if err := strictCheck(s.Properties[name], path+"/"+name); err != nil {
 			return err
@@ -222,6 +241,12 @@ func strictRewrite(s *Schema) {
 	if s == nil {
 		return
 	}
+	// A schema with properties and no type is an object in every reader's
+	// eyes and in marshalSchema's; the rewrite treats it as one and pins the
+	// type, because strict mode wants the word on the wire.
+	if s.Type == TypeNone && len(s.Properties) > 0 {
+		s.Type = TypeObject
+	}
 	if s.Type == TypeObject {
 		s.AdditionalProperties = &AdditionalProperties{Allowed: false}
 		all := s.PropertyList()
@@ -229,10 +254,15 @@ func strictRewrite(s *Schema) {
 			if !s.IsRequired(name) {
 				p := s.Properties[name]
 				// Widen a formerly-optional, non-nullable property so the
-				// model can still omit it.
+				// model can still omit it. The description moves UP to the
+				// wrapper and is cleared on the inner copy: duplicated, it
+				// is model-visible twice, once per level, and the wrapper is
+				// the property the model sees.
 				if p != nil && !p.Nullable {
+					desc := p.Description
+					p.Description = ""
 					s.Properties[name] = &Schema{
-						Description: p.Description,
+						Description: desc,
 						AnyOf:       []*Schema{p, {Type: TypeNull}},
 					}
 				}
