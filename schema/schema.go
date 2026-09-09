@@ -257,9 +257,18 @@ var ErrInvalidSchema = errors.New("agentkit: schema cannot be converted")
 type StrictRewriteError struct {
 	Path    string
 	Keyword string
+	// Reason, when set, replaces the default "uses <Keyword>, which the
+	// strict subset forbids" wording: some rejections are about a keyword
+	// being ABSENT (an array with no items) or carrying a shape the subset
+	// cannot express (additionalProperties as a schema), and "uses items,
+	// which the strict subset forbids" would send the author the wrong way.
+	Reason string
 }
 
 func (e *StrictRewriteError) Error() string {
+	if e.Reason != "" {
+		return "agentkit: schema at " + e.Path + ": " + e.Reason
+	}
 	return "agentkit: schema at " + e.Path + " uses " + e.Keyword + ", which the strict subset forbids"
 }
 func (e *StrictRewriteError) Is(target error) bool { return target == ErrInvalidSchema }

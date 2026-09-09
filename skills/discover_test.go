@@ -323,3 +323,102 @@ func TestLoadForSessionWithAZeroConfigSelectsNothing(t *testing.T) {
 		t.Fatalf("the registry's own config selected %q", got)
 	}
 }
+
+// REQ-SKILL-12 / REQ-SEC-10, the case a relative-HOME check does not catch:
+// an ABSOLUTE home that is the untrusted working directory, or lies inside
+// it. <cwd>/.nightshift/skills is then the user-global tier, trusted by
+// origin, and a cloned repository would author the prompt through it.
+func TestTheUserTierIsSkippedWhenItResolvesInsideAnUntrustedProject(t *testing.T) {
+	work := t.TempDir()
+	writeSkill(t, projectSkills(work), "impostor", `description = "impersonating the user's global config"`)
+
+	reg := Discover(Config{HomeDir: work, WorkDir: work})
+	if got := names(reg.Skills()); got != "" {
+		t.Fatalf("skills = %q, want none: the user tier resolved inside the untrusted project", got)
+	}
+	if !hasDiag(reg.Diagnostics(), "user-global skills skipped") {
+		t.Fatalf("diagnostics = %v, want the skip reported", reg.Diagnostics())
+	}
+
+	// A home that is a subdirectory of the project is the same case.
+	sub := filepath.Join(work, "home")
+	writeSkill(t, userSkills(sub), "nested", `description = "d"`)
+	if got := names(Discover(Config{HomeDir: sub, WorkDir: work}).Skills()); got != "" {
+		t.Fatalf("skills = %q, want none for a home inside the project", got)
+	}
+
+	// A home that merely shares a PREFIX with the project is outside it.
+	sibling := work + "-home"
+	writeSkill(t, userSkills(sibling), "mine", `description = "d"`)
+	t.Cleanup(func() { os.RemoveAll(sibling) })
+	if got := names(Discover(Config{HomeDir: sibling, WorkDir: work}).Skills()); got != "mine@user" {
+		t.Fatalf("skills = %q, want the sibling home's skill: a prefix match is not containment", got)
+	}
+
+	// With trust established the two tiers coincide and the skill loads once,
+	// as the user's — which is what makes the assertions above about the gate.
+	if got := names(Discover(Config{HomeDir: work, WorkDir: work, TrustProject: true}).Skills()); got != "impostor@user" {
+		t.Fatalf("trusted skills = %q", got)
+	}
+}
+
+// The same rule travels with the CALL (REQ-SKILL-05): a registry discovered
+// with trust must not serve the coinciding tier to an untrusted session.
+func TestLoadForSessionSkipsAUserTierInsideAnUntrustedProject(t *testing.T) {
+	work := t.TempDir()
+	writeSkill(t, projectSkills(work), "impostor", `description = "d"`)
+	trusted := Config{HomeDir: work, WorkDir: work, TrustProject: true}
+	reg := Discover(trusted)
+	if got := names(reg.LoadForSession("", "", trusted)); got != "impostor@user" {
+		t.Fatalf("trusted call = %q", got)
+	}
+	untrusted := trusted
+	untrusted.TrustProject = false
+	if got := names(reg.LoadForSession("", "", untrusted)); got != "" {
+		t.Fatalf("untrusted call = %q, want nothing: the user tier lies inside the untrusted project", got)
+	}
+}
+
+// REQ-SEC-06 for the manifest. A symlinked skill.toml reads the name and
+// description — the text that reaches the system prompt — from wherever the
+// link points, exactly what the prompt.md rule already refuses.
+func TestASymlinkedManifestIsRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on windows")
+	}
+	home, elsewhere := t.TempDir(), t.TempDir()
+	real := writeSkill(t, elsewhere, "planted", `description = "planted elsewhere"`)
+	dir := filepath.Join(userSkills(home), "linkedmanifest")
+	writeFile(t, filepath.Join(dir, PromptName), "# linked manifest\n")
+	if err := os.Symlink(filepath.Join(real, ManifestName), filepath.Join(dir, ManifestName)); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := Discover(Config{HomeDir: home})
+	if len(reg.Skills()) != 0 {
+		t.Fatalf("skills = %q, want none", names(reg.Skills()))
+	}
+	if !hasDiag(reg.Diagnostics(), "symlinked skill.toml") {
+		t.Fatalf("diagnostics = %v, want the linked manifest rejected", reg.Diagnostics())
+	}
+}
+
+// A manifest is a few short strings. One over MaxManifestBytes is not a
+// manifest, and discovery must not read an arbitrarily large file because a
+// directory named it skill.toml.
+func TestAnOversizedManifestIsRejectedWithoutBeingRead(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(userSkills(home), "huge")
+	padding := strings.Repeat("# padding\n", MaxManifestBytes/10+1)
+	writeFile(t, filepath.Join(dir, ManifestName), `description = "d"`+"\n"+padding)
+	writeFile(t, filepath.Join(dir, PromptName), "# huge\n")
+	writeSkill(t, userSkills(home), "fine", `description = "d"`)
+
+	reg := Discover(Config{HomeDir: home})
+	if got := names(reg.Skills()); got != "fine@user" {
+		t.Fatalf("skills = %q, want only the ordinary skill", got)
+	}
+	if !hasDiag(reg.Diagnostics(), "larger than the") {
+		t.Fatalf("diagnostics = %v, want the size limit named", reg.Diagnostics())
+	}
+}

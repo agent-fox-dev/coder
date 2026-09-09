@@ -71,11 +71,12 @@ func lintPluginSource(dir string, m Manifest) ([]Diagnostic, error) {
 
 	diags := make([]Diagnostic, 0, len(bad))
 	for _, b := range bad {
-		diags = append(diags, Diagnostic{
-			Path: b.File, Severity: SeverityError,
-			Message: fmt.Sprintf("imports %q; skill plugin code may not import agentkit internals, "+
-				"an LLM client library or a model API package (REQ-SKILL-09)", b.Import),
-		})
+		msg := fmt.Sprintf("imports %q; skill plugin code may not import agentkit internals, "+
+			"an LLM client library or a model API package (REQ-SKILL-09)", b.Import)
+		if b.Reason != "" {
+			msg = fmt.Sprintf("import %s: %s (REQ-SKILL-09)", b.Import, b.Reason)
+		}
+		diags = append(diags, Diagnostic{Path: b.File, Severity: SeverityError, Message: msg})
 	}
 	return diags, fmt.Errorf("%w: %s", ErrProhibitedImport, bad[0].Import)
 }

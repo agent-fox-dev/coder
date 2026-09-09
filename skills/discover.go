@@ -2,9 +2,11 @@ package skills
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // Directory and file names of REQ-SKILL-02 and REQ-SKILL-04.
@@ -20,6 +22,12 @@ const (
 	// system prompt is derived, never author-supplied.
 	PromptName = "prompt.md"
 )
+
+// MaxManifestBytes bounds a skill.toml read. A manifest is three short strings
+// and a few tables; one that is larger than this is not a manifest, and a
+// discovery pass must not be made to read an arbitrarily large file just
+// because a directory under the working directory named it skill.toml.
+const MaxManifestBytes = 1 << 20
 
 // Tier is where a skill came from. It is the trust boundary, not a label.
 type Tier uint8
@@ -89,6 +97,12 @@ type Config struct {
 	// false, so an embedder that never mentions trust is untrusted BY
 	// CONSTRUCTION. Nothing in this package infers it; silence is not consent.
 	TrustProject bool
+	// MaxContextBytes bounds the body of ONE context file (§6.5a). Zero means
+	// DefaultMaxContextBytes. A file over the bound is truncated at a line
+	// boundary, marked as such in the prompt, and reported as a diagnostic;
+	// it is not dropped, because a context file is standing instructions and
+	// losing all of them over a size limit is worse than losing the tail.
+	MaxContextBytes int
 }
 
 // UserSkillsDir returns the user-global skills directory, and false when there
@@ -112,6 +126,39 @@ func (c Config) ProjectSkillsDir() (string, bool) {
 		return "", false
 	}
 	return filepath.Join(abs, GlobalDirName, SkillsDirName), true
+}
+
+// insideUntrustedProject reports whether dir is the untrusted working
+// directory or lies inside it.
+//
+// This is the second way the user tier can resolve inside the repository, and
+// it is the one a relative-HOME check does not catch: HOME is absolute and
+// legitimate, and the process happens to be running in it — a home directory
+// checked out as a repository, a container whose HOME is the mounted project,
+// a CI job whose workspace IS its home. In every one of those, <cwd>/.nightshift
+// is BOTH the user-global tier and the project-local tier, and the user tier
+// is trusted by origin. A repository that a user merely cloned into that
+// directory would then author the system prompt through the tier the trust
+// gate does not cover. So the user tier is skipped whenever it would be read
+// from inside an untrusted project (REQ-SKILL-12, REQ-SEC-10); with trust
+// established the two tiers coincide harmlessly.
+func (c Config) insideUntrustedProject(dir string) bool {
+	if c.TrustProject || c.WorkDir == "" {
+		return false
+	}
+	work, err := filepath.Abs(c.WorkDir)
+	if err != nil {
+		return false
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(work), filepath.Clean(abs))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // ResolveHome resolves the user's home directory, reporting false when it
@@ -167,7 +214,20 @@ func Discover(cfg Config) *Registry {
 		roots = append(roots, root{cfg.BuiltinDir, TierBuiltin})
 	}
 	if dir, ok := cfg.UserSkillsDir(); ok {
-		roots = append(roots, root{dir, TierUser})
+		if cfg.insideUntrustedProject(dir) {
+			// Reported only when there is something there to skip; an
+			// untrusted session run from $HOME with no ~/.nightshift/skills
+			// has nothing to be warned about.
+			if _, err := os.Lstat(dir); err == nil {
+				r.diags = append(r.diags, Diagnostic{
+					Path: dir, Severity: SeverityWarning,
+					Message: "user-global skills skipped: the directory lies inside the untrusted " +
+						"working directory and would be read as trusted content (REQ-SKILL-12)",
+				})
+			}
+		} else {
+			roots = append(roots, root{dir, TierUser})
+		}
 	}
 	if dir, ok := cfg.ProjectSkillsDir(); ok {
 		roots = append(roots, root{dir, TierProject})
@@ -259,13 +319,27 @@ func scanTier(dir string, tier Tier) ([]Skill, []Diagnostic) {
 
 func loadSkill(dir string, tier Tier) (Skill, []Diagnostic, error) {
 	manifestPath := filepath.Join(dir, ManifestName)
-	src, err := os.ReadFile(manifestPath)
+	// REQ-SEC-06 for the manifest, on the same terms as prompt.md below: a
+	// symlinked skill.toml would let a skill directory read its name and
+	// description — the text that reaches the system prompt — from anywhere
+	// on the filesystem the link points at.
+	minfo, err := os.Lstat(manifestPath)
 	if err != nil {
 		// A directory with no skill.toml is not a skill; say so plainly rather
 		// than surfacing a bare ENOENT.
 		if os.IsNotExist(err) {
 			return Skill{}, nil, fmt.Errorf("no %s", ManifestName)
 		}
+		return Skill{}, nil, err
+	}
+	if minfo.Mode()&os.ModeSymlink != 0 {
+		return Skill{}, nil, fmt.Errorf("symlinked %s rejected (REQ-SEC-06)", ManifestName)
+	}
+	if !minfo.Mode().IsRegular() {
+		return Skill{}, nil, fmt.Errorf("%s is not a regular file", ManifestName)
+	}
+	src, err := readBounded(manifestPath, MaxManifestBytes)
+	if err != nil {
 		return Skill{}, nil, err
 	}
 
@@ -312,6 +386,25 @@ func loadSkill(dir string, tier Tier) (Skill, []Diagnostic, error) {
 	}
 
 	return Skill{Manifest: m, Dir: dir, PromptPath: promptPath, Tier: tier}, diags, nil
+}
+
+// readBounded reads a file that must fit in limit bytes. It reads AT MOST
+// limit+1 bytes, so a file that is far over the bound costs the bound, not
+// its own size, and it reports the overflow as an error naming the limit.
+func readBounded(path string, limit int) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > limit {
+		return nil, fmt.Errorf("%s is larger than the %d-byte limit", filepath.Base(path), limit)
+	}
+	return b, nil
 }
 
 // Skills returns every loaded skill, ordered by name.
@@ -392,7 +485,10 @@ func (c Config) admits(s Skill) bool {
 		return c.BuiltinDir != "" && rooted(c.BuiltinDir, s.Dir)
 	case TierUser:
 		dir, ok := c.UserSkillsDir()
-		return ok && rooted(dir, s.Dir)
+		// The same rule Discover applies, re-applied per call: a config whose
+		// user tier resolves inside its untrusted project admits nothing from
+		// it, however the registry was discovered.
+		return ok && !c.insideUntrustedProject(dir) && rooted(dir, s.Dir)
 	case TierProject:
 		// The gate itself: ProjectSkillsDir returns false when TrustProject is
 		// unset, so an untrusted config drops every project skill.

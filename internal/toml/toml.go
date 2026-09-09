@@ -63,6 +63,7 @@ const bomPrefix = diag.BOMPrefix
 // table — a silently misplaced key is worse than a rejected manifest:
 //   - an unterminated string, array or table header
 //   - anything that is not a comment, a table header or `key = value`
+//   - an array nested deeper than maxNesting levels (see parseArray)
 
 // ValueKind enumerates the value types the subset above can produce.
 type ValueKind uint8
@@ -240,6 +241,15 @@ func ParseTOML(src []byte) (*Table, []Diagnostic, error) {
 	return p.root, p.diags, nil
 }
 
+// maxNesting bounds array nesting. Nested arrays are not even a SUPPORTED
+// value — they are skipped with a diagnostic — but skipping one still parses
+// it, and parseArray recurses through parseValue once per '['. A manifest is
+// untrusted input (a project skill.toml is repository-authored), and an
+// unbounded recursion is a stack the input controls: a few hundred thousand
+// '[' bytes were enough to make the parser the thing that crashed. No
+// manifest nests sixty-four deep; a file that does is not a manifest.
+const maxNesting = 64
+
 type tomlParser struct {
 	src   []byte
 	i     int
@@ -247,6 +257,8 @@ type tomlParser struct {
 	root  *Table
 	cur   *Table
 	diags []Diagnostic
+	// depth is the current array nesting, checked against maxNesting.
+	depth int
 }
 
 func (p *tomlParser) errf(f string, a ...any) error {
@@ -579,6 +591,11 @@ func (p *tomlParser) parseBareToken() (Value, bool, string, error) {
 
 func (p *tomlParser) parseArray() (Value, bool, string, error) {
 	openLine := p.line
+	if p.depth >= maxNesting {
+		return Value{}, false, "", p.errf("array nested deeper than %d levels", maxNesting)
+	}
+	p.depth++
+	defer func() { p.depth-- }()
 	p.i++ // '['
 	out := []string{}
 	unsupported := ""

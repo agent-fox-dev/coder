@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +14,12 @@ import (
 
 // ManifestName is REQ-PLUGIN-05's file.
 const ManifestName = "plugin.toml"
+
+// MaxManifestBytes bounds a plugin.toml read. A manifest is a name, a module
+// path and a list of kinds; one larger than this is not a manifest, and
+// discovery must not read an arbitrarily large file because it was named
+// plugin.toml under a configured path.
+const MaxManifestBytes = 1 << 20
 
 // Manifest is a parsed plugin.toml.
 //
@@ -130,7 +137,7 @@ func Discover(cfg Config) ([]Manifest, []Diagnostic) {
 
 	for _, dir := range cfg.Paths {
 		for _, path := range manifestPaths(dir, &diags) {
-			src, err := os.ReadFile(path)
+			src, err := readBounded(path, MaxManifestBytes)
 			if err != nil {
 				diags = append(diags, Diagnostic{Path: path, Severity: SeverityWarning,
 					Message: "unreadable: " + err.Error()})
@@ -167,6 +174,24 @@ func Discover(cfg Config) ([]Manifest, []Diagnostic) {
 	SortManifestsByName(out)
 	sortDiagnostics(diags)
 	return out, diags
+}
+
+// readBounded reads a file that must fit in limit bytes, reading at most
+// limit+1 of them so an oversized file costs the bound and not its size.
+func readBounded(path string, limit int) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > limit {
+		return nil, fmt.Errorf("%s is larger than the %d-byte limit", filepath.Base(path), limit)
+	}
+	return b, nil
 }
 
 func replaceByName(ms []Manifest, m Manifest) []Manifest {

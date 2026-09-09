@@ -231,21 +231,19 @@ var attrEscaper = strings.NewReplacer(
 
 // escapeText escapes a value that sits in element content.
 //
-// It escapes & < > and deliberately NOT quotes. The breakout being closed is a
-// tag breakout: only '<' can open one and only '&' can open a character
-// reference, so escaping those two (with '>' for symmetry) makes it impossible
+// It escapes '<' and NOTHING ELSE. The breakout being closed is a tag
+// breakout, and only '<' can open a tag: escaping it alone makes it impossible
 // for a skill description or a context-file body to emit </available_skills>,
-// </context_file> or any other element. A quote cannot terminate element
-// content, so escaping it would buy no safety and would cost real damage: a
-// context file is markdown prose, and rewriting every apostrophe in it to
-// &apos; degrades the instructions the model is asked to follow. Escaping is
-// chosen per POSITION, which is the correct granularity here (REQ-CTX-04).
+// </context_file> or any other element. Nothing else in element content can
+// close the container. A quote cannot; neither can '>' or '&'. The reader is
+// a language model, not an XML parser, so an '&' left as written is an
+// ampersand and an "&amp;" would be a stray entity in the prose the model is
+// asked to follow — a context file is markdown, and "tabs &amp; spaces" or
+// "a -&gt; b" degrades the instructions for no safety. Escaping is chosen per
+// POSITION, which is the correct granularity here (REQ-CTX-04): the attribute
+// escaper above keeps its full set because a quote CAN end an attribute.
 func escapeText(s string) string {
 	return textEscaper.Replace(s)
 }
 
-var textEscaper = strings.NewReplacer(
-	"&", "&amp;",
-	"<", "&lt;",
-	">", "&gt;",
-)
+var textEscaper = strings.NewReplacer("<", "&lt;")

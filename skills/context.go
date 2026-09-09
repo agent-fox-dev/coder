@@ -1,11 +1,25 @@
 package skills
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"strings"
 )
+
+// DefaultMaxContextBytes is Config.MaxContextBytes when it is zero: 256 KiB
+// per file. A context file is prose the model reads on EVERY turn; one this
+// large is already past what any model attends to, and without a bound a
+// repository could make every session start by paying for a gigabyte of
+// standing instructions.
+const DefaultMaxContextBytes = 256 << 10
+
+// truncationMarker is appended, on its own line, to a body that was cut at
+// MaxContextBytes. It is visible to the model so the model knows it holds a
+// prefix rather than the file, and it uses no '<' so the text escaper leaves
+// it as written.
+const truncationMarker = "[agentkit: context file truncated at %d of %d bytes; read the file for the rest]"
 
 // bomPrefix is the UTF-8 byte order mark, written as an escape because a
 // literal BOM is illegal in Go source. REQ-CTX-02 requires it stripped from
@@ -37,6 +51,10 @@ type ContextFile struct {
 	// Global marks the user's own ~/.nightshift file, which is trusted by
 	// origin and therefore loaded whether or not the project is trusted.
 	Global bool
+	// Truncated reports that Body is a prefix of the file, cut at
+	// Config.MaxContextBytes on a line boundary and ending in a marker that
+	// says so.
+	Truncated bool
 }
 
 // UserContextDir returns the user-global config directory, and false when
@@ -57,18 +75,43 @@ func (c Config) UserContextDir() (string, bool) {
 //
 // The ancestor walk is gated on Config.TrustProject in its entirety
 // (REQ-CTX-03, REQ-SEC-10). Untrusted means the files are not read at all, not
-// that they are read and then dropped.
+// that they are read and then dropped. And "ancestor" is bounded (see
+// trustBoundary): trusting the PROJECT is not trusting /tmp.
 func DiscoverContext(cfg Config) ([]ContextFile, []Diagnostic) {
 	var out []ContextFile
 	var diags []Diagnostic
+	limit := cfg.MaxContextBytes
+	if limit <= 0 {
+		limit = DefaultMaxContextBytes
+	}
 
 	if dir, ok := cfg.UserContextDir(); ok {
-		if path, found := pickCandidate(dir); found {
-			f, err := readContextFile(path, true)
-			if err != nil {
-				diags = append(diags, Diagnostic{Path: path, Severity: SeverityError, Message: err.Error()})
-			} else {
-				out = append(out, f)
+		switch {
+		case cfg.insideUntrustedProject(dir):
+			// The same rule as the user skills tier: a global directory that
+			// resolves inside the untrusted project would be read as trusted
+			// content, and a context file is the whole body, not a name.
+			// Reported only when a candidate is actually there.
+			if _, _, found := pickCandidate(dir, false); found {
+				diags = append(diags, Diagnostic{
+					Path: dir, Severity: SeverityWarning,
+					Message: "user-global context file skipped: the directory lies inside the untrusted " +
+						"working directory and would be read as trusted content (REQ-CTX-03)",
+				})
+			}
+		default:
+			// The user's own file follows a symlink: dotfile repositories
+			// link their configs into place, and the user controls both ends.
+			path, pdiags, found := pickCandidate(dir, false)
+			diags = append(diags, pdiags...)
+			if found {
+				f, fdiags, err := readContextFile(path, true, limit)
+				diags = append(diags, fdiags...)
+				if err != nil {
+					diags = append(diags, Diagnostic{Path: path, Severity: SeverityError, Message: err.Error()})
+				} else {
+					out = append(out, f)
+				}
 			}
 		}
 	}
@@ -78,9 +121,16 @@ func DiscoverContext(cfg Config) ([]ContextFile, []Diagnostic) {
 	}
 
 	chain := ancestors(cfg.WorkDir)
+	chain, bdiags := trustBoundary(chain, cfg.HomeDir)
+	diags = append(diags, bdiags...)
 	picks := make([]string, len(chain)) // parallel to chain; "" = no file here
 	for i, dir := range chain {
-		if path, found := pickCandidate(dir); found {
+		// A repository-authored symlink is rejected here, as a skill's is
+		// (REQ-SEC-06): trusting the project is trusting what it contains,
+		// not whatever a link inside it points at.
+		path, pdiags, found := pickCandidate(dir, true)
+		diags = append(diags, pdiags...)
+		if found {
 			picks[i] = path
 		}
 	}
@@ -91,7 +141,8 @@ func DiscoverContext(cfg Config) ([]ContextFile, []Diagnostic) {
 		if path == "" {
 			continue
 		}
-		f, err := readContextFile(path, false)
+		f, fdiags, err := readContextFile(path, false, limit)
+		diags = append(diags, fdiags...)
 		if err != nil {
 			diags = append(diags, Diagnostic{Path: path, Severity: SeverityError, Message: err.Error()})
 			continue
@@ -101,34 +152,140 @@ func DiscoverContext(cfg Config) ([]ContextFile, []Diagnostic) {
 	return out, diags
 }
 
+// trustBoundary cuts an ancestor chain (ROOT -> CWD) down to the part the
+// project trust decision actually covers.
+//
+// TrustProject is an answer to "do I trust THIS repository". An ancestor walk
+// that runs to the filesystem root reads it as an answer about /home, /tmp
+// and /: a file planted at /tmp/AGENTS.md by any local user, or at the top
+// of a shared volume, would be injected into every trusted session started
+// anywhere beneath it. So the walk starts at the nearer of two anchors:
+//
+//   - the OUTERMOST enclosing git root, the directory highest on the chain
+//     that contains a .git entry (a directory for a repository, a file for a
+//     linked worktree), so a nested repository still sees its parent's file
+//     (REQ-CTX-05's control case); or
+//   - HomeDir itself, when the working directory lies under it, so a
+//     project with no repository still gets the user's own ~/AGENTS.md.
+//
+// "Nearer to the working directory" wins between them. When neither anchor
+// is on the chain — no repository, and a working directory outside the home —
+// only the working directory itself is read. Directories above the boundary
+// are never read; a candidate that exists there is reported so the author of
+// an AGENTS.md that stopped loading can see why, and reporting it costs a
+// stat, not a read.
+func trustBoundary(chain []string, homeDir string) ([]string, []Diagnostic) {
+	if len(chain) == 0 {
+		return chain, nil
+	}
+	boundary := -1
+	for i, dir := range chain {
+		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+			boundary = i // outermost: the first hit walking ROOT -> CWD
+			break
+		}
+	}
+	if homeDir != "" && filepath.IsAbs(homeDir) {
+		home := filepath.Clean(homeDir)
+		for i := boundary + 1; i < len(chain); i++ {
+			if chain[i] == home {
+				boundary = i // nearer to the working directory than the git root
+				break
+			}
+		}
+	}
+	if boundary < 0 {
+		boundary = len(chain) - 1
+	}
+	var diags []Diagnostic
+	for _, dir := range chain[:boundary] {
+		if path, _, found := pickCandidate(dir, false); found {
+			diags = append(diags, Diagnostic{
+				Path: path, Severity: SeverityWarning,
+				Message: fmt.Sprintf("not loaded: above the project trust boundary at %s "+
+					"(project trust covers the repository, not its parents)", chain[boundary]),
+			})
+		}
+	}
+	return chain[boundary:], diags
+}
+
 // pickCandidate applies REQ-CTX-01 within one directory.
 //
-// os.Stat, not Lstat: a candidate that resolves to a directory falls through
-// to the next name, and that is stated as a rule about the PATH, so a symlink
-// to a directory must fall through too. A dangling symlink fails Stat and also
-// falls through.
-func pickCandidate(dir string) (string, bool) {
+// A candidate that resolves to a directory falls through to the next name;
+// that is stated as a rule about the PATH, so a symlink to a directory must
+// fall through too, and a dangling symlink likewise.
+//
+// With rejectSymlinks a candidate that IS a symlink is skipped with a
+// diagnostic and the next name is tried, whatever the link points at. The
+// project-tier caller sets it (REQ-SEC-06 parity); the user's own global
+// directory does not, because a dotfiles repository linking its configs into
+// ~ is the ordinary case there and both ends of the link are the user's.
+func pickCandidate(dir string, rejectSymlinks bool) (string, []Diagnostic, bool) {
+	var diags []Diagnostic
 	for _, name := range ContextCandidates {
 		path := filepath.Join(dir, name)
+		if rejectSymlinks {
+			if li, err := os.Lstat(path); err == nil && li.Mode()&os.ModeSymlink != 0 {
+				diags = append(diags, Diagnostic{
+					Path: path, Severity: SeverityWarning,
+					Message: "symlinked context file rejected (REQ-SEC-06)",
+				})
+				continue
+			}
+		}
 		info, err := os.Stat(path)
 		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		return path, true
+		return path, diags, true
 	}
-	return "", false
+	return "", diags, false
 }
 
-func readContextFile(path string, global bool) (ContextFile, error) {
-	b, err := os.ReadFile(path)
+// readContextFile reads at most limit bytes of body. It reads limit+1 bytes
+// from the file, never the whole of it, so a large file costs the limit and
+// not its size; the size in the marker comes from stat.
+func readContextFile(path string, global bool, limit int) (ContextFile, []Diagnostic, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return ContextFile{}, err
+		return ContextFile{}, nil, err
 	}
-	return ContextFile{
-		Path:   path,
-		Body:   strings.TrimPrefix(string(b), bomPrefix),
-		Global: global,
-	}, nil
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
+	if err != nil {
+		return ContextFile{}, nil, err
+	}
+	b = bytes.TrimPrefix(b, []byte(bomPrefix))
+	out := ContextFile{Path: path, Global: global}
+	if len(b) <= limit {
+		out.Body = string(b)
+		return out, nil, nil
+	}
+
+	// Over the bound. Cut at the last line boundary within it — a cut mid-line
+	// leaves half a sentence, or half a code fence, as the last thing the
+	// model reads — and say so in the body and in the diagnostics.
+	total := int64(len(b))
+	if info, serr := f.Stat(); serr == nil && info.Size() > total {
+		total = info.Size()
+	}
+	cut := b[:limit]
+	if nl := bytes.LastIndexByte(cut, '\n'); nl > 0 {
+		cut = cut[:nl+1]
+	}
+	body := string(cut)
+	if !bytes.HasSuffix(cut, []byte("\n")) {
+		body += "\n"
+	}
+	out.Body = body + fmt.Sprintf(truncationMarker, len(cut), total) + "\n"
+	out.Truncated = true
+	diags := []Diagnostic{{
+		Path: path, Severity: SeverityWarning,
+		Message: fmt.Sprintf("context file truncated: %d bytes exceeds the %d-byte limit "+
+			"(Config.MaxContextBytes); the first %d bytes were kept", total, limit, len(cut)),
+	}}
+	return out, diags, nil
 }
 
 // ancestors returns cfg.WorkDir and every parent, ordered ROOT -> CWD

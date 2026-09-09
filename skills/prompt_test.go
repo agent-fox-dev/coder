@@ -129,7 +129,7 @@ func TestAHostileSkillCannotBreakOutOfItsContainer(t *testing.T) {
 		t.Fatalf("the name was not attribute-escaped:\n%s", out)
 	}
 	// The text is still readable, just inert.
-	if !strings.Contains(out, "&lt;/available_skills&gt;") {
+	if !strings.Contains(out, "&lt;/available_skills>") {
 		t.Fatalf("the description was not escaped:\n%s", out)
 	}
 }
@@ -147,10 +147,13 @@ func TestAHostileContextFileCannotCloseItsOwnBlock(t *testing.T) {
 	}
 }
 
-// An ampersand must be escaped FIRST. Escaping it after '<' rewrites the
-// entities just produced and prints the literal text "&lt;" to the model.
+// The attribute escaper is single-pass: an ampersand escaped AFTER '<' would
+// rewrite the entity just produced and print the literal text "&lt;" to the
+// model. The text escaper touches only '<', because nothing else in element
+// content can close the container and an "&amp;" in markdown prose is noise
+// the model has to read past (REQ-CTX-04).
 func TestEscapingDoesNotDoubleEscapeItsOwnEntities(t *testing.T) {
-	if got := escapeText("<a & b>"); got != "&lt;a &amp; b&gt;" {
+	if got := escapeText("<a & b> -> c &lt;"); got != "&lt;a & b> -> c &lt;" {
 		t.Fatalf("escapeText = %q", got)
 	}
 	if got := escapeAttr(`"<&>'`); got != "&quot;&lt;&amp;&gt;&apos;" {
