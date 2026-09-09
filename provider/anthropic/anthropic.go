@@ -31,14 +31,21 @@ const DefaultMaxTokens = 4096
 // "be deterministic" into "use the provider default".
 
 type request struct {
-	Model       string      `json:"model"`
-	MaxTokens   int         `json:"max_tokens"`
-	System      []sysBlock  `json:"system,omitzero"`
-	Messages    []message   `json:"messages"`
-	Tools       []tool      `json:"tools,omitzero"`
-	ToolChoice  *toolChoice `json:"tool_choice,omitzero"`
-	Temperature *float64    `json:"temperature,omitzero"`
-	TopP        *float64    `json:"top_p,omitzero"`
+	// Model is omitzero because the Vertex deployment names the model in the
+	// URL and REJECTS the body field. Every direct request sets it, so the
+	// key never disappears from a request that needs it.
+	Model string `json:"model,omitzero"`
+	// AnthropicVersion is the Vertex deployment's version, which lives in the
+	// body where the direct API's lives in the anthropic-version header. It is
+	// empty — and therefore absent — on every direct request.
+	AnthropicVersion string      `json:"anthropic_version,omitzero"`
+	MaxTokens        int         `json:"max_tokens"`
+	System           []sysBlock  `json:"system,omitzero"`
+	Messages         []message   `json:"messages"`
+	Tools            []tool      `json:"tools,omitzero"`
+	ToolChoice       *toolChoice `json:"tool_choice,omitzero"`
+	Temperature      *float64    `json:"temperature,omitzero"`
+	TopP             *float64    `json:"top_p,omitzero"`
 	// StopSequences is core.Request.StopSequences. Dropping it silently, as
 	// this did until the NFR-TEST-08 request golden showed the field missing
 	// from the body, means a caller's stop condition never takes effect and

@@ -72,6 +72,7 @@ lookup.
 | `anthropic` | `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer` |
 | | `ANTHROPIC_OAUTH_TOKEN` | `Authorization: Bearer` |
 | | `ANTHROPIC_API_KEY` | `x-api-key` |
+| | on Vertex: a Google OAuth token, `ambient` when the transport holds it | `Authorization: Bearer` |
 | `openai` | `OPENAI_API_KEY` | `Authorization: Bearer` |
 | `google` | `GOOGLE_GENERATIVE_AI_API_KEY` | `x-goog-api-key` |
 | | `GEMINI_API_KEY` | `x-goog-api-key` |
@@ -118,6 +119,7 @@ refresh once rather than N times.
 | Variable | Points at |
 |---|---|
 | `ANTHROPIC_BASE_URL` | a proxy or gateway in front of Anthropic |
+| `ANTHROPIC_VERTEX_BASE_URL` | a proxy in front of Vertex; beats `ANTHROPIC_BASE_URL` when the Vertex deployment is on |
 | `OPENAI_BASE_URL` | Azure OpenAI, a gateway, or any OpenAI-compatible server |
 | `GOOGLE_GEMINI_BASE_URL` | Vertex AI, or a proxy |
 | `OLLAMA_HOST` | your Ollama server (default `http://localhost:11434`) |
@@ -138,6 +140,62 @@ project — `Options.VertexProject`, else `GOOGLE_CLOUD_PROJECT` or
 Note that these variables alone do *not* flip the deployment, because they are
 set on every GCE and Cloud Run box: pass the project explicitly, or point
 `GOOGLE_GEMINI_BASE_URL` at a Vertex host.
+
+**Claude on Vertex** is the same kind of config change, on the same wire
+implementation:
+
+```bash
+export CLAUDE_CODE_USE_VERTEX=1
+export ANTHROPIC_VERTEX_PROJECT_ID=my-project
+export CLOUD_ML_REGION=us-east5            # optional; default `global`
+```
+
+| Variable | Does |
+|---|---|
+| `CLAUDE_CODE_USE_VERTEX` | selects the deployment. Read for *truth*, not presence: `=0` is off |
+| `ANTHROPIC_VERTEX_PROJECT_ID` | the GCP project; also selects the deployment on its own |
+| `CLOUD_ML_REGION` | the location; `GOOGLE_CLOUD_LOCATION` and `CLOUDSDK_COMPUTE_REGION` also work |
+| `ANTHROPIC_VERTEX_BASE_URL` | a proxy in front of Vertex |
+
+`GOOGLE_CLOUD_PROJECT` and `CLOUDSDK_CORE_PROJECT` may *supply* the project
+once something else has selected the deployment; like the Gemini case above,
+they never select it. `Options.VertexProject` / `Options.VertexLocation` are
+the in-code equivalents, and a Vertex base URL selects the deployment too. A
+selected deployment with no project anywhere is an error naming the project,
+not a request sent to `api.anthropic.com` with a Vertex path.
+
+Vertex authenticates with a Google OAuth access token, and this module has no
+dependencies to mint one with. Three ways, none of which adds one:
+
+```bash
+# 1. A token in the environment. Refresh it yourself; it is short-lived.
+export ANTHROPIC_AUTH_TOKEN="$(gcloud auth print-access-token)"
+```
+
+```go
+// 2. An ADC-authenticating transport, owned by the application.
+client, _ := google.DefaultClient(ctx, "https://www.googleapis.com/auth/cloud-platform")
+anthropic.Provider(anthropic.Options{HTTPClient: client})
+
+// 3. A credential store, for a long-running process — REQ-AUTH-05/06 gives
+//    you serialized refresh, which the environment cannot.
+anthropic.Provider(anthropic.Options{Credentials: creds})
+```
+
+With none of the three the credential state is `ambient`, which is the honest
+answer: this process holds no readable credential and the transport may still
+have one. That is also why pre-flight passes — a Vertex deployment is
+configured, and a check that reported `none` would refuse the run and name the
+wrong cause.
+
+An `ANTHROPIC_API_KEY` left over from a direct deployment is **dropped**, not
+forwarded: it is not a Vertex credential, and sending it would hand a
+first-party secret to a third party.
+
+Vertex names Claude models with a dated suffix (`claude-sonnet-5@20260401`).
+The catalog is not an allowlist, so such an id resolves by cloning the vendor's
+default row and reaches the URL verbatim:
+`AGENTKIT_MODEL=anthropic/claude-sonnet-5@20260401`.
 
 ### 3. A model, resolved through the catalog
 
