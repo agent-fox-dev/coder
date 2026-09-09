@@ -94,6 +94,16 @@ type client struct {
 	prefix *provider.ToolPrefix
 }
 
+// wantsCompaction reports whether Options.Betas opted into REQ-PROV-07.
+func (c *client) wantsCompaction() bool {
+	for _, b := range c.opts.Betas {
+		if strings.TrimSpace(b) == BetaCompaction {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *client) now() time.Time {
 	if c.opts.Now != nil {
 		return c.opts.Now()
@@ -126,6 +136,12 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 		o.Warnf("anthropic: %s", rep.String())
 	}
 	applyThinking(body, m, req.ThinkingLevel)
+	if c.wantsCompaction() {
+		// REQ-PROV-07: the beta header opts the REQUEST into the feature and
+		// the body names the edit; the server compacts only when both are
+		// present. A header alone was silently a no-op.
+		body.ContextManagement = &contextManagement{Edits: []contextEdit{{Type: "compact_20260112"}}}
+	}
 
 	// REQ-PROV-18: OnPayload runs after canonical->wire translation and before
 	// the first byte. Its error propagates to the caller UNMODIFIED, which is
@@ -153,7 +169,7 @@ func (c *client) Stream(ctx context.Context, m *core.Model, req core.Request, o 
 
 func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, req core.Request, raw []byte) {
 	d := &decodeState{
-		s: s,
+		s: s, model: m, lookup: c.opts.BillingLookup,
 		partial: core.AssistantMessage{
 			Provider: m.Provider, API: m.API, Model: m.ID,
 			ThinkingLevel: req.ThinkingLevel,
@@ -272,6 +288,11 @@ func statusError(resp *http.Response) string {
 type decodeState struct {
 	s       *core.EventStream
 	partial core.AssistantMessage
+	// model and lookup are what finish and fail price usage against
+	// (REQ-PROV-05.5); fail needs them too, because a truncated stream that
+	// reported usage in message_start still cost money.
+	model  *core.Model
+	lookup func(string) *core.Model
 
 	accs    map[int]*blockAcc
 	order   []int
@@ -313,8 +334,7 @@ func (d *decodeState) consume(r *provider.SSEReader) error {
 }
 
 func (d *decodeState) event(ev provider.SSEEvent) error {
-	switch ev.Type {
-	case "ping", "":
+	if ev.Type == "ping" || (ev.Type == "" && len(ev.Data) == 0) {
 		return nil
 	}
 	// REQ-SEC-11: bytes a provider sent are bytes we did not produce. One
@@ -323,6 +343,19 @@ func (d *decodeState) event(ev provider.SSEEvent) error {
 	// and letting last-wins choose which one we act on.
 	if err := provider.GuardUntrusted(ev.Data); err != nil {
 		return fmt.Errorf("anthropic: %s event: %w", ev.Type, err)
+	}
+	if ev.Type == "" {
+		// No `event:` line. Every Messages payload also names its type in
+		// the JSON, and a gateway that relays data lines without the event
+		// line is a real thing; treating such a stream as a run of pings
+		// ended every turn with ErrSSETruncated and no content.
+		var probe struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(ev.Data, &probe) != nil || probe.Type == "" || probe.Type == "ping" {
+			return nil
+		}
+		ev.Type = probe.Type
 	}
 	switch ev.Type {
 
@@ -479,14 +512,22 @@ func (d *decodeState) finish(m *core.Model, lookup func(string) *core.Model) {
 	// ONCE, here, from the final served name — never accumulated per event.
 	// That is what makes "repriced back" fall out for free when a later event
 	// names the requested model again.
-	billModel, billed := provider.BillingModel(m, final.ResponseModel, lookup)
-	final.Usage.BilledModel = billed
-	if final.Usage.Reported() {
-		final.Usage.SetCost(provider.ComputeCost(billModel, final.Usage))
-	}
+	d.price(&final, m, lookup)
 
 	d.s.Push(core.MessageEndEvent{Message: final})
 	d.s.End(core.StreamResult{Message: &final})
+}
+
+// price bills a message against the model that served it. It is shared by
+// the success and failure paths: a failed turn whose message_start already
+// reported input tokens was billed for them, and a session aggregate that
+// omits it under-reports by exactly the turns that went wrong.
+func (d *decodeState) price(msg *core.AssistantMessage, m *core.Model, lookup func(string) *core.Model) {
+	billModel, billed := provider.BillingModel(m, msg.ResponseModel, lookup)
+	msg.Usage.BilledModel = billed
+	if msg.Usage.Reported() {
+		msg.Usage.SetCost(provider.ComputeCost(billModel, msg.Usage))
+	}
 }
 
 // fail is REQ-PROV-04: the partial content and the failure are ONE value.
@@ -498,6 +539,8 @@ func (d *decodeState) fail(text string, err error) {
 	final := d.partial
 	final.Content = d.partialContent()
 	final.Usage = d.usage
+	final.Usage.BilledModel = ""
+	d.price(&final, d.model, d.lookup)
 	if text == provider.AbortText {
 		final.StopReason = core.StopReasonAborted
 		final.ErrorMessage = text
@@ -571,55 +614,85 @@ func DecodeResponse(m *core.Model, data []byte, lookup func(string) *core.Model)
 	return msg, nil
 }
 
-// effortBudgets maps an effort token to a thinking budget, for a catalog row
-// whose wire values are effort names rather than numbers.
-//
-// The Messages API's `thinking` object takes a budget: {"type":"enabled"}
-// with no budget_tokens is rejected outright, and an effort token belongs to
-// a different field (output_config.effort) that this adapter does not emit.
-// A row that speaks in effort names therefore has to be priced into a budget
-// here, on the same ladder the budget-style rows in the catalog use, so the
-// two kinds of row produce the same request for the same level.
-var effortBudgets = map[string]int{
-	"minimal": 1024, // the vendor minimum
-	"low":     4096,
-	"medium":  16384,
-	"high":    32768,
-	"xhigh":   65536,
-	"max":     131072,
+// effortTokens is the output_config.effort vocabulary this adapter will send.
+// "minimal" is not in it: no Anthropic model has that level, so a row that
+// wants minimal to mean something maps it to "low" itself, and a request that
+// reaches here as minimal is priced as low rather than rejected.
+var effortTokens = map[string]string{
+	"minimal": "low",
+	"low":     "low",
+	"medium":  "medium",
+	"high":    "high",
+	"xhigh":   "xhigh",
+	"max":     "max",
 }
 
+// minThinkingBudget is the vendor minimum for budget_tokens; a smaller value
+// is a 400.
+const minThinkingBudget = 1024
+
 // applyThinking is REQ-PROV-15's Anthropic arm: a TRI-state where undefined
-// omits the key entirely and an explicit "off" sends {"type":"disabled"}.
+// omits the key entirely and an explicit "off" sends {"type":"disabled"} —
+// when the row says the model accepts it.
+//
+// The catalog row's wire value for a level decides which generation of the
+// control is sent:
+//
+//   - an INTEGER is a thinking budget: {"type":"enabled","budget_tokens":N},
+//     held below max_tokens and never below the vendor minimum;
+//   - an EFFORT token (low … max) is the current control:
+//     {"type":"adaptive"} plus output_config.effort, which is what every
+//     model since Claude 4.6 takes and what budget_tokens is a 400 on.
 //
 // The requested level is CLAMPED here — upward first, then downward — and the
 // RETURNED wire value is what is priced; an unclamped level never reaches the
 // wire (REQ-PROV-15: "passing an unclamped level through is prohibited").
-// `off` bypasses the clamp: disabling is a capability of the wire, not of a
-// catalog row, and clamping a request for no thinking upward to the model's
-// lowest level would spend the caller's money against their stated wish.
+//
+// `off` skips the clamp (ruling P-27: a request for some thinking is never
+// clamped down to none, and a request for none is never clamped up to some)
+// but NOT the catalog. A row that maps off to a wire value sends
+// {"type":"disabled"}; a row that records off as present-and-null, or whose
+// ladder has no off entry, omits the key — on the models that cannot stop
+// thinking, disabled is a 400, and omission is the least thinking they offer.
+// A descriptor with no ladder at all also omits: the adapter sends disabled
+// only where something says the model accepts it.
 func applyThinking(r *request, m *core.Model, requested core.ThinkingLevel) {
 	switch requested {
 	case core.ThinkingUnset:
 		return
 	case core.ThinkingOff:
-		r.Thinking = &thinking{Type: "disabled"}
+		if _, ok := catalog.ThinkingWire(m, core.ThinkingOff); ok {
+			r.Thinking = &thinking{Type: "disabled"}
+		}
 		return
 	}
 	_, wire, ok := catalog.ClampThinkingLevel(m, requested)
 	if !ok {
 		return // no reachable level: omit rather than guess
 	}
+	wire = strings.ToLower(strings.TrimSpace(wire))
 
-	n, err := strconv.Atoi(strings.TrimSpace(wire))
-	if err != nil {
-		n = effortBudgets[strings.ToLower(strings.TrimSpace(wire))]
-	}
-	if n <= 0 {
-		// Neither a budget nor a known effort token. Omitting is the only
-		// request that is not a 400: `enabled` without budget_tokens is.
+	if n, err := strconv.Atoi(wire); err == nil {
+		applyBudget(r, n)
 		return
 	}
+	effort, known := effortTokens[wire]
+	if !known {
+		// Neither a budget nor an effort token. Omitting is the only request
+		// that is not a 400: `enabled` without budget_tokens is, and so is an
+		// effort the model has never heard of.
+		return
+	}
+	r.Thinking = &thinking{Type: "adaptive"}
+	r.OutputConfig = &outputConfig{Effort: effort}
+	// Thinking rejects any explicit temperature or top_p. Dropping them is the
+	// only option that keeps the request valid; the alternative is a 400 that
+	// names sampling and not thinking, sending the reader to the wrong knob.
+	r.Temperature, r.TopP = nil, nil
+}
+
+// applyBudget is the budget_tokens arm of applyThinking.
+func applyBudget(r *request, n int) {
 	// Anthropic rejects a thinking budget that is not strictly below
 	// max_tokens. The budget is the value we may lower; max_tokens has
 	// already been clamped against the context window (REQ-CAT-04) and
@@ -627,14 +700,13 @@ func applyThinking(r *request, m *core.Model, requested core.ThinkingLevel) {
 	if n >= r.MaxTokens {
 		n = r.MaxTokens - 1
 	}
-	if n <= 0 {
+	if n < minThinkingBudget {
+		// Below the vendor minimum — after the clamp, which is where this
+		// happens in practice: a small max_tokens deep into a long session
+		// leaves no room for the smallest legal budget. A sub-minimum budget
+		// is a 400; no thinking is the answer that still returns.
 		return
 	}
 	r.Thinking = &thinking{Type: "enabled", BudgetTokens: &n}
-
-	// Extended thinking rejects any explicit temperature or top_p. Dropping
-	// them is the only option that keeps the request valid; the alternative is
-	// a 400 that names sampling and not thinking, sending the reader to the
-	// wrong knob.
 	r.Temperature, r.TopP = nil, nil
 }

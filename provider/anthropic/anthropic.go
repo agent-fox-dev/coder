@@ -46,6 +46,15 @@ type request struct {
 	StopSequences []string  `json:"stop_sequences,omitzero"`
 	Stream        bool      `json:"stream"`
 	Thinking      *thinking `json:"thinking,omitzero"`
+	// OutputConfig carries the effort level for a row whose thinking ladder
+	// speaks effort tokens. It is emitted alongside {"type":"adaptive"} and
+	// never alongside a budget: the two are different generations of the
+	// same control, and a model accepts one or the other.
+	OutputConfig *outputConfig `json:"output_config,omitzero"`
+	// ContextManagement is REQ-PROV-07's body half. The compact-2026-01-12
+	// beta header alone changes nothing; the server compacts only when the
+	// body also names the edit.
+	ContextManagement *contextManagement `json:"context_management,omitzero"`
 
 	// immediateTools is the count of leading non-deferred tools. It is
 	// unexported and therefore never marshalled; StampCacheControl reads it to
@@ -54,8 +63,22 @@ type request struct {
 }
 
 type thinking struct {
-	Type         string `json:"type"` // "enabled" | "disabled"
+	// Type is "enabled" (with a budget), "adaptive" (with an effort in
+	// output_config, or none) or "disabled".
+	Type         string `json:"type"`
 	BudgetTokens *int   `json:"budget_tokens,omitzero"`
+}
+
+type outputConfig struct {
+	Effort string `json:"effort,omitzero"` // low | medium | high | xhigh | max
+}
+
+type contextManagement struct {
+	Edits []contextEdit `json:"edits"`
+}
+
+type contextEdit struct {
+	Type string `json:"type"` // "compact_20260112"
 }
 
 type sysBlock struct {
@@ -141,12 +164,14 @@ type tool struct {
 	Description  string          `json:"description,omitzero"`
 	InputSchema  json.RawMessage `json:"input_schema"`
 	CacheControl *cacheControl   `json:"cache_control,omitzero"`
-	// DeferLoading is REQ-CACHE-10's Anthropic arm: a tool that appeared
-	// mid-session is declared at its transcript position instead of being
-	// prepended to the cached prefix. A deferred tool carries NO
-	// cache_control — stamping one would place a breakpoint after the prefix
-	// it was meant to preserve.
-	DeferLoading *bool `json:"defer_loading,omitzero"`
+	// There is deliberately no defer_loading here. REQ-CACHE-10's Anthropic
+	// arm is ORDER alone: a tool that appeared mid-session is appended after
+	// the established ones so the cached prefix stays byte-identical, and it
+	// carries no cache_control because a breakpoint there would sit past the
+	// prefix it exists to preserve. `defer_loading: true` is a different
+	// feature — it HIDES the tool from the model until a tool-search server
+	// tool finds it — and sending it without declaring that server tool made
+	// every late-added tool invisible for the rest of the session.
 }
 
 type toolChoice struct {
@@ -212,6 +237,14 @@ func BuildRequestCached(m *core.Model, req core.Request, retention core.CacheRet
 		StopSequences: req.StopSequences,
 		Stream:        true,
 	}
+	// The current generation rejects temperature and top_p outright (a 400
+	// naming the field), and the catalog row records that as
+	// compat.supports_sampling: false. Dropping them is the only request that
+	// is not an error; the caller's knob simply has no counterpart on this
+	// model.
+	if !parseCompat(m).supportsSampling() {
+		out.Temperature, out.TopP = nil, nil
+	}
 
 	// A nil messages array is not an empty one on the wire: `"messages":null`
 	// is a 400 where `[]` is merely an empty (also rejected, but by a message
@@ -260,18 +293,17 @@ func BuildRequestCached(m *core.Model, req core.Request, retention core.CacheRet
 	for i, tw := range req.Tools {
 		byName[tw.Name] = schemas[i]
 	}
-	appendTools := func(ts []core.ToolWire, deferred bool) {
+	// Both halves are declared as ordinary, model-visible tools. The deferred
+	// half differs only in POSITION (after the prefix) and in carrying no
+	// breakpoint; see the tool struct for why it is not marked defer_loading.
+	appendTools := func(ts []core.ToolWire) {
 		for _, tw := range ts {
-			t := tool{Name: tw.Name, Description: tw.Description, InputSchema: byName[tw.Name]}
-			if deferred {
-				yes := true
-				t.DeferLoading = &yes
-			}
-			out.Tools = append(out.Tools, t)
+			out.Tools = append(out.Tools, tool{Name: tw.Name, Description: tw.Description,
+				InputSchema: byName[tw.Name]})
 		}
 	}
-	appendTools(split.Immediate, false)
-	appendTools(split.Deferred, true)
+	appendTools(split.Immediate)
+	appendTools(split.Deferred)
 
 	// ToolChoice absent is NOT auto: a provider must not invent a selection
 	// when the field is empty (REQ-TOOL-16). An explicit choice is forwarded
@@ -292,10 +324,14 @@ func BuildRequestCached(m *core.Model, req core.Request, retention core.CacheRet
 //
 // Exactly three placements, recomputed on EVERY request:
 //
-//  1. every system text block;
-//  2. the LAST tool only — the marker covers all preceding tools, so one
-//     breakpoint suffices and the four-breakpoint budget is not spent on the
-//     tool list;
+//  1. the LAST system block only — a marker caches everything rendered
+//     before it, and the wire renders tools, then system, then messages, so
+//     one breakpoint here covers the tool list and the whole system prompt
+//     together. Stamping every system block spent one of the four
+//     breakpoints per block, and a prompt with three or more blocks pushed
+//     the request over the limit;
+//  2. the last IMMEDIATE tool — the marker covers all preceding tools, so
+//     one breakpoint suffices and the budget is not spent on the tool list;
 //  3. the last content block of the last message, when that message is a user
 //     message and the block is text, image or tool_result.
 //
@@ -305,24 +341,31 @@ func BuildRequestCached(m *core.Model, req core.Request, retention core.CacheRet
 // or tool list changes produces a static prefix-only breakpoint, which re-pays
 // full input price on the entire growing transcript — the dominant cost in
 // exactly the multi-turn agent workload this SDK exists for.
+//
+// Under CacheRetentionLong the 1h TTL goes on placements 1 and 2 only. The
+// rolling breakpoint stays at the default 5-minute TTL: it is rewritten every
+// turn anyway, a 1h write bills at twice the 5m rate, and the wire requires
+// every 1h entry to precede every 5m one — which tools -> system -> messages
+// order satisfies exactly when the message breakpoint is the short one.
 func StampCacheControl(r *request, retention core.CacheRetention, m *core.Model) {
 	if retention == core.CacheRetentionNone {
 		return
 	}
-	cc := &cacheControl{Type: "ephemeral"}
+	short := &cacheControl{Type: "ephemeral"}
+	prefix := short
 	if retention == core.CacheRetentionLong && supportsLongRetention(m) {
-		cc.TTL = "1h"
+		prefix = &cacheControl{Type: "ephemeral", TTL: "1h"}
 	}
 
-	for i := range r.System {
-		r.System[i].CacheControl = cc
+	if n := len(r.System); n > 0 {
+		r.System[n-1].CacheControl = prefix
 	}
 	// The breakpoint goes on the last IMMEDIATE tool, not the last tool.
 	// A deferred tool sits after the prefix by construction (REQ-CACHE-10);
 	// stamping it would place the breakpoint past the very content the
 	// deferral exists to keep cached.
 	if n := r.immediateTools; n > 0 && n <= len(r.Tools) {
-		r.Tools[n-1].CacheControl = cc
+		r.Tools[n-1].CacheControl = prefix
 	}
 	if n := len(r.Messages); n > 0 {
 		last := &r.Messages[n-1]
@@ -330,25 +373,40 @@ func StampCacheControl(r *request, retention core.CacheRetention, m *core.Model)
 			lb := &last.Content[len(last.Content)-1]
 			switch lb.Type {
 			case "text", "image", "tool_result":
-				lb.CacheControl = cc
+				lb.CacheControl = short
 			}
 		}
 	}
 }
 
+// compat is the subset of a catalog row's compat object this adapter reads.
+// Absent keys take the conservative default; an unparseable object reads as
+// wholly absent rather than failing the request.
+type compat struct {
+	SupportsLongCacheRetention *bool `json:"supports_long_cache_retention"`
+	// SupportsSampling is false on rows whose model rejects temperature and
+	// top_p (the Claude 4.7+ generation). Absent means true.
+	SupportsSampling *bool `json:"supports_sampling"`
+}
+
+func parseCompat(m *core.Model) compat {
+	var c compat
+	if m == nil || len(m.Compat) == 0 {
+		return c
+	}
+	if err := json.Unmarshal(m.Compat, &c); err != nil {
+		return compat{}
+	}
+	return c
+}
+
+func (c compat) supportsSampling() bool {
+	return c.SupportsSampling == nil || *c.SupportsSampling
+}
+
 func supportsLongRetention(m *core.Model) bool {
-	// Compat is a raw JSON object on the catalog row; absence means the
-	// conservative default.
-	if len(m.Compat) == 0 {
-		return true
-	}
-	var c struct {
-		SupportsLongCacheRetention *bool `json:"supports_long_cache_retention"`
-	}
-	if err := json.Unmarshal(m.Compat, &c); err != nil || c.SupportsLongCacheRetention == nil {
-		return true
-	}
-	return *c.SupportsLongCacheRetention
+	c := parseCompat(m)
+	return c.SupportsLongCacheRetention == nil || *c.SupportsLongCacheRetention
 }
 
 // encodeMessages is where REQ-LOOP-02's Anthropic half lives.
@@ -379,7 +437,16 @@ func encodeMessages(ms core.Messages) []message {
 	for _, m := range ms {
 		switch v := m.(type) {
 		case core.UserMessage:
-			appendTo("user", encodeBlocks(v.Content)...)
+			b := encodeBlocks(v.Content)
+			if len(b) == 0 {
+				// Every block was dropped (empty text, unmodelled raw), and
+				// `"content":[]` is a 400. A skipped user turn keeps role
+				// alternation intact whenever the neighbours already
+				// alternated, which is the only way the transcript could
+				// have been valid before the message was emptied.
+				continue
+			}
+			appendTo("user", b...)
 
 		case core.AssistantMessage:
 			b := encodeBlocks(v.Content)
@@ -424,6 +491,12 @@ func splitResultContent(c core.Content) (inner []block, displaced []block) {
 	for _, b := range c {
 		switch v := b.(type) {
 		case core.TextBlock:
+			if v.Text == "" {
+				// Text is omitzero, so this would serialize as {"type":"text"}
+				// — a text block with no text key, which is a 400 — and the
+				// block carries nothing the model could read anyway.
+				continue
+			}
 			inner = append(inner, block{Type: "text", Text: v.Text})
 		case core.ImageBlock:
 			inner = append(inner, block{Type: "image", Source: &imageSource{
@@ -520,5 +593,11 @@ func MapStopReason(s string) core.StopReason {
 	case "refusal":
 		return core.StopReasonRefusal
 	}
+	// "pause_turn" lands here on purpose. It is the server pausing a long
+	// server-tool turn, not the model finishing, and the canonical vocabulary
+	// has no stop reason for it; mapping it to Stop ends the turn cleanly
+	// while RawStopReason keeps the vendor's own word for a caller that wants
+	// to resume by re-sending the transcript. Inventing a Continue reason
+	// would be a loop-level contract change, not a wire mapping.
 	return core.StopReasonStop
 }

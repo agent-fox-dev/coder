@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider/anthropic"
 	"github.com/agentfox/agentkit-go/provider/faux"
@@ -530,36 +531,236 @@ func TestBetaHeaderIsSentWhenRequested(t *testing.T) {
 	if got := sent.Header.Get("anthropic-beta"); got != anthropic.BetaCompaction {
 		t.Fatalf("anthropic-beta = %q, want %q", got, anthropic.BetaCompaction)
 	}
+	// The header alone is a no-op: the server compacts only when the body
+	// also names the edit (REQ-PROV-07).
+	body, _ := io.ReadAll(sent.Body)
+	var got struct {
+		ContextManagement *struct {
+			Edits []struct {
+				Type string `json:"type"`
+			} `json:"edits"`
+		} `json:"context_management"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ContextManagement == nil || len(got.ContextManagement.Edits) != 1 ||
+		got.ContextManagement.Edits[0].Type != "compact_20260112" {
+		t.Fatalf("body = %s, want context_management.edits = [{type: compact_20260112}] alongside the beta header", body)
+	}
+
+	// And without the beta, no body field either: a gateway that does not
+	// know the field rejects it.
+	_, _, sent = run(t, testModel(), core.Request{}, anthropic.Options{}, 200, streamFixture())
+	body, _ = io.ReadAll(sent.Body)
+	if strings.Contains(string(body), "context_management") {
+		t.Fatalf("body = %s carries context_management without the compaction beta", body)
+	}
+}
+
+// TestAFailedTurnThatReportedUsageIsStillBilled is REQ-PROV-05 on the failure
+// path. message_start reports input and cache tokens before any content, and
+// the provider bills them whether or not the stream finishes; a session
+// aggregate that priced only successful turns under-reported by exactly the
+// turns that went wrong.
+func TestAFailedTurnThatReportedUsageIsStillBilled(t *testing.T) {
+	full := streamFixture()
+	cut := full[:strings.Index(full, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1")]
+
+	msg, _, _ := run(t, testModel(), core.Request{}, anthropic.Options{}, 200, cut)
+	if msg.StopReason != core.StopReasonError {
+		t.Fatalf("stop reason = %q, want error", msg.StopReason)
+	}
+	if !msg.Usage.Has(core.UsageCostUSD) {
+		t.Fatal("a failed turn with reported usage must carry a cost")
+	}
+	// message_start: input 100, output 1, cache read 900, cache write 50.
+	want := (3*100.0 + 15*1.0 + 0.3*900.0 + 3.75*50.0) / 1e6
+	if diff := msg.Usage.CostUSD - want; diff > 1e-12 || diff < -1e-12 {
+		t.Fatalf("cost = %.10f, want %.10f from the usage message_start reported", msg.Usage.CostUSD, want)
+	}
+
+	// A failure before any usage arrived carries none: a computed zero and
+	// an absent cost must stay distinguishable.
+	msg, _, _ = run(t, testModel(), core.Request{}, anthropic.Options{}, 500, `{"type":"error"}`)
+	if msg.Usage.Has(core.UsageCostUSD) {
+		t.Fatal("a failure with no reported usage must not invent a zero cost")
+	}
+}
+
+// TestAnEventWithNoEventLineFallsBackToItsJSONType covers a relay that
+// forwards `data:` lines without the `event:` line. Every Messages payload
+// names its type in the JSON as well; treating the typeless event as a ping
+// ended every such turn with ErrSSETruncated and no content.
+func TestAnEventWithNoEventLineFallsBackToItsJSONType(t *testing.T) {
+	var b strings.Builder
+	for _, line := range strings.Split(streamFixture(), "\n") {
+		if strings.HasPrefix(line, "event:") {
+			continue
+		}
+		b.WriteString(line + "\n")
+	}
+	msg, _, _ := run(t, testModel(), core.Request{}, anthropic.Options{}, 200, b.String())
+	if msg.StopReason != core.StopReasonToolUse {
+		t.Fatalf("stop reason = %q (%q), want tool_use: the stream is complete, only the "+
+			"event: lines are missing", msg.StopReason, msg.ErrorMessage)
+	}
+	if msg.Content.Text() != "Hello" || len(core.ExtractToolUse(msg)) != 1 {
+		t.Fatalf("content = %#v, want the text and the tool call decoded", msg.Content)
+	}
+
+	// A typeless event whose JSON has no type is still a keep-alive.
+	body := "data: {}\n\n" + streamFixture()
+	msg, _, _ = run(t, testModel(), core.Request{}, anthropic.Options{}, 200, body)
+	if msg.StopReason != core.StopReasonToolUse {
+		t.Fatalf("stop reason = %q (%q); an untyped payload must be ignored, not fail the stream",
+			msg.StopReason, msg.ErrorMessage)
+	}
+}
+
+// TestOnlyTheLastSystemBlockCarriesABreakpoint is F6: the wire renders tools,
+// then system, then messages, and a marker caches everything before it, so
+// one breakpoint on the LAST system block covers the tool list and the whole
+// prompt. Stamping every block spent one of the four per-request breakpoints
+// per block, and three or more blocks pushed the request over the limit.
+func TestOnlyTheLastSystemBlockCarriesABreakpoint(t *testing.T) {
+	req := core.Request{System: []core.ContentBlock{
+		core.TextBlock{Text: "one"}, core.TextBlock{Text: "two"}, core.TextBlock{Text: "three"},
+	}, Messages: core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "hi"}}}}}
+
+	decode := func(retention core.CacheRetention) (sys []map[string]any, last map[string]any) {
+		t.Helper()
+		body, _, err := anthropic.BuildRequest(testModel(), req, retention)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(body)
+		var got struct {
+			System   []map[string]any `json:"system"`
+			Messages []struct {
+				Content []map[string]any `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got.System, got.Messages[0].Content[0]
+	}
+
+	sys, _ := decode(core.CacheRetentionShort)
+	for i, b := range sys[:2] {
+		if b["cache_control"] != nil {
+			t.Fatalf("system[%d] carries a breakpoint; only the last block may, or three blocks "+
+				"plus tools plus the rolling marker exceed the four-breakpoint limit", i)
+		}
+	}
+	if sys[2]["cache_control"] == nil {
+		t.Fatal("the last system block carries no breakpoint; nothing caches the prompt")
+	}
+
+	// Long retention: 1h on the prefix breakpoints, plain ephemeral on the
+	// rolling one. It is rewritten every turn, a 1h write costs twice a 5m
+	// one, and the wire requires 1h entries to precede 5m entries.
+	sys, last := decode(core.CacheRetentionLong)
+	cc, _ := sys[2]["cache_control"].(map[string]any)
+	if cc == nil || cc["ttl"] != "1h" {
+		t.Fatalf("system breakpoint = %v under long retention, want ttl 1h", sys[2]["cache_control"])
+	}
+	lcc, _ := last["cache_control"].(map[string]any)
+	if lcc == nil || lcc["type"] != "ephemeral" {
+		t.Fatalf("rolling breakpoint = %v, want ephemeral", last["cache_control"])
+	}
+	if _, has := lcc["ttl"]; has {
+		t.Fatalf("rolling breakpoint = %v carries a ttl; the per-turn marker stays at 5m", lcc)
+	}
+}
+
+// TestEmptyTextInsideAToolResultIsDropped is F9, the nested arm of
+// TestAnEmptyToolResultOmitsContent: an empty TextBlock INSIDE a result used
+// to serialize as {"type":"text"} — a 400 — while the top-level empty result
+// was already handled.
+func TestEmptyTextInsideAToolResultIsDropped(t *testing.T) {
+	call, _ := core.NewToolUse("toolu_1", "ls", json.RawMessage(`{}`))
+	req := core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "list"}}},
+		core.AssistantMessage{Content: core.Content{call}, StopReason: core.StopReasonToolUse,
+			Provider: "anthropic", API: anthropic.API, Model: "claude-test"},
+		core.ToolResultMessage{ToolUseID: "toolu_1", ToolName: "ls",
+			Content: core.Content{core.TextBlock{Text: ""}, core.TextBlock{Text: "a.go"}}},
+	}}
+	body, _, err := anthropic.BuildRequest(testModel(), req, core.CacheRetentionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(body)
+	if strings.Contains(string(raw), `{"type":"text"}`) {
+		t.Fatalf("body carries a text block with no text: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"a.go"`) {
+		t.Fatalf("the non-empty sibling was lost: %s", raw)
+	}
+}
+
+// TestAUserMessageWithNothingLeftIsSkipped is F10: a user message whose every
+// block was dropped (empty text, an unmodelled raw block) rendered as
+// `"content":[]`, which is a 400. Skipping the message keeps role alternation
+// intact wherever its neighbours already alternated.
+func TestAUserMessageWithNothingLeftIsSkipped(t *testing.T) {
+	req := core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "first"}}},
+		core.AssistantMessage{Content: core.Content{core.TextBlock{Text: "reply"}}, StopReason: core.StopReasonStop,
+			Provider: "anthropic", API: anthropic.API, Model: "claude-test"},
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: ""}}},
+		core.AssistantMessage{Content: core.Content{core.TextBlock{Text: "again"}}, StopReason: core.StopReasonStop,
+			Provider: "anthropic", API: anthropic.API, Model: "claude-test"},
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "last"}}},
+	}}
+	body, _, err := anthropic.BuildRequest(testModel(), req, core.CacheRetentionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(body)
+	if strings.Contains(string(raw), `"content":[]`) {
+		t.Fatalf("body carries an empty content array: %s", raw)
+	}
+	var got struct {
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	// With the empty user turn skipped, the two assistant turns become
+	// adjacent and encodeMessages coalesces them, so the wire sees
+	// user/assistant/user — valid alternation, where user/assistant/[]/
+	// assistant/user was a 400 on the empty content.
+	roles := make([]string, 0, len(got.Messages))
+	for _, m := range got.Messages {
+		roles = append(roles, m.Role)
+	}
+	if strings.Join(roles, ",") != "user,assistant,user" {
+		t.Fatalf("roles = %v, want user,assistant,user", roles)
+	}
 }
 
 // TestThinkingIsATriState is REQ-PROV-15's Anthropic arm: undefined omits the
-// key, "off" sends {"type":"disabled"}, a mapped level sends a budget.
+// key, "off" sends {"type":"disabled"} where the row maps it, a mapped level
+// sends the row's own budget.
 func TestThinkingIsATriState(t *testing.T) {
 	m := testModel()
-	budget := "2048"
-	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingHigh: &budget}
+	budget, disabled := "2048", "disabled"
+	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{
+		core.ThinkingOff: &disabled, core.ThinkingHigh: &budget}
 
-	capture := func(level core.ThinkingLevel) map[string]any {
-		var got map[string]any
-		req := core.Request{ThinkingLevel: level, Options: core.RequestOptions{
-			OnPayload: func(p any, _ *core.Model) (any, error) {
-				b, _ := json.Marshal(p)
-				_ = json.Unmarshal(b, &got)
-				return nil, nil
-			},
-		}}
-		run(t, m, req, anthropic.Options{}, 200, streamFixture())
-		return got
-	}
-
-	if got := capture(core.ThinkingUnset); got["thinking"] != nil {
+	if got := captureBody(t, m, core.ThinkingUnset); got["thinking"] != nil {
 		t.Fatalf("thinking = %v with an unset level, want the key OMITTED", got["thinking"])
 	}
-	off := capture(core.ThinkingOff)["thinking"].(map[string]any)
+	off := captureBody(t, m, core.ThinkingOff)["thinking"].(map[string]any)
 	if off["type"] != "disabled" {
 		t.Fatalf("thinking = %v for \"off\", want {\"type\":\"disabled\"}", off)
 	}
-	on := capture(core.ThinkingHigh)["thinking"].(map[string]any)
+	on := captureBody(t, m, core.ThinkingHigh)["thinking"].(map[string]any)
 	if on["type"] != "enabled" || on["budget_tokens"] != float64(2048) {
 		t.Fatalf("thinking = %v, want the catalog row's own budget", on)
 	}
@@ -567,7 +768,7 @@ func TestThinkingIsATriState(t *testing.T) {
 	// A level the row does not price is CLAMPED, never passed through and
 	// never guessed: max on a row that tops out at high clamps DOWN to high,
 	// REQ-PROV-15's own worked example.
-	clamped := capture(core.ThinkingMax)["thinking"].(map[string]any)
+	clamped := captureBody(t, m, core.ThinkingMax)["thinking"].(map[string]any)
 	if clamped["type"] != "enabled" || clamped["budget_tokens"] != float64(2048) {
 		t.Fatalf("thinking = %v for max on a row that tops out at high, want high's budget", clamped)
 	}
@@ -575,30 +776,82 @@ func TestThinkingIsATriState(t *testing.T) {
 	// sending a level the model does not know is a 400, and inventing a
 	// budget is worse than not thinking.
 	m.ThinkingLevelMap = nil
-	if got := capture(core.ThinkingHigh)["thinking"]; got != nil {
+	if got := captureBody(t, m, core.ThinkingHigh)["thinking"]; got != nil {
 		t.Fatalf("thinking = %v for a model with no map, want the key omitted", got)
 	}
 }
 
-// TestAnEffortStyleRowIsPricedIntoABudget pins the one shape the Messages API
-// rejects outright: {"type":"enabled"} with no budget_tokens. A catalog row
-// whose wire values are effort tokens ("high") rather than numbers used to
-// produce exactly that. An effort token is priced onto the same budget ladder
-// the budget-style rows use; a token the adapter does not know omits thinking
-// rather than sending a budgetless enable.
-func TestAnEffortStyleRowIsPricedIntoABudget(t *testing.T) {
-	capture := func(m *core.Model, level core.ThinkingLevel) map[string]any {
-		var got map[string]any
-		req := core.Request{ThinkingLevel: level, Options: core.RequestOptions{
-			OnPayload: func(p any, _ *core.Model) (any, error) {
-				b, _ := json.Marshal(p)
-				_ = json.Unmarshal(b, &got)
-				return nil, nil
-			},
-		}}
-		run(t, m, req, anthropic.Options{}, 200, streamFixture())
-		return got
+// captureBody builds and captures the wire body for one thinking level.
+func captureBody(t *testing.T, m *core.Model, level core.ThinkingLevel) map[string]any {
+	t.Helper()
+	return captureRequest(t, m, core.Request{ThinkingLevel: level})
+}
+
+// captureRequest captures the wire body the provider would send for req.
+func captureRequest(t *testing.T, m *core.Model, req core.Request) map[string]any {
+	t.Helper()
+	var got map[string]any
+	req.Options.OnPayload = func(p any, _ *core.Model) (any, error) {
+		b, _ := json.Marshal(p)
+		_ = json.Unmarshal(b, &got)
+		return nil, nil
 	}
+	run(t, m, req, anthropic.Options{}, 200, streamFixture())
+	return got
+}
+
+// TestOffConsultsTheCatalogBeforeSendingDisabled is the other half of ruling
+// P-27. `off` skips the clamp — a request for no thinking is never clamped up
+// to some — but it must not skip the ROW: on a model that cannot stop
+// thinking, {"type":"disabled"} is a 400, and the catalog records that as an
+// off entry that is present-and-null. Omitting the key is the least thinking
+// such a model offers.
+func TestOffConsultsTheCatalogBeforeSendingDisabled(t *testing.T) {
+	high := "high"
+	cases := []struct {
+		name string
+		m    map[core.ThinkingLevel]*string
+		want bool // disabled on the wire
+	}{
+		{"off maps to a value", map[core.ThinkingLevel]*string{
+			core.ThinkingOff: strp("disabled"), core.ThinkingHigh: &high}, true},
+		{"off present-and-null (Fable)", map[core.ThinkingLevel]*string{
+			core.ThinkingOff: nil, core.ThinkingHigh: &high}, false},
+		{"off absent from a ladder", map[core.ThinkingLevel]*string{
+			core.ThinkingHigh: &high}, false},
+		{"no ladder at all", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := testModel()
+			m.ThinkingLevelMap = c.m
+			body := captureBody(t, m, core.ThinkingOff)
+			th, present := body["thinking"].(map[string]any)
+			if c.want && (!present || th["type"] != "disabled") {
+				t.Fatalf("thinking = %v, want {\"type\":\"disabled\"}: the row says the model accepts it", body["thinking"])
+			}
+			if !c.want && present {
+				t.Fatalf("thinking = %v, want the key OMITTED: nothing says this model can be told not to think, "+
+					"and on the models that cannot, disabled is a 400", th)
+			}
+			if body["output_config"] != nil {
+				t.Fatalf("output_config = %v with off, want none", body["output_config"])
+			}
+		})
+	}
+}
+
+func strp(s string) *string { return &s }
+
+// TestAnEffortStyleRowSendsAdaptiveThinkingAndEffort pins the current
+// generation of the control. A catalog row whose wire values are effort
+// tokens ("high") describes a model that takes output_config.effort with
+// {"type":"adaptive"} and REJECTS budget_tokens — every model since Opus 4.7.
+// The previous adapter priced the token into a budget on the ladder the
+// budget rows use, which was a 400 on exactly the rows that carry tokens. A
+// token the adapter does not know omits thinking rather than sending
+// {"type":"enabled"} with no budget, which the API also rejects.
+func TestAnEffortStyleRowSendsAdaptiveThinkingAndEffort(t *testing.T) {
 	assertNeverBudgetless := func(body map[string]any) {
 		t.Helper()
 		th, ok := body["thinking"].(map[string]any)
@@ -609,24 +862,142 @@ func TestAnEffortStyleRowIsPricedIntoABudget(t *testing.T) {
 			t.Fatalf("thinking = %v: type enabled with no budget_tokens is rejected by the Messages API", th)
 		}
 	}
+	temp, topP := 0.3, 0.9
+	withSampling := func(m *core.Model, level core.ThinkingLevel) map[string]any {
+		return captureRequest(t, m, core.Request{ThinkingLevel: level, Temperature: &temp, TopP: &topP})
+	}
 
 	m := testModel()
 	m.MaxTokens = 64000
 	high := "high"
 	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingHigh: &high}
-	body := capture(m, core.ThinkingHigh)
+	body := withSampling(m, core.ThinkingHigh)
 	assertNeverBudgetless(body)
 	th, _ := body["thinking"].(map[string]any)
-	if th == nil || th["type"] != "enabled" || th["budget_tokens"] != float64(32768) {
-		t.Fatalf("thinking = %v for an effort-style row, want enabled with high's budget 32768", th)
+	if th == nil || th["type"] != "adaptive" || th["budget_tokens"] != nil {
+		t.Fatalf("thinking = %v for an effort-style row, want {\"type\":\"adaptive\"} and no budget: "+
+			"budget_tokens is a 400 on every model that speaks effort", th)
+	}
+	oc, _ := body["output_config"].(map[string]any)
+	if oc == nil || oc["effort"] != "high" {
+		t.Fatalf("output_config = %v, want {\"effort\":\"high\"}: the level rides in output_config, not in thinking", body["output_config"])
+	}
+	if body["temperature"] != nil || body["top_p"] != nil {
+		t.Fatalf("temperature/top_p = %v/%v survived alongside thinking; the API rejects the pair",
+			body["temperature"], body["top_p"])
+	}
+
+	// minimal has no Anthropic counterpart and is sent as low; a row that
+	// writes it as "minimal" gets the same treatment as one that writes "low".
+	minimal := "minimal"
+	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingMinimal: &minimal}
+	body = withSampling(m, core.ThinkingMinimal)
+	if oc, _ := body["output_config"].(map[string]any); oc == nil || oc["effort"] != "low" {
+		t.Fatalf("output_config = %v for a \"minimal\" wire value, want effort low", body["output_config"])
 	}
 
 	unknown := "turbo"
 	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingHigh: &unknown}
-	body = capture(m, core.ThinkingHigh)
+	body = withSampling(m, core.ThinkingHigh)
 	assertNeverBudgetless(body)
-	if body["thinking"] != nil {
-		t.Fatalf("thinking = %v for a wire token that is neither a budget nor an effort, want omitted", body["thinking"])
+	if body["thinking"] != nil || body["output_config"] != nil {
+		t.Fatalf("thinking/output_config = %v/%v for a wire token that is neither a budget nor an effort, want both omitted",
+			body["thinking"], body["output_config"])
+	}
+	if body["temperature"] == nil {
+		t.Fatal("temperature was dropped although no thinking is being sent")
+	}
+}
+
+// TestAShippedEffortRowReachesTheWireAsEffort runs the real catalog rows
+// through the adapter, because the translation table this replaces was only
+// ever wrong against real rows: a hand-built map cannot fail the way a
+// snapshot that says "high" for Opus 5 did.
+func TestAShippedEffortRowReachesTheWireAsEffort(t *testing.T) {
+	temp := 0.5
+	for _, c := range []struct {
+		id, effort string
+		thinking   string // wire type, or "" for omitted
+		level      core.ThinkingLevel
+	}{
+		{"anthropic/claude-opus-5", "xhigh", "adaptive", core.ThinkingXHigh},
+		{"anthropic/claude-fable-5-1", "max", "adaptive", core.ThinkingMax},
+		{"anthropic/claude-sonnet-4-6", "max", "adaptive", core.ThinkingXHigh}, // no xhigh: clamps UP
+		{"anthropic/claude-fable-5-1", "", "", core.ThinkingOff},               // cannot stop thinking
+		{"anthropic/claude-opus-5", "", "disabled", core.ThinkingOff},
+	} {
+		m, err := catalog.ResolveModel(c.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := captureRequest(t, m, core.Request{ThinkingLevel: c.level, Temperature: &temp})
+		th, _ := body["thinking"].(map[string]any)
+		if (c.thinking == "") != (th == nil) || (th != nil && th["type"] != c.thinking) {
+			t.Errorf("%s %s: thinking = %v, want type %q", c.id, c.level, body["thinking"], c.thinking)
+		}
+		oc, _ := body["output_config"].(map[string]any)
+		if (c.effort == "") != (oc == nil) || (oc != nil && oc["effort"] != c.effort) {
+			t.Errorf("%s %s: output_config = %v, want effort %q", c.id, c.level, body["output_config"], c.effort)
+		}
+		if _, ok := body["budget_tokens"]; ok {
+			t.Errorf("%s: budget_tokens on the wire; it is a 400 on this generation", c.id)
+		}
+	}
+
+	// A budget row stays a budget row: Haiku takes budget_tokens and errors
+	// on output_config.effort.
+	haiku, err := catalog.ResolveModel("anthropic/claude-haiku-4-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := captureBody(t, haiku, core.ThinkingHigh)
+	th, _ := body["thinking"].(map[string]any)
+	if th == nil || th["type"] != "enabled" || th["budget_tokens"] != float64(32768) {
+		t.Fatalf("haiku high: thinking = %v, want enabled with the row's 32768 budget", body["thinking"])
+	}
+	if body["output_config"] != nil {
+		t.Fatalf("haiku: output_config = %v; effort is an error on this model", body["output_config"])
+	}
+}
+
+// TestARowThatRejectsSamplingDropsTemperatureAndTopP is compat.supports_sampling
+// on the request path. The Claude 4.7+ generation returns a 400 naming the
+// field for any temperature or top_p, thinking or not, and the catalog row
+// says so; the caller's knob simply has no counterpart there.
+func TestARowThatRejectsSamplingDropsTemperatureAndTopP(t *testing.T) {
+	temp, topP := 0.2, 0.9
+	req := core.Request{Temperature: &temp, TopP: &topP}
+
+	m := testModel()
+	m.Compat = json.RawMessage(`{"supports_sampling": false}`)
+	body := captureRequest(t, m, req)
+	if _, ok := body["temperature"]; ok {
+		t.Fatalf("temperature = %v sent to a row with supports_sampling false", body["temperature"])
+	}
+	if _, ok := body["top_p"]; ok {
+		t.Fatalf("top_p = %v sent to a row with supports_sampling false", body["top_p"])
+	}
+
+	// Absent, and an unrelated compat key, both mean the conservative
+	// default: the knobs go through.
+	for _, compat := range []string{``, `{"supports_long_cache_retention": false}`, `{"supports_sampling": true}`} {
+		m.Compat = json.RawMessage(compat)
+		body := captureRequest(t, m, req)
+		if body["temperature"] != 0.2 || body["top_p"] != 0.9 {
+			t.Fatalf("compat %q: temperature/top_p = %v/%v, want 0.2/0.9 forwarded", compat,
+				body["temperature"], body["top_p"])
+		}
+	}
+	// And the shipped rows: Opus 5 rejects, Sonnet 4.6 accepts.
+	for id, want := range map[string]bool{"anthropic/claude-opus-5": false, "anthropic/claude-sonnet-4-6": true} {
+		m, err := catalog.ResolveModel(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, sent := captureRequest(t, m, req)["temperature"]
+		if sent != want {
+			t.Errorf("%s: temperature sent = %v, want %v", id, sent, want)
+		}
 	}
 }
 
@@ -804,25 +1175,48 @@ func TestAMalformedContentBlockStartFailsTheStream(t *testing.T) {
 
 func TestThinkingBudgetIsHeldBelowMaxTokens(t *testing.T) {
 	m := testModel()
-	m.MaxTokens = 1024
+	m.MaxTokens = 2048
 	budget := "4096" // larger than max_tokens: Anthropic rejects this outright
 	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingHigh: &budget}
 
-	var got map[string]any
-	req := core.Request{ThinkingLevel: core.ThinkingHigh, Options: core.RequestOptions{
-		OnPayload: func(p any, _ *core.Model) (any, error) {
-			b, _ := json.Marshal(p)
-			_ = json.Unmarshal(b, &got)
-			return nil, nil
-		},
-	}}
-	run(t, m, req, anthropic.Options{}, 200, streamFixture())
-
-	th := got["thinking"].(map[string]any)
+	got := captureBody(t, m, core.ThinkingHigh)
+	th, _ := got["thinking"].(map[string]any)
+	if th == nil {
+		t.Fatalf("thinking omitted; 2047 is a legal budget below max_tokens %v", got["max_tokens"])
+	}
 	if th["budget_tokens"].(float64) >= got["max_tokens"].(float64) {
 		t.Fatalf("budget_tokens %v is not below max_tokens %v; the BUDGET is the value "+
 			"we may lower, because max_tokens has already been clamped against the "+
 			"context window", th["budget_tokens"], got["max_tokens"])
+	}
+}
+
+// TestASubMinimumBudgetOmitsThinking is the other edge of the clamp above.
+// Holding the budget below max_tokens can push it under the vendor minimum of
+// 1024 — a small max_tokens, or a large one clamped deep into a long session
+// (REQ-CAT-04) — and a sub-minimum budget is a 400 just as an oversized one
+// is. No thinking is the request that still returns.
+func TestASubMinimumBudgetOmitsThinking(t *testing.T) {
+	m := testModel()
+	m.MaxTokens = 1024 // leaves 1023, under the minimum
+	budget := "4096"
+	m.ThinkingLevelMap = map[core.ThinkingLevel]*string{core.ThinkingHigh: &budget}
+	temp := 0.4
+
+	got := captureRequest(t, m, core.Request{ThinkingLevel: core.ThinkingHigh, Temperature: &temp})
+	if got["thinking"] != nil {
+		t.Fatalf("thinking = %v, want the key omitted: a budget under 1024 is a 400", got["thinking"])
+	}
+	if got["temperature"] != 0.4 {
+		t.Fatalf("temperature = %v; with no thinking on the wire the caller's sampling stands", got["temperature"])
+	}
+
+	// The minimum itself is legal.
+	m.MaxTokens = 1025
+	got = captureBody(t, m, core.ThinkingHigh)
+	th, _ := got["thinking"].(map[string]any)
+	if th == nil || th["budget_tokens"] != float64(1024) {
+		t.Fatalf("thinking = %v, want the 1024 minimum sent", got["thinking"])
 	}
 }
 
