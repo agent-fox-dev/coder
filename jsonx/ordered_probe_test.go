@@ -73,3 +73,22 @@ func TestMapMatchesOrderedMembers(t *testing.T) {
 		t.Fatalf("big is %T, want json.Number", m["nums"].(map[string]any)["big"])
 	}
 }
+
+// TestTrailingBytesAreRejected. The trailing-bytes check used dec.More, which
+// reports whether another ELEMENT follows and answers false for a stray `]`
+// or `}` exactly as it does for a clean end of input — so `{"a":1}]` decoded
+// as `{"a":1}`. Anything after the value is a rejection.
+func TestTrailingBytesAreRejected(t *testing.T) {
+	for _, in := range []string{`{"a":1}]`, `{"a":1}}`, `[1]}`, `{"a":1} x`, `1 2`, `"s" "t"`, `{"a":1}{}`} {
+		if _, err := DecodeOrdered([]byte(in)); err == nil {
+			t.Errorf("%s was accepted; the bytes after the value are not JSON", in)
+		} else if err != ErrTrailingBytes {
+			t.Errorf("%s: err = %v, want ErrTrailingBytes", in, err)
+		}
+	}
+	for _, in := range []string{`{"a":1}`, ` {"a":1} `, "[1]\n", `1`, `"s"`, `null`} {
+		if _, err := DecodeOrdered([]byte(in)); err != nil {
+			t.Errorf("%q was rejected: %v", in, err)
+		}
+	}
+}

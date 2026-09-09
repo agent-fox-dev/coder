@@ -58,6 +58,13 @@ type HTTPTransportOptions struct {
 	// because a request whose response is a long-lived SSE stream must not be
 	// cut off by a client deadline — the per-call deadline lives on the
 	// context instead.
+	//
+	// The default client does NOT follow redirects (its CheckRedirect
+	// returns http.ErrUseLastResponse). A redirect is followed with the
+	// configured Headers attached, and those carry the server's bearer
+	// token: a compromised or misconfigured endpoint answering 307 would
+	// receive our credential at an address the operator never configured.
+	// A caller supplying its own client should set the same CheckRedirect.
 	Client *http.Client
 	// Headers are sent on every request. This is where a bearer token for a
 	// remote server goes.
@@ -87,6 +94,13 @@ type httpCommon struct {
 	errMu sync.Mutex
 	err   error
 
+	// broken records the ids whose response stream this transport itself
+	// reported as ended without a response, so the client can tell the
+	// transport's synthetic -32001 from one a peer sent. See
+	// Message.streamBroken.
+	brokenMu sync.Mutex
+	broken   map[string]struct{}
+
 	closeOnce sync.Once
 }
 
@@ -97,7 +111,9 @@ func newHTTPCommon(ctx context.Context, opts HTTPTransportOptions) (*httpCommon,
 	}
 	hc := opts.Client
 	if hc == nil {
-		hc = &http.Client{}
+		hc = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	return &httpCommon{
@@ -265,7 +281,29 @@ func (h *httpCommon) reportBroken(id ID) {
 	if err != nil {
 		return
 	}
+	// Recorded BEFORE delivery, so the read loop that decodes the frame
+	// finds the marker already there.
+	h.brokenMu.Lock()
+	if h.broken == nil {
+		h.broken = map[string]struct{}{}
+	}
+	h.broken[id.Key()] = struct{}{}
+	h.brokenMu.Unlock()
 	h.deliver(frame)
+}
+
+// tookBrokenReport reports whether THIS transport minted a broken-stream
+// error for id, consuming the record. It is the out-of-band half of
+// reportBroken: the frame carries the code, this carries the proof that the
+// transport and not the peer chose it.
+func (h *httpCommon) tookBrokenReport(id ID) bool {
+	h.brokenMu.Lock()
+	defer h.brokenMu.Unlock()
+	if _, ok := h.broken[id.Key()]; !ok {
+		return false
+	}
+	delete(h.broken, id.Key())
+	return true
 }
 
 // isResponseTo is a cheap probe: does this frame answer the request with id

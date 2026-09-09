@@ -62,28 +62,45 @@ func (f *FrameReader) Next() ([]byte, error) {
 // Poisoned reports whether a malformed frame has torn the reader down.
 func (f *FrameReader) Poisoned() bool { return f.err != nil }
 
+// nextLine returns the next non-blank line.
+//
+// Blank keep-alive lines are skipped in a LOOP, not by recursion: a peer that
+// writes nothing but newlines would otherwise grow the stack by one frame per
+// line, and a 12 MiB run of them is a stack overflow the peer chose. The run
+// is also bounded — the bytes of consecutive blank lines count against
+// MaxMessageBytes exactly as a frame's bytes would — so a peer cannot spin
+// the reader forever with a stream that never delivers a message. The count
+// resets on every real frame, so an idle server's keep-alives never add up.
 func (f *FrameReader) nextLine() ([]byte, error) {
-	var out []byte
+	var blank int64
 	for {
-		chunk, more, err := f.br.ReadLine()
-		if err != nil {
-			return nil, err
+		var out []byte
+		for {
+			chunk, more, err := f.br.ReadLine()
+			if err != nil {
+				return nil, err
+			}
+			// Checked BEFORE the append that would grow the buffer, which is
+			// the whole of "bounded before it allocates".
+			if int64(len(out))+int64(len(chunk)) > f.lim.MaxMessageBytes {
+				return nil, failf(RuleMessageBytes, "$", "frame exceeds %d bytes",
+					f.lim.MaxMessageBytes)
+			}
+			out = append(out, chunk...)
+			if !more {
+				break
+			}
 		}
-		// Checked BEFORE the append that would grow the buffer, which is the
-		// whole of "bounded before it allocates".
-		if int64(len(out))+int64(len(chunk)) > f.lim.MaxMessageBytes {
-			return nil, failf(RuleMessageBytes, "$", "frame exceeds %d bytes",
-				f.lim.MaxMessageBytes)
+		if len(bytes.TrimSpace(out)) != 0 {
+			return out, nil
 		}
-		out = append(out, chunk...)
-		if !more {
-			break
+		// A blank line is at least its terminator, which ReadLine strips.
+		blank += int64(len(out)) + 1
+		if blank > f.lim.MaxMessageBytes {
+			return nil, failf(RuleMessageBytes, "$",
+				"more than %d bytes of blank lines without a frame", f.lim.MaxMessageBytes)
 		}
 	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return f.nextLine() // blank keep-alive lines are not frames
-	}
-	return out, nil
 }
 
 func (f *FrameReader) nextHeaderFramed() ([]byte, error) {

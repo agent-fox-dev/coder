@@ -74,6 +74,9 @@ type StdioOptions struct {
 	Limits wire.Limits
 }
 
+// maxStderrLine bounds one stderr line delivered to StdioOptions.Stderr.
+const maxStderrLine = 1 << 20
+
 // StdioTransport runs an MCP server as a subprocess and speaks NDJSON to it.
 type StdioTransport struct {
 	cmd    *exec.Cmd
@@ -147,11 +150,25 @@ func StartStdio(ctx context.Context, opts StdioOptions) (*StdioTransport, error)
 	go func() {
 		defer stderrR.Close()
 		sc := bufio.NewScanner(stderrR)
-		sc.Buffer(make([]byte, 0, 4096), 1<<20)
+		sc.Buffer(make([]byte, 0, 4096), maxStderrLine)
 		for sc.Scan() {
 			if opts.Stderr != nil {
 				opts.Stderr(sc.Text())
 			}
+		}
+		// The scanner stops on a line it cannot buffer (bufio.ErrTooLong) as
+		// well as at EOF. Stopping READING then is not an option: the child
+		// still holds the write end, and once the pipe fills its next write
+		// to stderr blocks — a server that logs is a server that hangs, and
+		// its stdout frames stop with it. So the rest of the stream is
+		// drained and discarded, and the caller is told once why its
+		// diagnostics stopped.
+		if err := sc.Err(); err != nil {
+			if opts.Stderr != nil {
+				opts.Stderr(fmt.Sprintf("[agentkit] stderr line exceeded %d bytes (%v); "+
+					"the rest of this server's stderr is discarded", maxStderrLine, err))
+			}
+			_, _ = io.Copy(io.Discard, stderrR)
 		}
 	}()
 	go func() { t.waitCh <- cmd.Wait() }()

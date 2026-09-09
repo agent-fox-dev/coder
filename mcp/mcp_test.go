@@ -250,13 +250,28 @@ func TestTheCapCountsRunesNotBytes(t *testing.T) {
 	}
 }
 
+// TestNonTextContentIsNotTruncated: an image is never SLICED. One that fits
+// the cap is kept whole; one that does not is dropped whole (see
+// TestNonTextContentIsChargedAgainstTheCap), because half a base64 image is
+// a corrupt image, not a shorter one.
 func TestNonTextContentIsNotTruncated(t *testing.T) {
 	out := mcp.CapContent([]mcp.Content{
+		{Type: "image", Data: strings.Repeat("A", 40_000), MimeType: "image/png"},
+	})
+	if len(out) != 1 || len(out[0].Data) != 40_000 {
+		t.Fatal("an image within the cap must be kept intact")
+	}
+	out = mcp.CapContent([]mcp.Content{
 		{Type: "image", Data: strings.Repeat("A", 100_000), MimeType: "image/png"},
 	})
-	if len(out) != 1 || len(out[0].Data) != 100_000 {
-		t.Fatal("an image is not text and slicing its base64 produces a corrupt image, " +
-			"not a shorter one")
+	for _, it := range out {
+		if it.Type == "image" {
+			t.Fatalf("an image over the cap was passed through with %d bytes of data; it must "+
+				"be dropped whole, never sliced and never exempted", len(it.Data))
+		}
+	}
+	if len(out) != 1 || !strings.Contains(out[0].Text, "truncated") {
+		t.Fatalf("the drop must leave the note and nothing else: %+v", out)
 	}
 }
 
@@ -1002,8 +1017,26 @@ func TestMain(m *testing.M) {
 	case "mortal":
 		runMortalChild()
 		return
+	case "stderr-flood":
+		runStderrFloodChild()
+		return
 	}
 	os.Exit(m.Run())
+}
+
+// runStderrFloodChild writes one 2 MiB line to stderr — more than the parent's
+// stderr scanner will buffer — and only then serves. If the parent stops
+// reading stderr at that line, this child blocks on the write (or dies of
+// SIGPIPE) before it ever answers a request.
+func runStderrFloodChild() {
+	_, _ = os.Stderr.Write([]byte(strings.Repeat("x", 2<<20) + "\n"))
+	s := mcp.NewServer(mcp.ServerOptions{Info: mcp.Implementation{Name: "flood", Version: "1"}})
+	_ = s.RegisterTool(mcp.ToolDefinition{Name: "hello"},
+		func(context.Context, map[string]any) (mcp.ToolsCallResult, error) {
+			return mcp.ToolsCallResult{Content: []mcp.Content{{Type: "text", Text: "hi"}}}, nil
+		})
+	tr := mcp.NewPipeTransport(os.Stdin, os.Stdout, wire.Limits{})
+	_ = s.Serve(context.Background(), tr)
 }
 
 // runChildServer reports its environment.

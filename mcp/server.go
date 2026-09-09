@@ -262,11 +262,21 @@ func (s *Server) liveSessionsLocked() []*serverSession {
 // and the server MUST NOT send one it did not name. A session with no listen
 // stream gets nothing at all, which is why a client that wants live updates
 // has to ask.
+//
+// It never blocks on a session's transport: each notification is queued for
+// the session's own pump (see serverSession.notify), so the host's
+// RegisterTool returns whether or not every subscriber is reading.
 func notifyAll(sessions []*serverSession, method string) {
 	for _, sess := range sessions {
 		sess.notify(method, nil)
 	}
 }
+
+// notificationQueueDepth bounds the notifications waiting on one session's
+// pump. A subscriber that has not drained this many is not reading, and the
+// session is torn down rather than allowed to hold memory for a stream nobody
+// is consuming.
+const notificationQueueDepth = 64
 
 // serverSession is one connection's state: the transport, and the correlator
 // for requests the SERVER issues to the client (sampling).
@@ -274,6 +284,19 @@ type serverSession struct {
 	tr     Transport
 	corr   *correlator
 	sendMu sync.Mutex
+	warnf  func(format string, args ...any)
+
+	// outbound carries notifications to the pump goroutine that writes them,
+	// so a change notification never runs a transport write on the caller's
+	// goroutine. RegisterTool used to: with one subscriber whose stdio pipe
+	// was full, every registration on the server blocked behind it.
+	outMu     sync.Mutex
+	outbound  chan Message
+	outClosed bool
+	pumpDone  chan struct{}
+	// teardown ends the session from the pump's side when its queue
+	// overflows; set by Serve and serveListen for their own transports.
+	teardown func()
 
 	// sub is the filter this session opted in to, nil until it sends a
 	// subscriptions/listen. subID is that request's id, which tags every
@@ -299,7 +322,15 @@ type inflightRequest struct {
 	cancelled atomic.Bool
 }
 
-// notify sends one change notification if this session subscribed to its type.
+// notify queues one change notification if this session subscribed to its
+// type. It does not write: the pump does, on its own goroutine.
+//
+// The queue is bounded and OVERFLOW IS FATAL to the session. A subscriber that
+// is notificationQueueDepth notifications behind has stopped reading, and the
+// choices are to drop notifications silently — a client that then trusts its
+// cache forever — or to block the registrar, which is what this replaces. The
+// session is torn down instead; a client that reconnects re-lists, which is
+// the one recovery that cannot serve it a stale tool.
 func (sess *serverSession) notify(method string, params any) {
 	sess.subMu.Lock()
 	sub := sess.sub
@@ -312,7 +343,64 @@ func (sess *serverSession) notify(method string, params any) {
 	if err != nil {
 		return
 	}
-	sess.send(Message{JSONRPC: Version, Method: method, Params: raw})
+	m := Message{JSONRPC: Version, Method: method, Params: raw}
+
+	sess.outMu.Lock()
+	defer sess.outMu.Unlock()
+	if sess.outClosed {
+		return
+	}
+	if sess.outbound == nil {
+		// No pump (a session a test built by hand): write inline, which
+		// is the old behaviour and still correct, only unbounded.
+		sess.send(m)
+		return
+	}
+	select {
+	case sess.outbound <- m:
+	default:
+		if sess.warnf != nil {
+			sess.warnf("a subscriber is %d notifications behind and not reading; "+
+				"closing its session", notificationQueueDepth)
+		}
+		sess.outClosed = true
+		close(sess.outbound)
+		if sess.teardown != nil {
+			// On its own goroutine: closing a transport may wait for the
+			// very write that is stuck, and this is the registrar's call.
+			go sess.teardown()
+		}
+	}
+}
+
+// startPump begins draining outbound to the transport.
+func (sess *serverSession) startPump() {
+	sess.outbound = make(chan Message, notificationQueueDepth)
+	sess.pumpDone = make(chan struct{})
+	go func() {
+		defer close(sess.pumpDone)
+		for m := range sess.outbound {
+			sess.send(m)
+		}
+	}()
+}
+
+// stopPump closes the queue and waits for the pump to finish what it had.
+//
+// The wait is unbounded because the pump holds sendMu while writing, and the
+// caller's next step is a write of its own on the same transport: it would
+// wait on the mutex instead, with no way to see that it is waiting.
+func (sess *serverSession) stopPump() {
+	sess.outMu.Lock()
+	if sess.outbound != nil && !sess.outClosed {
+		sess.outClosed = true
+		close(sess.outbound)
+	}
+	done := sess.pumpDone
+	sess.outMu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // subscribedTo maps a notification method onto the filter field that opts in
@@ -463,7 +551,12 @@ const MaxConcurrentHandlers = 64
 // Responses may therefore be written out of order. JSON-RPC correlates by id
 // and permits it.
 func (s *Server) Serve(ctx context.Context, tr Transport) error {
-	sess := &serverSession{tr: tr, corr: newCorrelator(), inflight: map[string]*inflightRequest{}}
+	sess := &serverSession{tr: tr, corr: newCorrelator(), inflight: map[string]*inflightRequest{},
+		warnf: s.warnf}
+	// A queue overflow closes the transport, which is what unblocks this
+	// loop's Receive and lets the session end.
+	sess.teardown = func() { _ = tr.Close() }
+	sess.startPump()
 	ctx = context.WithValue(ctx, sessionKey{}, sess)
 	slots := make(chan struct{}, MaxConcurrentHandlers)
 
@@ -479,6 +572,7 @@ func (s *Server) Serve(ctx context.Context, tr Transport) error {
 		s.mu.Lock()
 		delete(s.sessions, sess)
 		s.mu.Unlock()
+		sess.stopPump()
 
 		sess.corr.fail(ErrTransportClosed)
 		// Cancel what is still running before waiting for it. Without this a
@@ -1108,9 +1202,14 @@ func (s *Server) HTTPHandler(opts HTTPOptions) (http.Handler, error) {
 	if len(headers) == 0 {
 		headers = []string{"Authorization", "X-API-Key"}
 	}
+	// The body cap is the SMALLER of the HTTP option and the decoder's own
+	// message bound. A body the decoder would reject for its size has no
+	// reason to be read into memory first, and a host that configured a
+	// small wire limit and forgot this option was getting the 16 MiB default
+	// here regardless.
 	maxBody := opts.MaxBodyBytes
-	if maxBody <= 0 {
-		maxBody = wire.Defaults().MaxMessageBytes
+	if lim := s.opts.Limits.WithDefaults().MaxMessageBytes; maxBody <= 0 || maxBody > lim {
+		maxBody = lim
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1226,7 +1325,14 @@ func (s *Server) serveListen(w http.ResponseWriter, r *http.Request, m *Message)
 	}
 
 	tr := &sseResponseTransport{w: w, fl: fl}
-	sess := &serverSession{tr: tr, corr: newCorrelator(), inflight: map[string]*inflightRequest{}}
+	sess := &serverSession{tr: tr, corr: newCorrelator(), inflight: map[string]*inflightRequest{},
+		warnf: s.warnf}
+	// A queue overflow ends the listen by cancelling its context, which is
+	// how this request returns; the transport is fenced off below as usual.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	sess.teardown = cancel
+	sess.startPump()
 	s.mu.Lock()
 	s.sessions[sess] = struct{}{}
 	s.mu.Unlock()
@@ -1236,7 +1342,7 @@ func (s *Server) serveListen(w http.ResponseWriter, r *http.Request, m *Message)
 	w.WriteHeader(http.StatusOK)
 	fl.Flush()
 
-	ctx := context.WithValue(r.Context(), sessionKey{}, sess)
+	ctx = context.WithValue(ctx, sessionKey{}, sess)
 	result, rpcErr := s.dispatch(ctx, m) // returns when the client goes away
 
 	// Out of the registry BEFORE the final write and the close, so no
@@ -1245,6 +1351,7 @@ func (s *Server) serveListen(w http.ResponseWriter, r *http.Request, m *Message)
 	s.mu.Lock()
 	delete(s.sessions, sess)
 	s.mu.Unlock()
+	sess.stopPump()
 
 	out := Message{JSONRPC: Version, ID: m.ID, Error: rpcErr}
 	if rpcErr == nil {

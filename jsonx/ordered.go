@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 )
 
 // ValueKind discriminates an OrderedValue.
@@ -63,7 +64,11 @@ func DecodeOrdered(data []byte) (OrderedValue, error) {
 	if err := v.decode(dec); err != nil {
 		return OrderedValue{}, err
 	}
-	if dec.More() {
+	// Anything but a clean end of input is trailing bytes. dec.More is the
+	// wrong probe here: it reports whether another ELEMENT follows, and
+	// answers false for a stray `]` or `}` as readily as for EOF — so
+	// `{"a":1}]` was decoding as `{"a":1}`.
+	if _, err := dec.Token(); err != io.EOF {
 		return OrderedValue{}, ErrTrailingBytes
 	}
 	return v, nil

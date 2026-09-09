@@ -168,6 +168,18 @@ type Message struct {
 	Params  json.RawMessage `json:"params,omitzero"`
 	Result  json.RawMessage `json:"result,omitzero"`
 	Error   *Error          `json:"error,omitzero"`
+
+	// result is the decoded result tree, set by bindEnvelope so the caller
+	// binding a result does not parse the frame a second time (the bytes in
+	// Result are that tree re-encoded). Unexported: never marshalled, and
+	// nothing a peer sends can populate it.
+	result *wire.Value
+	// streamBroken marks a CodeResponseStreamBroken frame the TRANSPORT
+	// minted because a response stream ended with no response on it. Only
+	// the read loop sets it, and only on the transport's own word — the code
+	// alone proves nothing, because a peer can send -32001 too, and a peer
+	// that could trigger a re-issue that way could make a tool run twice.
+	streamBroken bool
 }
 
 func (m *Message) IsRequest() bool      { return m.Method != "" && m.ID.IsSet() }
@@ -240,6 +252,8 @@ func bindEnvelope(v wire.Value, m *Message) error {
 				return &wire.Error{Rule: wire.RuleSyntax, Path: path, Msg: err.Error()}
 			}
 			m.Result = raw
+			tree := member
+			m.result = &tree
 		case "error":
 			if member.Kind == wire.KindNull {
 				continue

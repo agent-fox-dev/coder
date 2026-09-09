@@ -194,7 +194,13 @@ type ServerConnection struct {
 	// cached list from outliving a server that has no subscription stream open
 	// to tell us it changed.
 	toolsExpire time.Time
-	calls       int
+	// toolsGen counts invalidations. ListTools reads it before it goes to
+	// the server and stores its result only if it is unchanged: a
+	// list_changed that arrives WHILE a tools/list is in flight would
+	// otherwise be overwritten by the list it predates, and the cache would
+	// hold a stale list with nothing left to invalidate it.
+	toolsGen uint64
+	calls    int
 	// subscribed is set when the server acknowledges a subscriptions/listen.
 	subscribed bool
 	closed     bool
@@ -278,6 +284,9 @@ func (c *ServerConnection) Dead() bool {
 // because a pool that knows a server's capabilities before the first tool call
 // can report an unusable server at connect time rather than mid-turn.
 func (c *ServerConnection) Discover(ctx context.Context) error {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
 	var res DiscoverResult
 	if err := c.call(ctx, MethodDiscover, DiscoverParams{}, &res); err != nil {
 		var rpcErr *Error
@@ -340,21 +349,42 @@ func (c *ServerConnection) ListTools(ctx context.Context) ([]ToolDefinition, err
 		c.mu.Unlock()
 		return out, nil
 	}
+	gen := c.toolsGen
 	c.mu.Unlock()
+
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
 
 	var all []ToolDefinition
 	var ttl int64
+	// cache is cleared by a page that says ttlMs: 0. That is the server
+	// saying "immediately stale" — a registry a host can mutate at any
+	// moment — and it is NOT the same as a page that omits the hint. A
+	// server that sends 0 and a server that sends nothing were both read as
+	// "cache until told otherwise" before, which for the first is the
+	// opposite of what it asked.
+	cache := true
 	cursor := ""
 	for {
-		var res ToolsListResult
-		if err := c.call(ctx, MethodToolsList, ToolsListParams{Cursor: cursor}, &res); err != nil {
+		var page wire.Value
+		if err := c.call(ctx, MethodToolsList, ToolsListParams{Cursor: cursor}, &page); err != nil {
 			return nil, fmt.Errorf("mcp: %s: tools/list: %w", c.cfg.Name, err)
 		}
-		// The SHORTEST hint across pages wins: one page going stale makes the
-		// assembled list stale, and caching to the longest would keep serving
-		// a list the server already said had expired in part.
-		if res.TTLMs > 0 && (ttl == 0 || res.TTLMs < ttl) {
-			ttl = res.TTLMs
+		var res ToolsListResult
+		if err := wire.Bind(page, &res); err != nil {
+			return nil, fmt.Errorf("mcp: %s: tools/list: %w", c.cfg.Name, err)
+		}
+		if _, present := page.Get("ttlMs"); present {
+			switch {
+			case res.TTLMs <= 0:
+				cache = false
+			case ttl == 0 || res.TTLMs < ttl:
+				// The SHORTEST hint across pages wins: one page going stale
+				// makes the assembled list stale, and caching to the longest
+				// would keep serving a list the server already said had
+				// expired in part.
+				ttl = res.TTLMs
+			}
 		}
 		all = append(all, res.Tools...)
 		if res.NextCursor == "" || res.NextCursor == cursor {
@@ -369,10 +399,15 @@ func (c *ServerConnection) ListTools(ctx context.Context) ([]ToolDefinition, err
 	}
 
 	c.mu.Lock()
-	c.tools, c.toolsValid = all, true
-	c.toolsExpire = time.Time{}
-	if ttl > 0 {
-		c.toolsExpire = c.opts.Now().Add(time.Duration(ttl) * time.Millisecond)
+	// Stored only if nothing invalidated the cache while the list was in
+	// flight. A newer generation means a list_changed arrived for a change
+	// this list may predate; the next ListTools will fetch again.
+	if cache && c.toolsGen == gen {
+		c.tools, c.toolsValid = all, true
+		c.toolsExpire = time.Time{}
+		if ttl > 0 {
+			c.toolsExpire = c.opts.Now().Add(time.Duration(ttl) * time.Millisecond)
+		}
 	}
 	c.mu.Unlock()
 	return append([]ToolDefinition(nil), all...), nil
@@ -383,12 +418,49 @@ func (c *ServerConnection) RefreshTools() {
 	c.mu.Lock()
 	c.toolsValid, c.tools = false, nil
 	c.toolsExpire = time.Time{}
+	c.toolsGen++
 	c.mu.Unlock()
+}
+
+// withTimeout applies REQ-MCP-CLIENT-07's timeout_s to one operation.
+//
+// Every request-shaped operation gets it — a tool call, a list, a read, the
+// discover probe. Subscribe does NOT: a subscription is a stream held open on
+// purpose, and a deadline on it would be a deadline on the server's right to
+// stay quiet.
+func (c *ServerConnection) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, c.cfg.timeout())
 }
 
 // Call invokes a tool by its UNQUALIFIED name (REQ-MCP-CLIENT-03).
 func (c *ServerConnection) Call(ctx context.Context, toolName string, args map[string]any) (ToolsCallResult, error) {
+	var raw json.RawMessage
+	if args != nil {
+		b, err := json.Marshal(args)
+		if err != nil {
+			return ToolsCallResult{}, fmt.Errorf("mcp: %s: tools/call %q: arguments: %w",
+				c.cfg.Name, toolName, err)
+		}
+		raw = b
+	}
+	return c.CallRaw(ctx, toolName, raw)
+}
+
+// CallRaw is Call with the arguments as the JSON the caller already holds.
+//
+// The pool uses it to pass the model's argument bytes through VERBATIM. Going
+// through map[string]any would launder every number through a float64 on the
+// way: 9007199254740993 arrives at the server as 9007199254740992, and a
+// server that checks an id against its own records finds nothing, with no
+// error anywhere to explain why. args is nil or a JSON object; it is sent as
+// written, member order and number literals included.
+func (c *ServerConnection) CallRaw(ctx context.Context, toolName string, args json.RawMessage) (ToolsCallResult, error) {
 	start := c.opts.Now()
+	if len(args) == 0 {
+		// A nil RawMessage is omitted from the request; an empty non-nil one
+		// would be written as nothing at all, which is not JSON.
+		args = nil
+	}
 
 	c.mu.Lock()
 	limit := c.cfg.callLimit()
@@ -401,7 +473,7 @@ func (c *ServerConnection) Call(ctx context.Context, toolName string, args map[s
 	c.calls++
 	c.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, c.cfg.timeout())
+	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
 	res, err := c.callWithMRTR(ctx, toolName, args)
@@ -416,20 +488,25 @@ func (c *ServerConnection) Call(ctx context.Context, toolName string, args map[s
 	return res, nil
 }
 
-// resultTypeOf reads the discriminator without binding the body.
-func resultTypeOf(raw []byte, limits wire.Limits) (ResultType, error) {
-	if len(raw) == 0 {
-		return ResultComplete, nil
-	}
-	v, err := wire.Parse(raw, limits)
-	if err != nil {
-		return "", err
-	}
-	rt, ok := v.Object["resultType"]
+// resultTypeOf reads the discriminator off the decoded result without binding
+// the body.
+func resultTypeOf(v wire.Value) ResultType {
+	rt, ok := v.Get("resultType")
 	if !ok {
-		return ResultComplete, nil
+		return ResultComplete
 	}
-	return ResultType(rt.String), nil
+	return ResultType(rt.String)
+}
+
+// rawCallParams is ToolsCallParams with the arguments carried as bytes, for
+// CallRaw. It is unexported because ToolsCallParams is the SERVER's view,
+// where the arguments are decoded for the handler; the client's job is to not
+// decode them at all.
+type rawCallParams struct {
+	Name           string          `json:"name"`
+	Arguments      json.RawMessage `json:"arguments,omitzero"`
+	InputResponses map[string]any  `json:"inputResponses,omitzero"`
+	RequestState   string          `json:"requestState,omitzero"`
 }
 
 // MaxInputRounds bounds the MRTR retry loop (REQ-MCP-CLIENT-08.2).
@@ -443,12 +520,17 @@ func resultTypeOf(raw []byte, limits wire.Limits) (ResultType, error) {
 const MaxInputRounds = 3
 
 // callWithMRTR runs tools/call, answering any input requests and retrying.
-func (c *ServerConnection) callWithMRTR(ctx context.Context, toolName string, args map[string]any) (ToolsCallResult, error) {
-	params := ToolsCallParams{Name: toolName, Arguments: args}
+func (c *ServerConnection) callWithMRTR(ctx context.Context, toolName string, args json.RawMessage) (ToolsCallResult, error) {
+	params := rawCallParams{Name: toolName, Arguments: args}
 
 	for round := 0; ; round++ {
-		var raw json.RawMessage
-		if err := c.call(ctx, MethodToolsCall, params, &raw); err != nil {
+		// The result is taken as the tree the read loop already built, and
+		// bound from there: the frame is parsed ONCE. It used to be parsed
+		// three times — the frame, then the result bytes for the
+		// discriminator, then again to bind — and on a 16 MiB result that
+		// is three 16 MiB trees for one message.
+		var tree wire.Value
+		if err := c.call(ctx, MethodToolsCall, params, &tree); err != nil {
 			return ToolsCallResult{}, err
 		}
 
@@ -460,13 +542,9 @@ func (c *ServerConnection) callWithMRTR(ctx context.Context, toolName string, ar
 		//
 		// An earlier-revision server omits the field, and the spec says to
 		// treat that as "complete".
-		kind, err := resultTypeOf(raw, c.opts.Limits)
-		if err != nil {
-			return ToolsCallResult{}, err
-		}
-		if kind != ResultInputRequired {
+		if resultTypeOf(tree) != ResultInputRequired {
 			var res ToolsCallResult
-			if err := decodeParams(raw, &res, c.opts.Limits); err != nil {
+			if err := wire.Bind(tree, &res); err != nil {
 				return ToolsCallResult{}, err
 			}
 			return res, nil
@@ -478,7 +556,7 @@ func (c *ServerConnection) callWithMRTR(ctx context.Context, toolName string, ar
 				ErrTooManyInputRounds, c.cfg.Name, round+1)
 		}
 		var need InputRequiredResult
-		if err := decodeParams(raw, &need, c.opts.Limits); err != nil {
+		if err := wire.Bind(tree, &need); err != nil {
 			return ToolsCallResult{}, err
 		}
 		answers, err := c.resolveInputRequests(ctx, need.InputRequests)
@@ -499,11 +577,23 @@ func (c *ServerConnection) callWithMRTR(ctx context.Context, toolName string, ar
 // returning two hundred blocks of 49K each would otherwise pass a per-item cap
 // and deliver ten megabytes. The note is addressed to the model, because the
 // model is what has to decide whether to ask for less next time.
+//
+// A non-text block is charged by the length of its Data. It is never SLICED —
+// half a base64 image is a corrupt image, not a smaller one — but it is not
+// free either: a cap that exempted images would be bypassed by a server that
+// returned its ten megabytes as one image block, and the model's context is
+// what the cap protects. A block that does not fit is dropped whole, and the
+// note says so.
 func CapContent(items []Content) []Content {
 	remaining := ResultCharCap
 	out := make([]Content, 0, len(items))
 	for i, it := range items {
 		if it.Type != "text" {
+			if len(it.Data) > remaining {
+				out = append(out, Content{Type: "text", Text: capNote(len(items) - i)})
+				return out
+			}
+			remaining -= len(it.Data)
 			out = append(out, it)
 			continue
 		}
@@ -517,16 +607,19 @@ func CapContent(items []Content) []Content {
 			it.Text = string(runes[:remaining])
 			out = append(out, it)
 		}
-		dropped := len(items) - i - 1
-		note := fmt.Sprintf(
-			"\n\n[truncated: this result exceeded the %d-character cap. %d further content "+
-				"block(s) were dropped. Narrow the request — a filter, a smaller range, a "+
-				"more specific query — rather than retrying it unchanged.]",
-			ResultCharCap, dropped)
-		out = append(out, Content{Type: "text", Text: note})
+		out = append(out, Content{Type: "text", Text: capNote(len(items) - i - 1)})
 		return out
 	}
 	return out
+}
+
+// capNote is the truncation notice CapContent appends, addressed to the model.
+func capNote(dropped int) string {
+	return fmt.Sprintf(
+		"\n\n[truncated: this result exceeded the %d-character cap. %d further content "+
+			"block(s) were dropped. Narrow the request — a filter, a smaller range, a "+
+			"more specific query — rather than retrying it unchanged.]",
+		ResultCharCap, dropped)
 }
 
 // Close tears the connection down.
@@ -662,7 +755,12 @@ func (c *ServerConnection) callOn(ctx context.Context, l *link, method string, r
 		select {
 		case resp := <-ch:
 			if resp.Error != nil {
-				if resp.Error.Code == CodeResponseStreamBroken && !reissued {
+				// Re-issued on the TRANSPORT's marker, never on the code
+				// alone. A peer can send -32001 too, and a re-issue on its
+				// say-so would run the tool a second time at the peer's
+				// request — the duplicate execution the "once, on our own
+				// evidence" rule exists to rule out.
+				if resp.streamBroken && !reissued {
 					c.warnf("server %q: the response stream for %s ended without a response; "+
 						"re-issuing the request with a new id", c.cfg.Name, method)
 					reissued = true
@@ -670,10 +768,7 @@ func (c *ServerConnection) callOn(ctx context.Context, l *link, method string, r
 				}
 				return resp.Error
 			}
-			if out == nil {
-				return nil
-			}
-			return decodeParams(resp.Result, out, c.opts.Limits)
+			return c.decodeResult(resp, out)
 		case <-ctx.Done():
 			// Forget the waiter so a timed-out call does not leak an entry for
 			// the life of the connection.
@@ -682,10 +777,44 @@ func (c *ServerConnection) callOn(ctx context.Context, l *link, method string, r
 			// the handler running to completion on the other side — for a
 			// tool that spends money or holds a lock, "the client gave up"
 			// and "the work stopped" have to be the same event.
-			c.cancelRemote(l, id, ctx.Err())
+			c.cancelRemote(ctx, l, id, ctx.Err())
 			return ctx.Err()
 		}
 	}
+}
+
+// decodeResult binds a response's result into out.
+//
+// The read loop parsed the frame once and left the result's tree on the
+// message; binding from that tree is what keeps it at once. A caller that
+// asks for the tree itself (*wire.Value) gets it without even a bind, which is
+// how tools/call reads its discriminator and then binds the right shape.
+func (c *ServerConnection) decodeResult(resp *Message, out any) error {
+	if out == nil {
+		return nil
+	}
+	if tree, ok := out.(*wire.Value); ok {
+		switch {
+		case resp.result != nil:
+			*tree = *resp.result
+			return nil
+		case len(resp.Result) == 0:
+			*tree = wire.Value{}
+			return nil
+		}
+		v, err := wire.Parse(resp.Result, c.opts.Limits)
+		if err != nil {
+			return err
+		}
+		*tree = v
+		return nil
+	}
+	if resp.result != nil {
+		return wire.Bind(*resp.result, out)
+	}
+	// A message built in-process (the correlator's failure frames) carries
+	// bytes only.
+	return decodeParams(resp.Result, out, c.opts.Limits)
 }
 
 // reconnect replaces a dead link (NFR-REL-03), or reports why it cannot.
@@ -801,11 +930,21 @@ func (c *ServerConnection) requestMeta() RequestMeta {
 	}
 }
 
+// cancelNotifyTimeout bounds the courtesy notification a timed-out call sends.
+const cancelNotifyTimeout = 2 * time.Second
+
 // cancelRemote sends notifications/cancelled for an abandoned request. A send
 // failure is deliberately ignored: the call has already failed, and the
 // cancellation is a courtesy to a peer that may itself be the reason the send
 // cannot complete.
-func (c *ServerConnection) cancelRemote(l *link, id ID, cause error) {
+//
+// It is sent on its OWN goroutine under its own short deadline. The caller is
+// a Call that has just hit timeout_s, and the transport that failed to
+// answer in time is the one this has to write to: a wedged HTTP endpoint or a
+// full stdio pipe would otherwise hold Call inside the notification for as
+// long as the peer likes, and REQ-MCP-CLIENT-07's timeout would be a timeout
+// on everything except returning.
+func (c *ServerConnection) cancelRemote(ctx context.Context, l *link, id ID, cause error) {
 	rawID, err := id.MarshalJSON()
 	if err != nil {
 		return
@@ -814,19 +953,34 @@ func (c *ServerConnection) cancelRemote(l *link, id ID, cause error) {
 	if cause != nil {
 		reason = cause.Error()
 	}
-	_ = c.notify(l, MethodCancelled, map[string]any{"requestId": json.RawMessage(rawID), "reason": reason})
+	msg, err := c.notification(MethodCancelled,
+		map[string]any{"requestId": json.RawMessage(rawID), "reason": reason})
+	if err != nil {
+		return
+	}
+	go func() {
+		// WithoutCancel: the call's own context is already done, which is
+		// the reason this is being sent.
+		nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelNotifyTimeout)
+		defer cancel()
+		_ = sendContext(nctx, l.tr, msg)
+	}()
 }
 
-func (c *ServerConnection) notify(l *link, method string, params any) error {
+// notification builds a notification frame with the per-request _meta.
+func (c *ServerConnection) notification(method string, params any) ([]byte, error) {
 	raw, err := c.withMeta(params)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	msg, err := json.Marshal(Message{JSONRPC: Version, Method: method, Params: raw})
-	if err != nil {
-		return err
-	}
-	return l.tr.Send(msg)
+	return json.Marshal(Message{JSONRPC: Version, Method: method, Params: raw})
+}
+
+// brokenReporter is implemented by a transport that mints
+// CodeResponseStreamBroken frames itself and can vouch for each one. See
+// Message.streamBroken.
+type brokenReporter interface {
+	tookBrokenReport(id ID) bool
 }
 
 func (c *ServerConnection) readLoop(l *link) {
@@ -851,6 +1005,15 @@ func (c *ServerConnection) readLoop(l *link) {
 
 		switch {
 		case m.IsResponse():
+			if m.Error != nil && m.Error.Code == CodeResponseStreamBroken {
+				// The code is the transport's, but a peer can write it too.
+				// Only the transport's own record of having minted this
+				// frame makes it a re-issue; without that it is the peer's
+				// error and the call fails with it.
+				if br, ok := l.tr.(brokenReporter); ok && br.tookBrokenReport(m.ID) {
+					m.streamBroken = true
+				}
+			}
 			if !l.corr.deliver(&m) {
 				c.warnf("server %q sent a response for unknown id %s", c.cfg.Name, m.ID)
 			}
@@ -974,15 +1137,14 @@ func (c *ServerConnection) warnf(format string, args ...any) {
 	}
 }
 
-func (c *ServerConnection) auditCall(tool string, args map[string]any, isErr bool, elapsed int64, at time.Time) {
+func (c *ServerConnection) auditCall(tool string, args json.RawMessage, isErr bool, elapsed int64, at time.Time) {
 	if c.opts.Audit == nil {
 		return
 	}
-	raw, _ := json.Marshal(args)
 	c.opts.Audit(core.AuditEvent{
 		Kind: core.AuditToolCall, Timestamp: at,
 		ServerName: c.cfg.Name, ToolName: tool,
-		ArgumentsHash: core.HashArguments(raw),
+		ArgumentsHash: core.HashArguments(args),
 		IsError:       isErr, ElapsedMS: elapsed,
 	})
 }

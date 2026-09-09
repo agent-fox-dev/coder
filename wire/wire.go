@@ -31,11 +31,22 @@ type Limits struct {
 	MaxContainerLen int
 	// MaxDepth bounds nesting. Default 64.
 	MaxDepth int
+	// MaxNodes bounds the TOTAL number of values in one message, across every
+	// container. Default 2e6.
+	//
+	// The other three bounds do not imply it. A decoded Value is 96 bytes
+	// and its shortest encoding is two, so a 16 MiB message of `[[],[],…]`
+	// that respects MaxContainerLen and MaxDepth still materializes as a
+	// tree sixty-four times its own size. This is the bound on that
+	// amplification: 2e6 nodes is under 200 MiB of tree at the worst case,
+	// and a legitimate message that needs more is not one this protocol has.
+	MaxNodes int
 }
 
 // Defaults are the table in REQ-SEC-11.
 func Defaults() Limits {
-	return Limits{MaxMessageBytes: 16 << 20, MaxContainerLen: 1_000_000, MaxDepth: 64}
+	return Limits{MaxMessageBytes: 16 << 20, MaxContainerLen: 1_000_000, MaxDepth: 64,
+		MaxNodes: 2_000_000}
 }
 
 // WithDefaults fills the zero fields. It is exported because a caller that
@@ -55,6 +66,9 @@ func (l Limits) withDefaults() Limits {
 	if l.MaxDepth <= 0 {
 		l.MaxDepth = d.MaxDepth
 	}
+	if l.MaxNodes <= 0 {
+		l.MaxNodes = d.MaxNodes
+	}
 	return l
 }
 
@@ -66,6 +80,7 @@ const (
 	RuleMessageBytes Rule = "message_bytes"
 	RuleContainerLen Rule = "container_len"
 	RuleDepth        Rule = "depth"
+	RuleNodes        Rule = "nodes"
 	RuleDuplicateKey Rule = "duplicate_key"
 	RuleSyntax       Rule = "syntax"
 	RuleUnknownField Rule = "unknown_field"

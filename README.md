@@ -263,7 +263,15 @@ client forever. Three rounds, then an error.
 client names the types it wants and the server MUST NOT send one it did not
 name. A connection with no subscription receives nothing — which is why the
 tool cache also honours the `ttlMs` hint every list result now carries, since a
-client that never subscribed has no other way to learn its cache went stale.
+client that never subscribed has no other way to learn its cache went stale. An
+explicit `ttlMs: 0` means *do not cache* — the list is fetched on every use —
+while an absent hint keeps the list until a `list_changed` arrives; the two
+used to be read the same way, which for the server that sent `0` was the
+opposite of what it asked. The default HTTP client also does **not follow
+redirects**: the configured headers carry the server's bearer token, and
+`net/http` would forward them (and, on a 307, the body) to whatever address the
+endpoint named. A caller supplying its own `http.Client` should set the same
+`CheckRedirect`.
 
 **Routing headers are derived from the body, never accepted from a caller.**
 Every POST carries `MCP-Protocol-Version`, `Mcp-Method` and — for `tools/call`
@@ -311,7 +319,10 @@ a declared 2³¹ wraps negative, sails past a `> max` check, and panics on a
 negative slice bound, which is a remote crash from a header field. And **no
 buffer is sized to a declared length**: a peer announcing 16 MiB and sending
 one byte must cost one byte, or the number in the header is a free allocation
-primitive.
+primitive. A fourth bound, **`MaxNodes`**, caps the total number of values in
+one message: a decoded value is 96 bytes and its shortest encoding is two, so
+the size, container and depth limits together still let a 16 MiB message
+materialize as a tree sixty-four times its size.
 
 **Field matching is case-sensitive**, unlike `encoding/json`. `id` and `Id` are
 two distinct keys, so duplicate-key rejection does not catch them; case-folded

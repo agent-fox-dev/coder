@@ -718,3 +718,135 @@ func TestInvalidUTF8InAStringIsRejected(t *testing.T) {
 		t.Fatalf("valid UTF-8 rejected: %v", err)
 	}
 }
+
+// newlines yields an endless stream of '\n' without holding it in memory.
+type newlines struct{}
+
+func (newlines) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = '\n'
+	}
+	return len(p), nil
+}
+
+// TestBlankLinesAreSkippedWithoutGrowingTheStack: the NDJSON reader skipped a
+// blank keep-alive line by calling itself, so a peer writing nothing but
+// newlines grew the stack one frame per line — 12 MiB of them is a fatal stack
+// overflow the peer chose. The skip is a loop now, and the frame after the
+// run is delivered.
+func TestBlankLinesAreSkippedWithoutGrowingTheStack(t *testing.T) {
+	const run = 12 << 20
+	body := io.MultiReader(io.LimitReader(newlines{}, run), strings.NewReader(`{"a":1}`+"\n"))
+	r := wire.NewNDJSON(body, wire.Limits{})
+
+	got, err := r.Next()
+	if err != nil {
+		t.Fatalf("Next after %d blank lines: %v", run, err)
+	}
+	if string(got) != `{"a":1}` {
+		t.Fatalf("frame = %q, want the frame after the blank run", got)
+	}
+	if _, err := r.Next(); err != io.EOF {
+		t.Fatalf("err = %v, want io.EOF", err)
+	}
+}
+
+// TestARunOfBlankLinesIsBoundedLikeAFrame: blank lines are not free. Their
+// bytes count against MaxMessageBytes exactly as a frame's would, so a peer
+// cannot hold the reader in a loop that never yields a message.
+func TestARunOfBlankLinesIsBoundedLikeAFrame(t *testing.T) {
+	const limit = 1024
+
+	under := strings.Repeat("\n", limit/2) + `{"a":1}` + "\n"
+	r := wire.NewNDJSON(strings.NewReader(under), wire.Limits{MaxMessageBytes: limit})
+	if got, err := r.Next(); err != nil || string(got) != `{"a":1}` {
+		t.Fatalf("a run under the limit must deliver the next frame: %q, %v", got, err)
+	}
+
+	over := strings.Repeat("\n", limit*4) + `{"a":1}` + "\n"
+	r = wire.NewNDJSON(strings.NewReader(over), wire.Limits{MaxMessageBytes: limit})
+	_, err := r.Next()
+	var we *wire.Error
+	if !errors.As(err, &we) || we.Rule != wire.RuleMessageBytes {
+		t.Fatalf("a %d-byte run of blank lines under a %d-byte limit gave %v; want a "+
+			"message_bytes rejection", limit*4, limit, err)
+	}
+	if !r.Poisoned() {
+		t.Fatal("the rejection must poison the reader like any other")
+	}
+
+	// The count RESETS on every real frame: an idle server's keep-alives over
+	// a long session never add up to a rejection.
+	var b strings.Builder
+	for i := 0; i < 8; i++ {
+		b.WriteString(strings.Repeat("\n", limit/2))
+		b.WriteString(`{"a":1}` + "\n")
+	}
+	r = wire.NewNDJSON(strings.NewReader(b.String()), wire.Limits{MaxMessageBytes: limit})
+	for i := 0; i < 8; i++ {
+		if _, err := r.Next(); err != nil {
+			t.Fatalf("frame %d after its own short blank run: %v", i, err)
+		}
+	}
+}
+
+// TestTheTotalNodeCountIsBounded is the amplification bound. A decoded Value
+// is 96 bytes and its shortest encoding is two, so MaxMessageBytes,
+// MaxContainerLen and MaxDepth together still allow a 16 MiB message to
+// materialize as a tree sixty-four times its size. MaxNodes is the fourth
+// bound, and it is checked BEFORE the value is appended to its container.
+func TestTheTotalNodeCountIsBounded(t *testing.T) {
+	// Eleven scalars in one array: twelve nodes.
+	rejects(t, `[1,2,3,4,5,6,7,8,9,10,11]`, wire.Limits{MaxNodes: 10}, wire.RuleNodes)
+	// Spread across containers — the bound is TOTAL, not per container.
+	rejects(t, `{"a":[1,2,3],"b":[4,5,6],"c":{"d":7}}`, wire.Limits{MaxNodes: 10}, wire.RuleNodes)
+	// Exactly at the limit is legal.
+	if err := wire.Guard([]byte(`[1,2,3,4,5,6,7,8,9]`), wire.Limits{MaxNodes: 10}); err != nil {
+		t.Fatalf("ten nodes under a limit of ten was rejected: %v", err)
+	}
+	if _, err := wire.Parse([]byte(`[1,2,3,4,5,6,7,8,9]`), wire.Limits{MaxNodes: 10}); err != nil {
+		t.Fatalf("Parse rejected what Guard accepted: %v", err)
+	}
+}
+
+// TestTheDefaultNodeBoundHoldsUnderTheOtherDefaults: a message that respects
+// the default MaxContainerLen and MaxDepth and the default MaxMessageBytes can
+// still exceed the default MaxNodes, which is the point of having it.
+func TestTheDefaultNodeBoundHoldsUnderTheOtherDefaults(t *testing.T) {
+	d := wire.Defaults()
+	if d.MaxNodes <= 0 {
+		t.Fatal("Defaults must carry a node bound")
+	}
+	// Enough arrays at the container limit to pass the node bound by one,
+	// with every other default respected: each inner array is exactly
+	// MaxContainerLen elements and the message is a few MiB.
+	per := d.MaxContainerLen
+	arrays := d.MaxNodes/per + 1
+	var b strings.Builder
+	b.Grow(2*per*arrays + 16)
+	b.WriteByte('[')
+	for a := 0; a < arrays; a++ {
+		if a > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('[')
+		for i := 0; i < per; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteByte('0')
+		}
+		b.WriteByte(']')
+	}
+	b.WriteByte(']')
+	data := []byte(b.String())
+	if int64(len(data)) > d.MaxMessageBytes {
+		t.Fatalf("the fixture is %d bytes, over MaxMessageBytes; it would be rejected for the wrong reason", len(data))
+	}
+	err := wire.Guard(data, wire.Limits{})
+	var we *wire.Error
+	if !errors.As(err, &we) || we.Rule != wire.RuleNodes {
+		t.Fatalf("a %d-byte message of %d values gave %v; want a nodes rejection under the "+
+			"defaults", len(data), arrays*per+arrays+1, err)
+	}
+}
