@@ -748,7 +748,7 @@ func encodeParts(c core.Content, nameByID map[string]string) []part {
 // 400s on every tool call — the single easiest way to get this provider wrong.
 // A result whose text is already a JSON object is passed through VERBATIM,
 // which keeps the tool's own key order intact rather than re-wrapping and
-// re-sorting it.
+// re-sorting it — unless the object carries a key Gemini reads as its own.
 func responseObject(v core.ToolResultMessage) json.RawMessage {
 	return responseBytes(v.Content, v.IsError)
 }
@@ -759,7 +759,7 @@ func responseBytes(c core.Content, isErr bool) json.RawMessage {
 		b, _ := json.Marshal(map[string]string{"error": text})
 		return b
 	}
-	if obj := objectBytes(text); obj != nil {
+	if obj := objectBytes(text); obj != nil && !hasReservedKey(obj) {
 		return obj
 	}
 	b, _ := json.Marshal(map[string]string{"output": text})
@@ -772,6 +772,44 @@ func objectBytes(s string) json.RawMessage {
 		return nil
 	}
 	return json.RawMessage(t)
+}
+
+// hasReservedKey reports whether a JSON object carries, at any depth, a key
+// Gemini interprets rather than passes to the model.
+//
+// functionResponse.response is not an opaque payload on this wire: a
+// `{"$ref": name}` object inside it is Gemini's own syntax for pointing at a
+// functionResponse.parts entry by display_name, and a name that matches no
+// part is a 400 for the whole request. The text of a tool result is whatever
+// the tool produced — read_file hands back a file verbatim — so a JSON Schema
+// read from the workspace, with its `{"$ref": "#/$defs/test"}`, was reaching
+// the wire as a live reference. An object with a `$`-prefixed key anywhere is
+// therefore wrapped under "output" like plain text, where it is a string the
+// model reads and nothing Gemini resolves.
+func hasReservedKey(obj json.RawMessage) bool {
+	var v any
+	if err := json.Unmarshal(obj, &v); err != nil {
+		return true
+	}
+	return walkForReservedKey(v)
+}
+
+func walkForReservedKey(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, child := range x {
+			if strings.HasPrefix(k, "$") || walkForReservedKey(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range x {
+			if walkForReservedKey(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ------------------------------------------------------------- schema dialect

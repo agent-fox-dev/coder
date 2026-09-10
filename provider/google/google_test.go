@@ -295,6 +295,19 @@ func TestFunctionResponseIsAlwaysAJSONObject(t *testing.T) {
 			core.ToolResultMessage{ToolUseID: "c1", ToolName: "t",
 				Content: core.Content{core.TextBlock{Text: `{"zeta":1,"alpha":2}`}}},
 			`{"zeta":1,"alpha":2}`},
+		// A JSON Schema read from the workspace is a JSON object whose
+		// `{"$ref": ...}` Gemini reads as a reference to a response part,
+		// and "The referenced name `#/$defs/test` ... does not match to a
+		// display_name" is a 400 for the whole request. It goes under
+		// "output" as text, like any other file.
+		{"an object with a $ref key at any depth is wrapped as text",
+			core.ToolResultMessage{ToolUseID: "c1", ToolName: "read_file",
+				Content: core.Content{core.TextBlock{Text: `{"items":{"$ref":"#/$defs/test"}}`}}},
+			`{"output":"{\"items\":{\"$ref\":\"#/$defs/test\"}}"}`},
+		{"an object with a $-prefixed key in an array is wrapped as text",
+			core.ToolResultMessage{ToolUseID: "c1", ToolName: "read_file",
+				Content: core.Content{core.TextBlock{Text: `{"allOf":[{"$ref":"#/a"}]}`}}},
+			`{"output":"{\"allOf\":[{\"$ref\":\"#/a\"}]}"}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
