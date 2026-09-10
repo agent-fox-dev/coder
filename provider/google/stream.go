@@ -629,6 +629,14 @@ func (d *decoder) chunk(data []byte) error {
 					Data: p.InlineData.Data, MimeType: p.InlineData.MimeType})
 				d.textIdx, d.thinkIdx = -1, -1
 				changed = true
+				// An image model attaches the turn's signature to the image
+				// part itself, and a conversational edit replayed without it
+				// loses the chain exactly as a text turn would (the case
+				// keepSignature exists for). Kept at its position, after
+				// the image, so the replay sends image then signature.
+				if p.ThoughtSignature != "" {
+					d.keepSignature(p.ThoughtSignature)
+				}
 
 			case p.Text != "":
 				if d.textIdx < 0 {
