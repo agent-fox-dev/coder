@@ -829,3 +829,53 @@ func TestSynthesizedCallIDsDoNotRepeatAcrossResponses(t *testing.T) {
 		t.Fatalf("id = %q, want resp_9-0", got)
 	}
 }
+
+// TestAThoughtSignatureOnAnImagePartIsKeptAndReplayed is the image-model
+// shape: a generated image arrives as an inlineData part that carries the
+// turn's thoughtSignature, and a conversational edit ("make the beard
+// longer") replayed without it loses the chain. The signature rides as a
+// signature-only ThinkingBlock right after the image and goes back as a
+// signature-only part after the inlineData part.
+func TestAThoughtSignatureOnAnImagePartIsKeptAndReplayed(t *testing.T) {
+	sse := data(
+		`{"responseId":"r1","modelVersion":"gemini-x","candidates":[{"content":{"role":"model","parts":[{"text":"Here you go.","thoughtSignature":"TSIG"},{"inlineData":{"mimeType":"image/png","data":"AAAA"},"thoughtSignature":"ISIG"}]},"finishReason":"STOP"}]}`)
+	msg := drive(t, sse)
+	var kinds []string
+	for _, b := range msg.Content {
+		switch v := b.(type) {
+		case core.TextBlock:
+			kinds = append(kinds, "text")
+		case core.ImageBlock:
+			kinds = append(kinds, "image")
+		case core.ThinkingBlock:
+			kinds = append(kinds, "sig:"+v.Signature)
+		}
+	}
+	if got := strings.Join(kinds, ","); got != "text,sig:TSIG,image,sig:ISIG" {
+		t.Fatalf("content = %s, want the image's signature kept after the image", got)
+	}
+
+	// The replay model must accept images, or the repair pass replaces the
+	// image with a text placeholder before this encoder ever sees it.
+	vision := model()
+	vision.Input = []string{"text", "image"}
+	raw, w := build(t, vision, core.Request{Messages: core.Messages{
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "a dwarf"}}}, *msg,
+		core.UserMessage{Content: core.Content{core.TextBlock{Text: "longer beard"}}},
+	}})
+	if !strings.Contains(string(raw), `"thoughtSignature":"ISIG"`) {
+		t.Fatalf("the image signature did not reach the replay: %s", raw)
+	}
+	// The replayed model turn must carry the image and then its signature,
+	// in that order, so the position the signature arrived at is the
+	// position it goes back in.
+	body := string(raw)
+	img := strings.Index(body, `"inlineData"`)
+	sig := strings.Index(body, `"thoughtSignature":"ISIG"`)
+	if img < 0 || sig < img {
+		t.Fatalf("replay order wrong (image at %d, signature at %d): %s", img, sig, body)
+	}
+	if len(w.Contents) != 3 || w.Contents[1].Role != google.RoleModel {
+		t.Fatalf("contents = %+v, want user, model, user", w.Contents)
+	}
+}
