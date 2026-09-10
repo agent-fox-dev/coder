@@ -137,21 +137,22 @@ func indentJSON(t *testing.T, raw []byte) string {
 func goldenRequestCases(t *testing.T) []goldenCase {
 	t.Helper()
 	req := canonicalRequest(t)
+	noenv := func(string) string { return "" }
 	return []goldenCase{
 		{"anthropic", capture(t,
-			anthropic.Provider(anthropic.Options{BaseURL: "https://example.invalid"}),
+			anthropic.Provider(anthropic.Options{BaseURL: "https://example.invalid", Getenv: noenv}),
 			goldenModel("claude-test", anthropic.API, "anthropic"), req)},
 		{"openai", capture(t,
-			openai.Provider(openai.Options{BaseURL: "https://example.invalid"}),
+			openai.Provider(openai.Options{BaseURL: "https://example.invalid", Getenv: noenv}),
 			goldenModel("gpt-test", openai.API, "openai"), req)},
 		{"google", capture(t,
-			google.Provider(google.Options{BaseURL: "https://example.invalid"}),
+			google.Provider(google.Options{BaseURL: "https://example.invalid", Getenv: noenv}),
 			goldenModel("gemini-test", google.API, "google"), req)},
 		{"openai_responses", capture(t,
-			openairesponses.Provider(openairesponses.Options{BaseURL: "https://example.invalid"}),
+			openairesponses.Provider(openairesponses.Options{BaseURL: "https://example.invalid", Getenv: noenv}),
 			goldenModel("gpt-resp-test", openairesponses.API, "openai"), req)},
 		{"ollama", capture(t,
-			ollama.Provider(ollama.Options{BaseURL: "https://example.invalid"}),
+			ollama.Provider(ollama.Options{BaseURL: "https://example.invalid", Getenv: noenv}),
 			goldenModel("llama-test", ollama.API, "ollama"), req)},
 	}
 }
