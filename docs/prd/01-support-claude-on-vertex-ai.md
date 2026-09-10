@@ -89,7 +89,7 @@ derives it from configuration alone. The deployment is on when **any** of:
 |---|---|
 | `Options.VertexProject` | code said so |
 | `CLAUDE_CODE_USE_VERTEX` truthy | a flag variable whose only purpose is this |
-| `ANTHROPIC_VERTEX_PROJECT_ID` set | names Anthropic-on-Vertex and nothing else |
+| `ANTHROPIC_VERTEX_PROJECT_ID` set, *and no Anthropic-direct credential is* | names Anthropic-on-Vertex and nothing else — but see the amendment below |
 | the resolved base URL is an `aiplatform.googleapis.com` host | the host is the deployment |
 
 This is a deliberate departure from ruling **L-7**, which forbids ambient GCP
@@ -105,6 +105,34 @@ this deployment. `GOOGLE_CLOUD_PROJECT` keeps L-7's treatment here too: it can
 `CLAUDE_CODE_USE_VERTEX=0` must not select it. `Env.Has` is presence, and a
 flag variable's whole grammar is its value, so the check is truthiness
 (`0`/`false`/`no`/`off` are off).
+
+**Amended 2026-09-10** — see `docs/errata/01_vertex_deployment_selection.md`.
+The table above was implemented as a disjunction, and that was wrong in two
+ways the field found within the day. These variables are not ambient, as L-12
+says, but they are *sticky*: the decision to run on Vertex is made once and
+unmade once, and `ANTHROPIC_VERTEX_PROJECT_ID` left behind by an incomplete
+unmaking kept routing every request to Google — where the Anthropic key is
+correctly withheld and ADC has nothing to replace it, so the run dies on a
+Google 401 that names none of this. And reading the flag for truth only stops
+the *flag* from selecting the deployment: with the other variables set there
+was no way to spell "not Vertex" at all. So the signals are now **ranked**:
+
+- `Options.VertexProject`, a truthy `CLAUDE_CODE_USE_VERTEX`, and a base URL
+  that *is* a Vertex host each select the deployment outright.
+- `CLAUDE_CODE_USE_VERTEX` read as false is an explicit **off**, and vetoes
+  every remaining environment signal.
+- `ANTHROPIC_VERTEX_PROJECT_ID` alone selects it only when the environment
+  carries no `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` /
+  `ANTHROPIC_OAUTH_TOKEN`. A project is coordinates; a key is a decision, and
+  it is one this path cannot use anyway.
+
+A real Vertex box has no Anthropic key — that is the deployment's premise and
+the reason REQ-AUTH-04's ambient state exists — so the rank-3 rule costs it
+nothing.
+
+A 401 or 403 from this deployment also now carries the deployment, its
+coordinates, the setting that selected it, and both ways back to the direct
+API, because the Google body carries none of that.
 
 A selected deployment with no resolvable project is an **error naming the
 missing project**, not a silent fallback to `/v1/messages` — which would be a

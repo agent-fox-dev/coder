@@ -152,10 +152,10 @@ export CLOUD_ML_REGION=us-east5            # optional; default `global`
 
 | Variable | Does |
 |---|---|
-| `CLAUDE_CODE_USE_VERTEX` | selects the deployment. Read for *truth*, not presence: `=0` is off |
-| `ANTHROPIC_VERTEX_PROJECT_ID` | the GCP project; also selects the deployment on its own |
+| `CLAUDE_CODE_USE_VERTEX` | selects the deployment. Read for *truth*, not presence: `=0` is an explicit **off** that vetoes every other environment signal |
+| `ANTHROPIC_VERTEX_PROJECT_ID` | the GCP project. It selects the deployment on its own **only when no `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_OAUTH_TOKEN` is set** |
 | `CLOUD_ML_REGION` | the location; `GOOGLE_CLOUD_LOCATION` and `CLOUDSDK_COMPUTE_REGION` also work |
-| `ANTHROPIC_VERTEX_BASE_URL` | a proxy in front of Vertex |
+| `ANTHROPIC_VERTEX_BASE_URL` | a proxy in front of Vertex. Like the project variable, a Vertex host here selects the deployment only when no Anthropic-direct credential is set |
 
 `GOOGLE_CLOUD_PROJECT` and `CLOUDSDK_CORE_PROJECT` may *supply* the project
 once something else has selected the deployment; like the Gemini case above,
@@ -163,6 +163,16 @@ they never select it. `Options.VertexProject` / `Options.VertexLocation` are
 the in-code equivalents, and a Vertex base URL selects the deployment too. A
 selected deployment with no project anywhere is an error naming the project,
 not a request sent to `api.anthropic.com` with a Vertex path.
+
+**Going back to the direct API** is `unset CLAUDE_CODE_USE_VERTEX` *and*
+`unset ANTHROPIC_VERTEX_PROJECT_ID` — or, if the project variable is set by
+something you do not control, `export CLAUDE_CODE_USE_VERTEX=0`, which turns
+the deployment off outright. Exporting an `ANTHROPIC_API_KEY` is enough on its
+own when the project variable is the only thing left over: a key that only the
+direct deployment can use outranks a project that only names coordinates. If a
+request does reach Vertex without a credential, the 401 says so — it names the
+project, the setting that selected the deployment, and both ways out, because
+Google's own body names none of them.
 
 Vertex authenticates with a Google OAuth access token, and this module has no
 dependencies to mint one with. Three ways, none of which adds one:
