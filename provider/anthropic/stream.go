@@ -35,11 +35,22 @@ const BetaCompaction = "compact-2026-01-12"
 // sending either under the other's header is a 401 whose body says nothing
 // about which variable was picked. This is precisely why REQ-AUTH-03 rejects a
 // single `<VENDOR>_API_KEY` convention.
+//
+// The names are constants because the deployment switch reads the same three
+// (directCredential): a credential only the direct deployment can use is what
+// outranks a leftover ANTHROPIC_VERTEX_PROJECT_ID, and a second copy of the
+// list is a second place to forget a row.
+const (
+	AuthTokenVar  = "ANTHROPIC_AUTH_TOKEN"
+	OAuthTokenVar = "ANTHROPIC_OAUTH_TOKEN"
+	APIKeyVar     = "ANTHROPIC_API_KEY"
+)
+
 var VendorAuth = provider.VendorAuth{
 	Vars: []provider.EnvVar{
-		{Name: "ANTHROPIC_AUTH_TOKEN", Scheme: provider.SchemeBearer},
-		{Name: "ANTHROPIC_OAUTH_TOKEN", Scheme: provider.SchemeBearer},
-		{Name: "ANTHROPIC_API_KEY", Scheme: provider.SchemeAPIKey},
+		{Name: AuthTokenVar, Scheme: provider.SchemeBearer},
+		{Name: OAuthTokenVar, Scheme: provider.SchemeBearer},
+		{Name: APIKeyVar, Scheme: provider.SchemeAPIKey},
 		// A base URL is configuration, not a credential (REQ-AUTH-03's
 		// "discovery and retrieval are distinct operations"). Sending a proxy
 		// URL as a bearer token is nonsense; its presence still means the
@@ -287,7 +298,7 @@ func (c *client) run(ctx context.Context, s *core.EventStream, m *core.Model, re
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg := statusError(resp)
+		msg := statusError(resp) + vertexAuthNote(resp.StatusCode, vx, env)
 		d.fail(msg, errors.New(msg))
 		return
 	}
@@ -329,6 +340,34 @@ func transportError(caller, req context.Context, err error) string {
 // matches bare "429"/"500"/"503" strings, so a message that renders only the
 // provider's prose loses the retry for a gateway that returns a 503 with an
 // empty body.
+// vertexAuthNote explains an authentication failure from the Vertex
+// deployment, and it is the second half of the same defect the ranked
+// selection in VertexSelectedBy fixes.
+//
+// Vertex answers a missing credential with a Google JSON blob — "Request is
+// missing required authentication credential", CREDENTIALS_MISSING, a link to
+// the Google sign-in console — that names neither Claude, nor the deployment,
+// nor the setting that routed the request to Google. Rendered under this
+// package's "anthropic:" prefix it reads as an Anthropic outage on a machine
+// whose ANTHROPIC_API_KEY is perfectly good, and nothing in it suggests
+// looking at ANTHROPIC_VERTEX_PROJECT_ID.
+func vertexAuthNote(status int, vx Vertex, env provider.Env) string {
+	if !vx.On() || (status != http.StatusUnauthorized && status != http.StatusForbidden) {
+		return ""
+	}
+	note := " [Claude on Vertex AI: project " + vx.Project + ", location " + vx.Location +
+		", selected by " + vx.SelectedBy + ". This deployment authenticates with " +
+		"Google Application Default Credentials, not " + APIKeyVar
+	if directCredential(env) {
+		// Saying so is the whole point: the key IS set, it was deliberately
+		// withheld from a Google endpoint, and without this line the operator
+		// reads the 401 as the key being rejected.
+		note += " — which is set, and is never sent to a Google endpoint"
+	}
+	return note + ". To use the Anthropic API directly instead, unset " +
+		VertexProjectVar + " or set " + VertexEnableVar + "=0.]"
+}
+
 func statusError(resp *http.Response) string {
 	return provider.StatusError("anthropic", resp, func(body []byte) string {
 		var we wireError

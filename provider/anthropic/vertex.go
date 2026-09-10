@@ -70,6 +70,13 @@ const (
 type Vertex struct {
 	Project  string
 	Location string
+	// SelectedBy names the configuration that chose this deployment. It is
+	// diagnostic only, and it exists because the failure it explains is
+	// otherwise unreadable: Vertex answers a missing credential with a Google
+	// JSON blob naming neither Claude nor the variable that routed the request
+	// there, so an operator holding a working ANTHROPIC_API_KEY sees an
+	// "anthropic" 401 and no way to tell which setting sent it to Google.
+	SelectedBy string
 }
 
 // On reports whether the Vertex path shape applies. A project is the whole
@@ -120,27 +127,116 @@ func (v Vertex) Path(m *core.Model, stream bool) string {
 // function because it is the shape every non-Vertex caller wants.
 func Path(m *core.Model, stream bool) string { return Vertex{}.Path(m, stream) }
 
-// VertexSelected reports whether the ENVIRONMENT names this deployment.
+// VertexSelectedBy names the configuration that selects the Vertex deployment,
+// or "" when the Anthropic-direct deployment applies.
 //
-// It is exported because VendorAuth.Ambient is the pre-flight answer to the
-// reported bug — a Vertex deployment has no readable key and must not resolve
+// Ruling L-12 (amended, see docs/errata/01_vertex_deployment_selection.md):
+// unlike Gemini's L-7, an environment variable MAY select this deployment,
+// because these variables are not ambient. But they are STICKY — an operator
+// who tries Vertex and goes back sets the flag once and unsets it once, and
+// ANTHROPIC_VERTEX_PROJECT_ID outlives the decision. So the signals are ranked
+// rather than OR-ed:
+//
+//   - Options.VertexProject, a truthy CLAUDE_CODE_USE_VERTEX, and a Vertex host
+//     reached through a base URL the DIRECT deployment would also use each
+//     select it outright. The first two are a deliberate act; the third is the
+//     endpoint the request is going to, and /v1/messages sent there is a 404 no
+//     matter what anything else says.
+//   - CLAUDE_CODE_USE_VERTEX read as false is an explicit OFF, and vetoes
+//     every remaining environment signal. Without the veto there is no way to
+//     spell "not Vertex" on a machine that carries the other variables.
+//   - ANTHROPIC_VERTEX_PROJECT_ID, and a Vertex host reached only through
+//     ANTHROPIC_VERTEX_BASE_URL, select it only when the environment carries no
+//     Anthropic-direct credential. Both are Vertex-ONLY variables the direct
+//     deployment never reads: coordinates rather than a decision. An
+//     ANTHROPIC_API_KEY in the same environment is unambiguous, is useless on
+//     this path (vertexAuth drops it), and outranks them.
+//
+// GOOGLE_CLOUD_PROJECT, set on every GCE and Cloud Run box, is not consulted
+// here at all and can only supply a project once something else has selected
+// the deployment.
+//
+// It is exported because VendorAuth.Ambient is the pre-flight answer to
+// REQ-AUTH-04 — a Vertex deployment has no readable key and must not resolve
 // to "no credential" — and an embedder writing its own pre-flight needs the
 // same predicate.
-//
-// Ruling L-12: unlike Gemini's L-7, an environment variable MAY select this
-// deployment, because these variables are not ambient. CLAUDE_CODE_USE_VERTEX
-// and ANTHROPIC_VERTEX_PROJECT_ID are set by nothing except an operator
-// choosing Claude on Vertex; GOOGLE_CLOUD_PROJECT, which is set on every GCE
-// and Cloud Run box, is NOT consulted here and can only supply a project once
-// something else has selected the deployment.
-func VertexSelected(env provider.Env) bool {
+func VertexSelectedBy(base, project string, env provider.Env) string {
+	if project != "" {
+		return "Options.VertexProject"
+	}
 	if envOn(env.Get(VertexEnableVar)) {
-		return true
+		return VertexEnableVar
 	}
-	if env.Has(VertexProjectVar) {
-		return true
+	if isVertexHost(base) && !fromVertexProxy(base, env) {
+		// Deliberately not naming a variable: this host may equally have come
+		// from the catalog row or Options.BaseURL, and naming the wrong one
+		// sends the reader to a setting that is not there.
+		return "a Vertex host in the base URL"
 	}
-	return isVertexHost(env.Get(VertexBaseURLVar)) || isVertexHost(env.Get(BaseURLVar))
+	if vertexOff(env) {
+		return ""
+	}
+	if !directCredential(env) {
+		if env.Has(VertexProjectVar) {
+			return VertexProjectVar
+		}
+		if isVertexHost(base) {
+			return VertexBaseURLVar
+		}
+	}
+	return ""
+}
+
+// fromVertexProxy reports whether the resolved base URL is the value of
+// ANTHROPIC_VERTEX_BASE_URL, which deploymentBase applies last.
+//
+// That variable is Vertex-only — the direct deployment never reads it, so when
+// the deployment is off it names no endpoint at all — which makes it a sticky
+// leftover of exactly the kind ANTHROPIC_VERTEX_PROJECT_ID is, and it is ranked
+// with it. A Vertex host reached through ANTHROPIC_BASE_URL, Options.BaseURL or
+// the catalog row is the endpoint the request is actually going to, and stays a
+// signal nothing overrides.
+func fromVertexProxy(base string, env provider.Env) bool {
+	u := env.Get(VertexBaseURLVar)
+	return u != "" && strings.TrimRight(u, "/") == strings.TrimRight(base, "/")
+}
+
+// VertexSelected reports whether the ENVIRONMENT names this deployment. It is
+// VendorAuth.Ambient, which runs before any model or option is in hand, so the
+// base URL it can see is the one the environment names.
+func VertexSelected(env provider.Env) bool {
+	return VertexSelectedBy(envBase(env), "", env) != ""
+}
+
+// envBase is the base URL the ENVIRONMENT names, in deploymentBase's order.
+func envBase(env provider.Env) string {
+	if u := env.Get(VertexBaseURLVar); u != "" {
+		return u
+	}
+	return env.Get(BaseURLVar)
+}
+
+// vertexOff reports an EXPLICIT off: the flag is present and reads as false.
+//
+// This is not the negation of envOn. An absent flag is not a decision — it
+// leaves the remaining signals to speak — while `CLAUDE_CODE_USE_VERTEX=0` is
+// an operator saying no, and it has to beat a leftover project variable or it
+// says nothing at all.
+func vertexOff(env provider.Env) bool {
+	v := env.Get(VertexEnableVar)
+	return v != "" && !envOn(v)
+}
+
+// directCredential reports whether the environment carries a credential that
+// only the Anthropic-direct deployment can use.
+//
+// It reads the same variables as VendorAuth.Vars, minus the discovery-only
+// rows: a base URL is configuration, not a credential, and a Vertex proxy URL
+// is not evidence of a direct deployment. The names are shared constants
+// rather than a second copy of the table, because reading VendorAuth from here
+// would be an initialization cycle — the table's Ambient field is this file.
+func directCredential(env provider.Env) bool {
+	return env.Has(AuthTokenVar) || env.Has(OAuthTokenVar) || env.Has(APIKeyVar)
 }
 
 // ResolveVertex decides the deployment from configuration alone.
@@ -154,7 +250,8 @@ func VertexSelected(env provider.Env) bool {
 // several layers down, and the message that produces names neither Vertex nor
 // the missing project.
 func ResolveVertex(base, project, location string, env provider.Env) (Vertex, error) {
-	if project == "" && !isVertexHost(base) && !VertexSelected(env) {
+	by := VertexSelectedBy(base, project, env)
+	if by == "" {
 		return Vertex{}, nil
 	}
 	if project == "" {
@@ -164,7 +261,8 @@ func ResolveVertex(base, project, location string, env provider.Env) (Vertex, er
 	}
 	if project == "" {
 		return Vertex{}, errors.New("anthropic: the Vertex AI deployment needs a project: " +
-			"set Options.VertexProject or " + VertexProjectVar)
+			"set Options.VertexProject or " + VertexProjectVar +
+			" (this deployment was selected by " + by + ")")
 	}
 	if location == "" {
 		location = firstEnv(env, VertexRegionVar, "GOOGLE_CLOUD_LOCATION", "CLOUDSDK_COMPUTE_REGION")
@@ -178,7 +276,7 @@ func ResolveVertex(base, project, location string, env provider.Env) (Vertex, er
 	if location == "" {
 		location = VertexGlobalLocation
 	}
-	return Vertex{Project: project, Location: location}, nil
+	return Vertex{Project: project, Location: location, SelectedBy: by}, nil
 }
 
 // deploymentBase is the base URL the deployment CHECK sees. It mirrors
