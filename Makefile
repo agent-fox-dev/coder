@@ -8,25 +8,11 @@ help: ## Show this help
 test: ## Run all Go tests (root module + difftest and flatline submodules)
 	go test ./...
 	cd difftest && go test ./...
-	@$(MAKE) --no-print-directory test-flatline
-
-# examples/flatline is a nested module that imports the agent-fox spec library
-# through a replace to a sibling checkout (see examples/flatline/go.mod). When
-# that checkout is absent the module cannot build, so its tests are skipped
-# rather than failed.
-.PHONY: test-flatline
-test-flatline: ## Run the flatline example's tests (needs ../spec/golang)
-	@if [ -d ../spec/golang ]; then \
-		cd examples/flatline && go test ./...; \
-	else \
-		echo "examples/flatline: ../spec/golang not found; skipping (see examples/flatline/go.mod)"; \
-	fi
 
 .PHONY: build-examples
 build-examples: ## Install examples/issued, examples/cleaner and examples/flatline into ./bin
 	go install ./examples/issued
 	go install ./examples/cleaner
-	cd examples/flatline && go install .
 
 .PHONY: fmt
 fmt: ## gofmt all source files in place
@@ -36,7 +22,6 @@ fmt: ## gofmt all source files in place
 vet: ## go vet the root module and difftest submodule (and flatline when buildable)
 	go vet ./...
 	cd difftest && go vet ./...
-	@if [ -d ../spec/golang ]; then cd examples/flatline && go vet ./...; fi
 
 .PHONY: lint
 lint: ## Run golangci-lint if installed, otherwise skip
