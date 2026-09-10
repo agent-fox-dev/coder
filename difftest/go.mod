@@ -7,7 +7,7 @@
 // boundary rather than a build tag.
 module github.com/agentfox/agentkit-go/difftest
 
-go 1.24
+go 1.26.5
 
 require github.com/agentfox/agentkit-go v0.0.0
 
