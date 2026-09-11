@@ -6,6 +6,10 @@
 /streaming
 /codingagent
 /session
+# The line above also matches the session/ package directory for files git
+# does not yet track; this re-includes the directory so a new file there is
+# not silently ignored.
+!/session/
 /delegation
 /flatline
 /examples/flatline/flatline
