@@ -1,4 +1,4 @@
-# AgentKit
+# A agentkit-go
 
 A dependency-free Go agent SDK. The loop, the tool system and the provider
 abstraction are ordinary Go you can read and step through — nothing is hidden
