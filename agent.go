@@ -4,9 +4,13 @@
 // can read and step through. Nothing is hidden inside a subprocess or a graph
 // engine.
 //
-// The canonical vocabulary lives in the core package and is re-exported here
-// by type alias, so agentkit.Tool and core.Tool are the same type and no
-// conversion exists anywhere.
+// The canonical vocabulary — messages, content blocks, events, Tool,
+// AgentConfig and every interface seam — lives in the core package and is
+// used directly; this package adds nothing to it. What lives here is the
+// Agent: its constructors, the loop, the tool batch executor and provider
+// registration. Stop policies, middleware, compaction, the prompt assembler,
+// the execute guard and delegation are each their own package beneath this
+// one.
 package agentkit
 
 import (
@@ -19,6 +23,7 @@ import (
 	"time"
 
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/session"
 )
 
@@ -90,7 +95,7 @@ type Agent struct {
 	// meter is REQ-CACHE-08's session aggregate. It is never nil, so every
 	// call site is unconditional and the metered and unmetered paths cannot
 	// drift apart — the same reasoning that makes rec never nil.
-	meter *CacheMeter
+	meter *middleware.CacheMeter
 }
 
 // NewAgent constructs an Agent. Credentials, catalog lookup and provider
@@ -125,7 +130,7 @@ func NewAgentWithHistory(cfg core.AgentConfig, h *core.ConversationHistory) (*Ag
 }
 
 func newAgent(cfg core.AgentConfig, h *core.ConversationHistory) *Agent {
-	a := &Agent{producerID: newID("prod"), cfg: cfg, history: h, meter: NewCacheMeter()}
+	a := &Agent{producerID: newID("prod"), cfg: cfg, history: h, meter: middleware.NewCacheMeter()}
 	a.rec = session.NewRecorder(cfg.SessionStore, h, cfg.OnPersistError)
 	a.tools = append(a.tools, cfg.ToolPolicy.CustomTools...)
 	return a
@@ -166,7 +171,7 @@ func (a *Agent) RegisterTool(t core.Tool) error {
 
 // SetPromptBlocks replaces AgentConfig.PromptBlocks: the extra system-prompt
 // sections appended after the built-in ones, which is where the skills and
-// project-context block goes (SkillBlocks builds it).
+// project-context block goes (prompt.SkillBlocks builds it).
 //
 // It exists because the two halves of the skills wiring sat on opposite sides
 // of the constructor. The assembled block is a field on core.AgentConfig, so
@@ -177,10 +182,10 @@ func (a *Agent) RegisterTool(t core.Tool) error {
 // AuditSkills — which is the exact call LoadSkills exists to make
 // unforgettable. Now there is one order that does both:
 //
-//	cfg := agentkit.SkillsConfigFor(agentCfg, workDir, skills.BuiltinDir())
+//	cfg := skills.ConfigFor(agentCfg, workDir, skills.BuiltinDir())
 //	sel := agent.LoadSkills(skills.Discover(cfg), archetype, task, cfg)
 //	files, _ := skills.DiscoverContext(cfg)
-//	err := agent.SetPromptBlocks(agentkit.SkillBlocks(sel, files, agent.Tools()))
+//	err := agent.SetPromptBlocks(prompt.SkillBlocks(sel, files, agent.Tools()))
 //
 // Like RegisterTool it returns ErrBusy while a run is in flight, for the same
 // reason: the assembled prompt is the provider's cached prefix (REQ-CACHE-06),
@@ -221,7 +226,7 @@ func (a *Agent) PromptBlocks() []string {
 func (a *Agent) Tools() []core.Tool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return ResolveToolPolicy(a.tools, a.cfg.ToolPolicy)
+	return a.cfg.ToolPolicy.Resolve(a.tools)
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -290,7 +295,7 @@ func (a *Agent) Snapshot(ctx context.Context) (core.SessionSnapshot, error) {
 	a.mu.Lock()
 	cfg, usage := a.cfg, a.usage
 	names := make([]string, 0, len(a.tools))
-	for _, t := range ResolveToolPolicy(a.tools, cfg.ToolPolicy) {
+	for _, t := range cfg.ToolPolicy.Resolve(a.tools) {
 		names = append(names, t.Name)
 	}
 	idle := a.Phase() == core.PhaseIdle && a.holds == 0 && !a.running
@@ -340,18 +345,18 @@ func (a *Agent) History() *core.ConversationHistory { return a.history }
 // Level 1 figures come from what the PROVIDER reported, never from a
 // re-estimate: REQ-GO-15 forbids treating an estimate as a measurement, and a
 // savings number computed from estimated tokens is a guess wearing a dollar
-// sign. Level 2 hit and miss counts require CachingMiddleware to have been
+// sign. Level 2 hit and miss counts require middleware.Caching to have been
 // registered with this agent's Meter — see AgentConfig.Middleware and
 // CacheOptions.Meter.
-func (a *Agent) CacheStats() CacheStats { return a.meter.Stats() }
+func (a *Agent) CacheStats() middleware.CacheStats { return a.meter.Stats() }
 
-// Meter exposes the agent's cache meter so CachingMiddleware can be wired to
+// Meter exposes the agent's cache meter so middleware.Caching can be wired to
 // it at construction:
 //
 //	a, _ := agentkit.NewAgent(cfg)
 //	cfg.Middleware = append(cfg.Middleware,
-//	    agentkit.CachingMiddleware(agentkit.CacheOptions{Meter: a.Meter()}))
-func (a *Agent) Meter() *CacheMeter { return a.meter }
+//	    middleware.Caching(middleware.CacheOptions{Meter: a.Meter()}))
+func (a *Agent) Meter() *middleware.CacheMeter { return a.meter }
 
 // Usage returns cumulative usage for the agent's lifetime.
 func (a *Agent) Usage() core.Usage {
@@ -506,4 +511,37 @@ func (a *Agent) wasAborted() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.aborted
+}
+
+// Config returns a copy of the agent's current configuration, read under the
+// lock. It is what a caller building a DERIVED agent — a delegation child
+// that inherits the parent's providers, credentials, plugins and tracer —
+// reads from; Snapshot's ConfigView is the narrower, serializable form.
+//
+// It is a copy of the struct, not a deep copy: the registries and slices it
+// carries are shared with the agent. Mutating them through the copy is the
+// caller's bug, exactly as it would be for the config passed to NewAgent.
+func (a *Agent) Config() core.AgentConfig {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg
+}
+
+// SetStopPolicy replaces AgentConfig.StopPolicy. Like RegisterTool and
+// SetPromptBlocks it returns ErrBusy while a run is in flight: the policy is
+// consulted at every turn boundary of the run that started with it, and
+// swapping it underneath that run would make the stop reason describe a
+// policy the caller of Run never saw.
+//
+// It exists so a delegation tool can graft a budget onto a child a factory
+// built without one (REQ-MULTI-03); an embedder constructing its own agent
+// puts the policy on the config instead.
+func (a *Agent) SetStopPolicy(p core.StopPolicy) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return core.ErrBusy
+	}
+	a.cfg.StopPolicy = p
+	return nil
 }

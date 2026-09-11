@@ -1,8 +1,6 @@
-package agentkit
+package core
 
-import "github.com/agentfox/agentkit-go/core"
-
-// ResolveToolPolicy is REQ-TOOL-10's five-field resolution. It applies
+// Resolve is REQ-TOOL-10's five-field resolution over a registered set. It applies
 // UNIFORMLY to built-in and caller-supplied tools — that uniformity is the
 // requirement, and it is what makes four otherwise surprising consequences
 // true. Each is normative and each has a test:
@@ -19,18 +17,18 @@ import "github.com/agentfox/agentkit-go/core"
 // This is what REQ-MULTI-05's per-agent "tool allowlist" resolves to, and it
 // is what lets a subagent be scoped to read-and-search-only per delegation
 // without rebuilding the tool set by hand.
-func ResolveToolPolicy(registered []core.Tool, p core.ToolPolicy) []core.Tool {
+func (p ToolPolicy) Resolve(registered []Tool) []Tool {
 	// Tools, when non-nil INCLUDING EMPTY, is used verbatim and bypasses
 	// everything below. Non-nil-but-empty is deliberately distinct from nil:
 	// "no tools, and I mean it" must be expressible.
 	if p.Tools != nil {
-		return append([]core.Tool(nil), p.Tools...)
+		return append([]Tool(nil), p.Tools...)
 	}
 
-	set := make([]core.Tool, 0, len(registered)+len(p.CustomTools))
+	set := make([]Tool, 0, len(registered)+len(p.CustomTools))
 	seen := make(map[string]int, len(registered)+len(p.CustomTools))
 
-	add := func(t core.Tool) {
+	add := func(t Tool) {
 		if i, ok := seen[t.Name]; ok {
 			// A custom tool overrides a built-in of the same name, in place,
 			// so overriding does not reorder the tool list — the tool list is
@@ -42,9 +40,9 @@ func ResolveToolPolicy(registered []core.Tool, p core.ToolPolicy) []core.Tool {
 		set = append(set, t)
 	}
 
-	if p.NoTools != core.NoToolsAll {
+	if p.NoTools != NoToolsAll {
 		for _, t := range registered {
-			if t.Builtin && p.NoTools == core.NoToolsBuiltin {
+			if t.Builtin && p.NoTools == NoToolsBuiltin {
 				continue
 			}
 			add(t)
@@ -57,7 +55,7 @@ func ResolveToolPolicy(registered []core.Tool, p core.ToolPolicy) []core.Tool {
 	// NoTools "all" sets an empty allowlist: nothing survives, custom
 	// included. Returning here rather than falling through keeps that true
 	// even if ToolNames names something.
-	if p.NoTools == core.NoToolsAll {
+	if p.NoTools == NoToolsAll {
 		return nil
 	}
 
@@ -68,7 +66,7 @@ func ResolveToolPolicy(registered []core.Tool, p core.ToolPolicy) []core.Tool {
 		for _, n := range p.ToolNames {
 			allow[n] = true
 		}
-		set = filter(set, func(t core.Tool) bool { return allow[t.Name] })
+		set = filterTools(set, func(t Tool) bool { return allow[t.Name] })
 	}
 
 	// ExcludeTools is a denylist applied AFTER the allowlist, and applies to
@@ -78,13 +76,13 @@ func ResolveToolPolicy(registered []core.Tool, p core.ToolPolicy) []core.Tool {
 		for _, n := range p.ExcludeTools {
 			deny[n] = true
 		}
-		set = filter(set, func(t core.Tool) bool { return !deny[t.Name] })
+		set = filterTools(set, func(t Tool) bool { return !deny[t.Name] })
 	}
 
 	return set
 }
 
-func filter(ts []core.Tool, keep func(core.Tool) bool) []core.Tool {
+func filterTools(ts []Tool, keep func(Tool) bool) []Tool {
 	out := ts[:0]
 	for _, t := range ts {
 		if keep(t) {

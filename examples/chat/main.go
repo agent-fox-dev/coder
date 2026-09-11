@@ -28,6 +28,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/ollama"
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 func main() {
@@ -68,9 +69,9 @@ func run() error {
 	// 3. A stop policy is required in practice, not optional: without one a
 	//    tool-using agent has no upper bound. Even here, where no tool is
 	//    registered, it is the honest default.
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(10),
-		agentkit.StopOverBudget(1.00), // dollars, cumulative for the run
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(10),
+		stop.OverBudget(1.00), // dollars, cumulative for the run
 	)
 	cfg.SystemPrompt = "You are concise. Answer in plain prose, no preamble."
 

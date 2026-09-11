@@ -109,7 +109,7 @@ run whose resolved tool set carries a shell tool and no interceptor
 shell. `assertReadOnly` catches the same mistake one layer earlier with a
 message that names the tool.
 
-The comment on that guard in [`policy.go`](../../policy.go) describes this
+The comment on that guard in [`guard/guard.go`](../../guard/guard.go) describes this
 program exactly:
 
 > REQ-SEC-03 replaced the command allowlist with a per-call interceptor […]
@@ -188,11 +188,11 @@ is text a stranger wrote.
 
 `file_issue` sets `ToolResult.Terminate`, so `RunStopToolTerminate` is what
 "there is a diagnosis" means. A run that hits the turn limit or the budget
-returns an error naming the stop reason, and no issue. `StopAny(StopAfterTurns(100),
-StopOverBudget(2.00))` bounds a read loop that wanders.
+returns an error naming the stop reason, and no issue. `stop.Any(stop.AfterTurns(100),
+stop.OverBudget(2.00))` bounds a read loop that wanders.
 
 A long read loop also fills the context window. `NewTriager` installs
-`agentkit.NewContextTransform` with `SummarizationCompaction` at 60% of the
+`compaction.NewContextTransform` with `compaction.Summarization` at 60% of the
 window (`installCompaction` in [`triage.go`](triage.go)), so the transcript is
 summarized in place rather than the run ending on a context-length error
 before `file_issue` is ever called.

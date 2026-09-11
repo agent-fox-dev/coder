@@ -23,6 +23,8 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/session"
+	"github.com/agentfox/agentkit-go/stop"
+	"github.com/agentfox/agentkit-go/subagent"
 )
 
 func main() {
@@ -341,9 +343,9 @@ func newAgent(p *faux.Provider) *agentkit.Agent {
 	cfg := core.AgentConfig{
 		Model:        faux.Model(),
 		SystemPrompt: "You are a helpful assistant.",
-		StopPolicy: agentkit.StopAny(
-			agentkit.StopAfterTurns(8),
-			agentkit.StopOverBudget(0.50),
+		StopPolicy: stop.Any(
+			stop.AfterTurns(8),
+			stop.OverBudget(0.50),
 		),
 		ParallelTools: true,
 		Providers:     core.ProviderRegistry{faux.API: p.APIProvider()},
@@ -376,7 +378,7 @@ func demoKillAndResume() {
 	path := filepath.Join(dir, "session.jsonl")
 
 	// ---- Process 1.
-	store1, _, err := agentkit.OpenSession(path, session.Options{Durability: session.DurabilityPerEntry})
+	store1, _, err := session.OpenOrCreate(path, session.Options{Durability: session.DurabilityPerEntry})
 	if err != nil {
 		fail(err)
 	}
@@ -393,7 +395,7 @@ func demoKillAndResume() {
 	fmt.Print("  ...process 1 exits.\n\n")
 
 	// ---- Process 2 reopens the same path.
-	store2, resume, err := agentkit.OpenSession(path, session.Options{Durability: session.DurabilityPerEntry})
+	store2, resume, err := session.OpenOrCreate(path, session.Options{Durability: session.DurabilityPerEntry})
 	if err != nil {
 		fail(err)
 	}
@@ -430,7 +432,7 @@ func demoKillAndResume() {
 
 func demoDelegation() {
 	rule("7. Delegation hands out a FRESH child per call (REQ-MULTI-02/04)")
-	fmt.Println("SubagentTool takes a FACTORY, not an agent. A single shared child looks")
+	fmt.Println("subagent.Tool takes a FACTORY, not an agent. A single shared child looks")
 	fmt.Println("correct and fails under exactly the condition delegation exists for: two")
 	fmt.Print("parallel calls, where the second finds the run slot taken.\n\n")
 
@@ -465,8 +467,8 @@ func demoDelegation() {
 		}
 		return child, nil
 	}
-	if err := a.RegisterTool(agentkit.SubagentTool(a, factory,
-		agentkit.SubagentOptions{Name: "researcher"})); err != nil {
+	if err := a.RegisterTool(subagent.Tool(a, factory,
+		subagent.Options{Name: "researcher"})); err != nil {
 		fail(err)
 	}
 
@@ -492,7 +494,7 @@ func baseConfig(p *faux.Provider) core.AgentConfig {
 	return core.AgentConfig{
 		Model:        faux.Model(),
 		SystemPrompt: "You are a helpful assistant.",
-		StopPolicy:   agentkit.StopAfterTurns(8),
+		StopPolicy:   stop.AfterTurns(8),
 		Providers:    core.ProviderRegistry{faux.API: p.APIProvider()},
 	}
 }

@@ -1,26 +1,39 @@
-package agentkit
+// Package compaction is REQ-GO-12 through REQ-GO-16: the context transform the
+// loop applies before every model call, the four strategies that decide
+// whether and where to cut, the summarizers that produce a checkpoint, and the
+// anchored token estimate (REQ-GO-15) that drives both the trigger and the
+// REQ-CAT-04 clamp.
+//
+// Compaction is a context transform applied inside the loop, never a
+// middleware: a compaction middleware's own summarization call would re-enter
+// the chain, be fingerprinted by the dedup cache and be charged against the
+// budget gate as though it were a conversational turn. NewContextTransform
+// builds the closure installed as core.AgentConfig.TransformContext.
+package compaction
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
 	"github.com/agentfox/agentkit-go/core"
 )
 
-// CompactionSummaryPrefix wraps a summary when it is rendered into the model
+// SummaryPrefix wraps a summary when it is rendered into the model
 // context. It is MODEL-VISIBLE format contract and is pinned by a golden test:
 // changing it changes what every compacted session says to the model.
-const CompactionSummaryPrefix = "[Earlier conversation, summarized]\n\n"
+const SummaryPrefix = "[Earlier conversation, summarized]\n\n"
 
-// CompactionSplitSeparator joins the two halves of a SPLIT summary
+// SplitSeparator joins the two halves of a SPLIT summary
 // (REQ-GO-14): the summary of the completed turns, then the summary of the
 // turn the cut landed inside. Model-visible format contract, pinned by the
-// same golden as CompactionSummaryPrefix.
-const CompactionSplitSeparator = "\n\n[The turn in progress at the cut, summarized separately]\n\n"
+// same golden as SummaryPrefix.
+const SplitSeparator = "\n\n[The turn in progress at the cut, summarized separately]\n\n"
 
-// CompactionStrategy decides whether and where to compact.
-type CompactionStrategy interface {
+// Strategy decides whether and where to compact.
+type Strategy interface {
 	// ShouldCompact reports whether the view needs compacting, given the
 	// anchored estimate and the model's context window.
 	ShouldCompact(estTokens, contextWindow int) bool
@@ -42,7 +55,7 @@ const (
 	// strategies (ruling P-8).
 	//
 	// REQ-GO-14's "not a tool_result" is necessary but not sufficient: it
-	// permits a cut landing on an ASSISTANT message. SummarizationCompaction
+	// permits a cut landing on an ASSISTANT message. Summarization
 	// is fine there because it prepends a summary user message, but
 	// TurnWindow and TokenWindow have nothing to prepend, so they would
 	// produce a view starting on an assistant turn — which Anthropic rejects
@@ -53,21 +66,21 @@ const (
 
 // ---------------------------------------------------------------- strategies
 
-// NoCompaction never compacts.
-type NoCompaction struct{}
+// None never compacts.
+type None struct{}
 
-func (NoCompaction) ShouldCompact(int, int) bool     { return false }
-func (NoCompaction) CutIndex(core.Messages, int) int { return 0 }
-func (NoCompaction) CutPolicy() CutPolicy            { return CutNotToolResult }
+func (None) ShouldCompact(int, int) bool     { return false }
+func (None) CutIndex(core.Messages, int) int { return 0 }
+func (None) CutPolicy() CutPolicy            { return CutNotToolResult }
 
-// TurnWindowCompaction keeps the most recent MaxTurns user turns.
-type TurnWindowCompaction struct{ MaxTurns int }
+// TurnWindow keeps the most recent MaxTurns user turns.
+type TurnWindow struct{ MaxTurns int }
 
-func (t TurnWindowCompaction) CutPolicy() CutPolicy { return CutUserOnly }
+func (t TurnWindow) CutPolicy() CutPolicy { return CutUserOnly }
 
-func (t TurnWindowCompaction) ShouldCompact(est, window int) bool { return true }
+func (t TurnWindow) ShouldCompact(est, window int) bool { return true }
 
-func (t TurnWindowCompaction) CutIndex(msgs core.Messages, _ int) int {
+func (t TurnWindow) CutIndex(msgs core.Messages, _ int) int {
 	seen := 0
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if _, ok := msgs[i].(core.UserMessage); ok {
@@ -80,31 +93,31 @@ func (t TurnWindowCompaction) CutIndex(msgs core.Messages, _ int) int {
 	return 0
 }
 
-// TokenWindowCompaction keeps the most recent KeepTokens' worth of messages.
-type TokenWindowCompaction struct{ KeepTokens int }
+// TokenWindow keeps the most recent KeepTokens' worth of messages.
+type TokenWindow struct{ KeepTokens int }
 
-func (t TokenWindowCompaction) CutPolicy() CutPolicy { return CutUserOnly }
+func (t TokenWindow) CutPolicy() CutPolicy { return CutUserOnly }
 
-func (t TokenWindowCompaction) ShouldCompact(est, window int) bool {
+func (t TokenWindow) ShouldCompact(est, window int) bool {
 	return est > t.KeepTokens
 }
 
-func (t TokenWindowCompaction) CutIndex(msgs core.Messages, _ int) int {
+func (t TokenWindow) CutIndex(msgs core.Messages, _ int) int {
 	return cutByTokens(msgs, t.KeepTokens, CutUserOnly)
 }
 
-// SummarizationCompaction replaces the summarized prefix with a model-written
+// Summarization replaces the summarized prefix with a model-written
 // summary.
-type SummarizationCompaction struct {
+type Summarization struct {
 	// ThresholdFraction of the context window at which compaction fires.
 	ThresholdFraction float64
 	// KeepTokens is the size of the tail kept verbatim.
 	KeepTokens int
 }
 
-func (s SummarizationCompaction) CutPolicy() CutPolicy { return CutNotToolResult }
+func (s Summarization) CutPolicy() CutPolicy { return CutNotToolResult }
 
-func (s SummarizationCompaction) ShouldCompact(est, window int) bool {
+func (s Summarization) ShouldCompact(est, window int) bool {
 	f := s.ThresholdFraction
 	if f <= 0 {
 		f = 0.8
@@ -115,7 +128,7 @@ func (s SummarizationCompaction) ShouldCompact(est, window int) bool {
 	return float64(est) > f*float64(window)
 }
 
-func (s SummarizationCompaction) CutIndex(msgs core.Messages, _ int) int {
+func (s Summarization) CutIndex(msgs core.Messages, _ int) int {
 	keep := s.KeepTokens
 	if keep <= 0 {
 		keep = 8000
@@ -186,7 +199,7 @@ func (e *ErrBadSummary) Error() string { return "agentkit: unusable summary: " +
 // It calls core.ProviderClient DIRECTLY and holds NO middleware chain. That is
 // structural, not a rule anyone has to remember: REQ-GO-12.3 requires the
 // summarization call to stay off the middleware path so it cannot re-enter
-// BudgetMiddleware, the retry layers' turn accounting, or the dedup cache as
+// middleware.Budget, the retry layers' turn accounting, or the dedup cache as
 // though it were a conversational turn. A summarizer that went back through
 // the loop would satisfy the requirement only by convention.
 //
@@ -207,14 +220,14 @@ func ModelSummarizer(p core.ProviderClient, m *core.Model, reserveTokens int) Su
 // ModelTurnSummarizer is the summarizer for the SPLIT half of a cut
 // (REQ-GO-14): the prefix of the turn the boundary landed inside, summarized
 // under a distinct prompt at half the token budget. Install it as
-// CompactionDeps.TurnSummarizer; when absent, the main summarizer is used for
+// Deps.TurnSummarizer; when absent, the main summarizer is used for
 // both halves and the distinct prompt and the half budget are lost.
 func ModelTurnSummarizer(p core.ProviderClient, m *core.Model, reserveTokens int) Summarizer {
 	return modelSummarizer(p, m, reserveTokens/2, true)
 }
 
 func modelSummarizer(p core.ProviderClient, m *core.Model, reserveTokens int, turnOnly bool) Summarizer {
-	sessionID := newID("summary")
+	sessionID := randomID("summary")
 	return func(ctx context.Context, prefix core.Messages, previous string) (string, error) {
 		system := "Summarize the conversation so far. Preserve decisions, file paths, " +
 			"identifiers, and anything the assistant committed to. Omit pleasantries."
@@ -262,7 +275,7 @@ const summaryContinuationNote = "[The earlier conversation is summarized in the 
 
 // summaryMaxTokens is REQ-GO-12.3's clamp: min(0.8 × reserve, model.MaxTokens),
 // with each unknown side deferring to the other and a floor of 1. With no
-// reserve stated the model's ceiling is further bounded by DefaultMaxTokens: a
+// reserve stated the model's ceiling is further bounded by core.DefaultMaxTokens: a
 // summary does not need a 128K output budget, and providers size rate-limit
 // reservations from max_tokens.
 func summaryMaxTokens(m *core.Model, reserve int) int {
@@ -273,8 +286,8 @@ func summaryMaxTokens(m *core.Model, reserve int) int {
 	if m != nil && m.MaxTokens > 0 && (n <= 0 || n > m.MaxTokens) {
 		n = m.MaxTokens
 	}
-	if reserve <= 0 && n > DefaultMaxTokens {
-		n = DefaultMaxTokens
+	if reserve <= 0 && n > core.DefaultMaxTokens {
+		n = core.DefaultMaxTokens
 	}
 	if n <= 0 {
 		n = 1
@@ -323,15 +336,15 @@ func ValidateSummary(msg *core.AssistantMessage) (string, error) {
 
 // ---------------------------------------------------------------- transform
 
-// CompactionDeps are the inputs a compaction closure binds.
+// Deps are the inputs a compaction closure binds.
 //
 // REQ-GO-12's ContextTransform signature cannot return an error, cannot see
 // the current model (which changes mid-session under REQ-SESS-03) and cannot
 // reach the SessionStore to write the REQ-SESS-04 entry. Rather than widen the
 // pinned signature, those inputs are supplied by BINDING a closure — the field
 // holds a bound closure, not a free function (ruling P-40).
-type CompactionDeps struct {
-	Strategy   CompactionStrategy
+type Deps struct {
+	Strategy   Strategy
 	Summarizer Summarizer
 	// TurnSummarizer summarizes the prefix of a SPLIT turn (REQ-GO-14) under
 	// a distinct prompt at half the budget. Nil disables the split and the
@@ -363,7 +376,7 @@ type CompactionDeps struct {
 // compacted request reports small usage, the next check passes, full history
 // returns, the check fails again — and every swing invalidates the provider's
 // cache prefix and re-sends content already paid to summarize.
-func NewContextTransform(d CompactionDeps) core.ContextTransform {
+func NewContextTransform(d Deps) core.ContextTransform {
 	return func(ctx context.Context, msgs core.Messages) core.Messages {
 		if d.Strategy == nil {
 			return msgs
@@ -467,7 +480,7 @@ func NewContextTransform(d CompactionDeps) core.ContextTransform {
 // from is the first message NOT covered by the previous checkpoint (0 when
 // there is none): only msgs[from:cut] is summarized, and the previous summary
 // stands in for everything before it.
-func summarizeWithSplit(ctx context.Context, d CompactionDeps, msgs core.Messages, from, cut int, previous string) (string, error) {
+func summarizeWithSplit(ctx context.Context, d Deps, msgs core.Messages, from, cut int, previous string) (string, error) {
 	if _, onUser := msgs[cut].(core.UserMessage); onUser || d.TurnSummarizer == nil {
 		return d.Summarizer(ctx, msgs[from:cut], previous)
 	}
@@ -490,7 +503,7 @@ func summarizeWithSplit(ctx context.Context, d CompactionDeps, msgs core.Message
 	if err != nil {
 		return "", err
 	}
-	return head + CompactionSplitSeparator + tail, nil
+	return head + SplitSeparator + tail, nil
 }
 
 func checkpointPtr(cp core.CompactionCheckpoint, ok bool) *core.CompactionCheckpoint {
@@ -512,8 +525,17 @@ func ApplyCheckpoint(msgs core.Messages, cp core.CompactionCheckpoint) core.Mess
 	}
 	out := make(core.Messages, 0, len(msgs)-cp.PrefixLen+1)
 	out = append(out, core.UserMessage{
-		Content: core.Content{core.TextBlock{Text: CompactionSummaryPrefix + cp.Summary}},
+		Content: core.Content{core.TextBlock{Text: SummaryPrefix + cp.Summary}},
 	})
 	out = append(out, msgs[cp.PrefixLen:]...)
 	return out
+}
+
+// randomID is the summarizer's per-instance session id: eight random bytes
+// under a prefix. rand.Read from crypto/rand cannot fail on any supported
+// platform; since Go 1.24 it panics rather than returning an error.
+func randomID(prefix string) string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return prefix + "_" + hex.EncodeToString(b[:])
 }

@@ -1,16 +1,15 @@
-package agentkit
+package core
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
 
-	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/jsonx"
 	"github.com/agentfox/agentkit-go/schema"
 )
 
-// Prepared is the output of the argument pipeline. It carries the value in
+// PreparedArguments is the output of the argument pipeline (REQ-TOOL-11). It carries the value in
 // three forms, and that is not redundancy:
 //
 //	Raw    the bytes handed to the handler (REQ-GO-03's pinned signature)
@@ -23,7 +22,7 @@ import (
 // tool call (ruling P-7). The ordered form is what the pipeline actually
 // operates on; the map is derived for the interceptor's convenience and is
 // never re-encoded back into a request.
-type Prepared struct {
+type PreparedArguments struct {
 	Raw   json.RawMessage
 	Order jsonx.OrderedObject
 	Args  map[string]any
@@ -35,7 +34,7 @@ type Prepared struct {
 // WithArgs replaces the arguments, as an interceptor may do (REQ-SEC-03.5),
 // regenerating Raw through the ordered form so the positions of keys the
 // interceptor kept survive.
-func (p Prepared) WithArgs(args map[string]any) Prepared {
+func (p PreparedArguments) WithArgs(args map[string]any) PreparedArguments {
 	order := p.Order.Clone()
 	for k, v := range args {
 		order.Set(k, jsonx.OV(v))
@@ -51,7 +50,7 @@ func (p Prepared) WithArgs(args map[string]any) Prepared {
 	if err != nil {
 		raw = p.Raw
 	}
-	return Prepared{Raw: raw, Order: order, Args: order.Map(), Coercions: p.Coercions}
+	return PreparedArguments{Raw: raw, Order: order, Args: order.Map(), Coercions: p.Coercions}
 }
 
 // PrepareArguments runs REQ-TOOL-11's fixed pipeline before the handler. Every
@@ -66,7 +65,7 @@ func (p Prepared) WithArgs(args map[string]any) Prepared {
 // Step 2 is the non-obvious one: constrained sampling forces the model to emit
 // every declared property, so optional fields arrive as explicit nulls.
 // Treating them as present is a validation failure on well-formed output.
-func PrepareArguments(t core.Tool, c core.ToolUseBlock) (Prepared, error) {
+func PrepareArguments(t Tool, c ToolUseBlock) (PreparedArguments, error) {
 	order := c.InputOrder.Clone()
 	modified := false
 
@@ -101,7 +100,7 @@ func PrepareArguments(t core.Tool, c core.ToolUseBlock) (Prepared, error) {
 
 		// ---- 4. Validate.
 		if err := schema.Validate(t.InputSchema, order); err != nil {
-			return Prepared{}, fmt.Errorf("%w\n\narguments as provided:\n%s", err, echoArguments(c.Input))
+			return PreparedArguments{}, fmt.Errorf("%w\n\narguments as provided:\n%s", err, echoArguments(c.Input))
 		}
 
 		raw := c.Input
@@ -110,7 +109,7 @@ func PrepareArguments(t core.Tool, c core.ToolUseBlock) (Prepared, error) {
 				raw = b
 			}
 		}
-		return Prepared{Raw: raw, Order: order, Args: order.Map(), Coercions: coercions}, nil
+		return PreparedArguments{Raw: raw, Order: order, Args: order.Map(), Coercions: coercions}, nil
 	}
 
 	raw := c.Input
@@ -119,7 +118,7 @@ func PrepareArguments(t core.Tool, c core.ToolUseBlock) (Prepared, error) {
 			raw = b
 		}
 	}
-	return Prepared{Raw: raw, Order: order, Args: order.Map()}, nil
+	return PreparedArguments{Raw: raw, Order: order, Args: order.Map()}, nil
 }
 
 // echoArguments renders the model's own bytes back to it, indented.

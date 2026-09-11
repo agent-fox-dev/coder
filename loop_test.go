@@ -13,6 +13,7 @@ import (
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 // ---------------------------------------------------------------- scaffolding
@@ -99,7 +100,7 @@ func newTestAgent(t *testing.T, s *scripted, mutate func(*core.AgentConfig)) *Ag
 	t.Helper()
 	cfg := core.AgentConfig{
 		Model:      testModel(),
-		StopPolicy: StopAfterTurns(10),
+		StopPolicy: stop.AfterTurns(10),
 		Providers:  core.ProviderRegistry{testAPI: s.provider()},
 	}
 	if mutate != nil {
@@ -543,7 +544,7 @@ func TestStopPolicyReasonSurvivesStopAny(t *testing.T) {
 	}}
 	a := newTestAgent(t, s, func(c *core.AgentConfig) {
 		c.ErrorOnLimit = true
-		c.StopPolicy = StopAny(StopOverBudget(1e9), StopAfterTurns(1))
+		c.StopPolicy = stop.Any(stop.OverBudget(1e9), stop.AfterTurns(1))
 	})
 	res, err := a.Run(context.Background(), "go")
 	if !errors.Is(err, core.ErrMaxTurns) {
@@ -766,7 +767,7 @@ func TestContinuePreconditions(t *testing.T) {
 		s := &scripted{turns: []core.AssistantMessage{
 			{Content: core.Content{core.TextBlock{Text: "resumed"}}, StopReason: core.StopReasonStop},
 		}}
-		cfg := core.AgentConfig{Model: testModel(), StopPolicy: StopAfterTurns(5),
+		cfg := core.AgentConfig{Model: testModel(), StopPolicy: stop.AfterTurns(5),
 			Providers: core.ProviderRegistry{testAPI: s.provider()}}
 		a, err := NewAgentWithHistory(cfg, h)
 		if err != nil {
@@ -955,163 +956,6 @@ func TestHoldKeepsAgentNonIdle(t *testing.T) {
 	}
 }
 
-// ------------------------------------------------------------------- estimate
-
-// TestEstimateSkipRulesEachFireIndependently pins REQ-GO-15. Each case
-// satisfies the OTHER two skip rules, so deleting any one `continue` from the
-// implementation fails exactly one subtest.
-func TestEstimateSkipRulesEachFireIndependently(t *testing.T) {
-	good := core.AssistantMessage{StopReason: core.StopReasonStop}
-	good.Usage.SetField(core.UsageInputTokens, 1000)
-
-	t.Run("(a) aborted turn is not an anchor", func(t *testing.T) {
-		bad := core.AssistantMessage{StopReason: core.StopReasonAborted}
-		bad.Usage.SetField(core.UsageInputTokens, 999999)
-		got := EstimateContextTokens(core.Messages{good, bad}, nil)
-		if got > 2000 {
-			t.Fatalf("estimate %d used an aborted turn as the anchor", got)
-		}
-	})
-
-	t.Run("(b) zero-usage turn is not an anchor", func(t *testing.T) {
-		var zero core.AssistantMessage
-		zero.StopReason = core.StopReasonStop
-		zero.Usage.SetField(core.UsageInputTokens, 0)
-		got := EstimateContextTokens(core.Messages{good, zero}, nil)
-		if got < 1000 {
-			t.Fatalf("estimate %d fell back past the valid anchor: a zero-usage response "+
-				"was treated as authoritative", got)
-		}
-	})
-
-	t.Run("(c) anchor invalidated by a later-inserted prefix", func(t *testing.T) {
-		// The checkpoint says a summary was inserted, so an assistant message
-		// from before it was sent under a different prefix.
-		cp := &core.CompactionCheckpoint{PrefixLen: 1, Summary: "s", CreatedAtLen: 4}
-		msgs := core.Messages{good, good, good}
-		got := EstimateContextTokens(msgs, cp)
-		if got >= 1000 {
-			t.Fatalf("estimate %d used a stale anchor: rule (c) never fired. Without "+
-				"CompactionCheckpoint.CreatedAtLen it cannot fire at all (ruling P-2)", got)
-		}
-	})
-}
-
-// ------------------------------------------------------------------- toolpolicy
-
-func TestToolPolicyResolution(t *testing.T) {
-	builtin := func(n string) core.Tool {
-		return core.Tool{Name: n, Description: n, Builtin: true, InputSchema: schema.Object(),
-			Handler: func(context.Context, json.RawMessage) (json.RawMessage, error) { return nil, nil }}
-	}
-	custom := func(n string) core.Tool {
-		return core.Tool{Name: n, Description: n, InputSchema: schema.Object(),
-			Handler: func(context.Context, json.RawMessage) (json.RawMessage, error) { return nil, nil }}
-	}
-	reg := []core.Tool{builtin("read"), builtin("write"), builtin("exec")}
-
-	names := func(ts []core.Tool) string {
-		var out []string
-		for _, t := range ts {
-			out = append(out, t.Name)
-		}
-		return strings.Join(out, ",")
-	}
-
-	// The four non-obvious consequences of REQ-TOOL-10, each its own row.
-	cases := []struct {
-		name   string
-		policy core.ToolPolicy
-		want   string
-	}{
-		{`NoTools "all" disables CUSTOM tools too`,
-			core.ToolPolicy{NoTools: core.NoToolsAll, CustomTools: []core.Tool{custom("mine")}}, ""},
-		{`NoTools "builtin" leaves custom tools alive`,
-			core.ToolPolicy{NoTools: core.NoToolsBuiltin, CustomTools: []core.Tool{custom("mine")}}, "mine"},
-		{`a ToolNames allowlist constrains custom tools`,
-			core.ToolPolicy{ToolNames: []string{"read"}, CustomTools: []core.Tool{custom("mine")}}, "read"},
-		{`ExcludeTools applies to custom tools`,
-			core.ToolPolicy{ExcludeTools: []string{"mine"}, CustomTools: []core.Tool{custom("mine")}}, "read,write,exec"},
-		{`Tools non-nil bypasses everything`,
-			core.ToolPolicy{Tools: []core.Tool{custom("only")}, ToolNames: []string{"read"}, NoTools: core.NoToolsAll}, "only"},
-		{`Tools non-nil but EMPTY means no tools, deliberately`,
-			core.ToolPolicy{Tools: []core.Tool{}}, ""},
-		{`nil ToolNames means the default set`,
-			core.ToolPolicy{}, "read,write,exec"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := names(ResolveToolPolicy(reg, tc.policy)); got != tc.want {
-				t.Fatalf("resolved %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestCustomToolOverridesBuiltinInPlace: overriding must not reorder the tool
-// list, because the tool list is part of the cached prompt prefix.
-func TestCustomToolOverridesBuiltinInPlace(t *testing.T) {
-	reg := []core.Tool{
-		{Name: "a", Builtin: true}, {Name: "read", Builtin: true, Description: "builtin"}, {Name: "z", Builtin: true},
-	}
-	got := ResolveToolPolicy(reg, core.ToolPolicy{
-		CustomTools: []core.Tool{{Name: "read", Description: "custom"}},
-	})
-	if len(got) != 3 || got[1].Name != "read" || got[1].Description != "custom" {
-		t.Fatalf("override did not happen in place: %+v", got)
-	}
-}
-
-func TestPreparedArgumentsPreserveKeyOrder(t *testing.T) {
-	tool := core.Tool{
-		Name: "t", InputSchema: schema.Object(
-			schema.Prop("zeta", schema.String()), schema.Opt("alpha", schema.String())),
-	}
-	c := toolUse(t, "c1", "t", `{"zeta":"1","alpha":"2"}`)
-	p, err := PrepareArguments(tool, c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(p.Raw) != `{"zeta":"1","alpha":"2"}` {
-		t.Fatalf("Raw = %s; the model's own bytes must pass through untouched when "+
-			"nothing changed (REQ-PROV-17)", p.Raw)
-	}
-}
-
-func TestOptionalNullsAreDeletedNotRejected(t *testing.T) {
-	// Constrained sampling forces the model to emit every declared property,
-	// so optional fields arrive as explicit nulls.
-	tool := core.Tool{
-		Name: "t", InputSchema: schema.Object(
-			schema.Prop("path", schema.String()), schema.Opt("limit", schema.Int())),
-	}
-	c := toolUse(t, "c1", "t", `{"path":"/x","limit":null}`)
-	p, err := PrepareArguments(tool, c)
-	if err != nil {
-		t.Fatalf("an explicit null for an OPTIONAL property must be deleted, not rejected "+
-			"(REQ-TOOL-11.2): %v", err)
-	}
-	if _, present := p.Args["limit"]; present {
-		t.Fatal("the optional null was not deleted")
-	}
-}
-
-func TestValidationErrorEchoesTheModelsOwnKeyOrder(t *testing.T) {
-	tool := core.Tool{
-		Name: "t", InputSchema: schema.Object(schema.Prop("path", schema.String())),
-	}
-	c := toolUse(t, "c1", "t", `{"zeta":1,"alpha":2}`)
-	_, err := PrepareArguments(tool, c)
-	if err == nil {
-		t.Fatal("want a validation error for a missing required property")
-	}
-	msg := err.Error()
-	zi, ai := strings.Index(msg, "zeta"), strings.Index(msg, "alpha")
-	if zi < 0 || ai < 0 || zi > ai {
-		t.Fatalf("error text did not echo the model's own key order (REQ-TOOL-12.3):\n%s", msg)
-	}
-}
-
 func TestStreamResultAvailableWithoutReadingAnyEvent(t *testing.T) {
 	// REQ-GO-08: the result is fed by the terminal event, not by consumption,
 	// and that is what makes abandoning a stream safe.
@@ -1155,3 +999,18 @@ func TestUnknownToolYieldsAnErrorResultNotACrash(t *testing.T) {
 }
 
 var _ = fmt.Sprintf
+
+func user(s string) core.Message {
+	return core.UserMessage{Content: core.Content{core.TextBlock{Text: s}}}
+}
+
+func assistantSaying(s string, tokens int64) core.Message {
+	m := core.AssistantMessage{
+		Content:    core.Content{core.TextBlock{Text: s}},
+		StopReason: core.StopReasonStop,
+	}
+	if tokens > 0 {
+		m.Usage.SetField(core.UsageInputTokens, tokens)
+	}
+	return m
+}

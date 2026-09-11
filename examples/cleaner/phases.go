@@ -10,8 +10,12 @@ import (
 	"time"
 
 	agentkit "github.com/agentfox/agentkit-go"
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/guard"
+	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -171,10 +175,10 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	// loops cheaply; the budget catches one that reads large files a few
 	// expensive times; the sentinel tool is the INTENDED ending, and the other
 	// two are what happens when the model never reaches it.
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(b.maxTurns),
-		agentkit.StopOverBudget(b.budgetUSD),
-		agentkit.StopWhenToolCalled(spec.terminalTool),
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(b.maxTurns),
+		stop.OverBudget(b.budgetUSD),
+		stop.WhenToolCalled(spec.terminalTool),
 	)
 
 	// The shipped restricted policy is the floor: an allowlist of program
@@ -186,7 +190,7 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	// cares about and a generic policy cannot: that git mutations belong to
 	// the pipeline rather than to the model, and that nothing the model does
 	// should reach GitHub without passing through the audited comment path.
-	base := agentkit.RestrictedPolicy(agentkit.RestrictedOptions{
+	base := guard.Restricted(guard.Options{
 		AllowedPrograms:     spec.programs,
 		AllowShellOperators: !spec.readOnly,
 		TerminateOnBlock:    false,
@@ -197,7 +201,7 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 		}
 	})
 	cfg.Middleware = append(append([]core.Middleware(nil), b.base.Middleware...),
-		agentkit.RetryMiddleware(agentkit.RetryOptions{MaxAttempts: 3}),
+		middleware.Retry(middleware.RetryOptions{MaxAttempts: 3}),
 	)
 
 	// Compaction. A phase that reads a dozen large files fills the context
@@ -252,10 +256,10 @@ func installCompaction(cfg *core.AgentConfig, history *core.ConversationHistory,
 		return
 	}
 	client := core.ClientFunc(p.Stream)
-	cfg.TransformContext = agentkit.NewContextTransform(agentkit.CompactionDeps{
-		Strategy:       agentkit.SummarizationCompaction{ThresholdFraction: 0.6},
-		Summarizer:     agentkit.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
-		TurnSummarizer: agentkit.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
+	cfg.TransformContext = compaction.NewContextTransform(compaction.Deps{
+		Strategy:       compaction.Summarization{ThresholdFraction: 0.6},
+		Summarizer:     compaction.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
+		TurnSummarizer: compaction.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
 		History:        history,
 		Model:          cfg.Model,
 		OnError:        onError,

@@ -1,4 +1,4 @@
-package agentkit
+package middleware
 
 import (
 	"context"
@@ -158,7 +158,7 @@ func (m *CacheMeter) price(fp string, cost float64) {
 // CALL span, and those two concerns sit at different points in one chain. A
 // direct call would couple them; a context-carried note leaves both usable
 // alone. The ORDERING it requires is real and is documented on
-// TracingMiddleware: tracing must be registered so that it wraps caching,
+// Tracing: tracing must be registered so that it wraps caching,
 // which — since the LAST registered middleware is outermost — means
 // registering tracing after caching.
 type cacheNote struct {

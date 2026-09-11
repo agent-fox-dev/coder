@@ -1,4 +1,10 @@
-package agentkit
+// Package subagent is REQ-MULTI: delegation from one agent to a fresh child.
+//
+// It sits ABOVE the root package — it is the one package in the module that
+// imports agentkit — because a delegation tool needs a parent *agentkit.Agent
+// to read its configuration and remaining budget from, and a child to run.
+// Nothing in the root references it, so the direction is safe.
+package subagent
 
 import (
 	"context"
@@ -6,23 +12,25 @@ import (
 	"fmt"
 	"sync"
 
+	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
-// AgentFactory builds a fresh child agent for one delegation.
+// Factory builds a fresh child agent for one delegation.
 //
-// It is a FACTORY, not an *Agent, and that is the whole design of REQ-MULTI.
-// Handing SubagentTool a single agent value would look correct and fail under
+// It is a FACTORY, not an *agentkit.Agent, and that is the whole design of REQ-MULTI.
+// Handing Tool a single agent value would look correct and fail under
 // exactly the condition delegation exists for: the orchestrator emits two
 // parallel calls to the same specialist, the second finds the run slot taken
 // and returns ErrBusy (REQ-LOOP-15). "Each child is an independent value" is
 // what makes parallel delegation safe BY CONSTRUCTION (REQ-MULTI-04), and a
 // shared instance is not one.
-type AgentFactory func(ctx context.Context) (*Agent, error)
+type Factory func(ctx context.Context) (*agentkit.Agent, error)
 
-// SubagentOptions configures a delegation tool.
-type SubagentOptions struct {
+// Options configures a delegation tool.
+type Options struct {
 	Name        string
 	Description string
 	// PromptField names the argument carrying the child's prompt.
@@ -40,7 +48,7 @@ type SubagentOptions struct {
 	MaxBudgetUSD float64
 }
 
-// SubagentTool wraps an agent factory as a tool the orchestrator can call
+// Tool wraps an agent factory as a tool the orchestrator can call
 // (REQ-MULTI-01).
 //
 // The child ALWAYS starts with fresh, empty history (REQ-MULTI-02). Sharing
@@ -49,7 +57,7 @@ type SubagentOptions struct {
 // history reaches the child's system context — and it inflates the child's
 // input by the whole parent conversation, which is the cost delegation was
 // supposed to avoid.
-func SubagentTool(parent *Agent, factory AgentFactory, opts SubagentOptions) core.Tool {
+func Tool(parent *agentkit.Agent, factory Factory, opts Options) core.Tool {
 	if opts.PromptField == "" {
 		opts.PromptField = "prompt"
 	}
@@ -84,7 +92,7 @@ func SubagentTool(parent *Agent, factory AgentFactory, opts SubagentOptions) cor
 			if err != nil {
 				return core.ErrResult("subagent_construction_failed", err.Error())
 			}
-			if child.history.Len() != 0 {
+			if child.History().Len() != 0 {
 				// A factory that returned a pre-populated agent has defeated
 				// REQ-MULTI-02. Fail loudly rather than leak the transcript.
 				return core.ErrResult("subagent_history_not_empty",
@@ -99,10 +107,12 @@ func SubagentTool(parent *Agent, factory AgentFactory, opts SubagentOptions) cor
 						"the parent has no remaining budget to delegate")
 				}
 				slice := remaining * opts.BudgetFraction
-				child.mu.Lock()
-				existing := child.cfg.StopPolicy
-				child.cfg.StopPolicy = StopAny(existing, StopOverBudget(slice))
-				child.mu.Unlock()
+				existing := child.Config().StopPolicy
+				if err := child.SetStopPolicy(stop.Any(existing, stop.OverBudget(slice))); err != nil {
+					// The factory handed back an agent that is already running;
+					// that is not a fresh child (REQ-MULTI-02).
+					return core.ErrResult("subagent_busy", err.Error())
+				}
 			}
 
 			res, err := child.Run(ctx, prompt)
@@ -124,13 +134,13 @@ func SubagentTool(parent *Agent, factory AgentFactory, opts SubagentOptions) cor
 
 // ---------------------------------------------------------------- REQ-MULTI-05
 
-// AgentDefinition is a named specialist (REQ-MULTI-05): everything needed to
+// Definition is a named specialist (REQ-MULTI-05): everything needed to
 // construct a child agent, registered by name so the parent model can invoke
 // it as a tool call. The "tool allowlist" is the REQ-TOOL-10 ToolPolicy,
 // applied uniformly to built-in and caller-supplied tools, so a specialist can
 // be scoped to read-and-search-only per delegation without rebuilding the tool
 // set by hand.
-type AgentDefinition struct {
+type Definition struct {
 	Name         string
 	Description  string
 	SystemPrompt string
@@ -141,25 +151,25 @@ type AgentDefinition struct {
 	// Tools are registered on every child built from this definition, before
 	// ToolPolicy resolves them.
 	Tools []core.Tool
-	// BudgetFraction is SubagentOptions.BudgetFraction for this specialist.
+	// BudgetFraction is Options.BudgetFraction for this specialist.
 	BudgetFraction float64
 }
 
-// AgentRegistry holds specialists by name. It is a value the embedder owns —
+// Registry holds specialists by name. It is a value the embedder owns —
 // never a package-level global (NFR-SEC-05) — and a name is registered once;
 // a duplicate is an error rather than a silent replacement, because the tool
 // the parent model sees is the name.
-type AgentRegistry struct {
+type Registry struct {
 	mu   sync.Mutex
-	defs map[string]AgentDefinition
+	defs map[string]Definition
 	list []string
 }
 
-func NewAgentRegistry() *AgentRegistry { return &AgentRegistry{defs: map[string]AgentDefinition{}} }
+func NewRegistry() *Registry { return &Registry{defs: map[string]Definition{}} }
 
-func (r *AgentRegistry) Register(def AgentDefinition) error {
+func (r *Registry) Register(def Definition) error {
 	if def.Name == "" {
-		return fmt.Errorf("agentkit: AgentDefinition has no name")
+		return fmt.Errorf("agentkit: Definition has no name")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -172,7 +182,7 @@ func (r *AgentRegistry) Register(def AgentDefinition) error {
 }
 
 // Lookup returns a definition by name.
-func (r *AgentRegistry) Lookup(name string) (AgentDefinition, bool) {
+func (r *Registry) Lookup(name string) (Definition, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	d, ok := r.defs[name]
@@ -180,7 +190,7 @@ func (r *AgentRegistry) Lookup(name string) (AgentDefinition, bool) {
 }
 
 // Names lists registered specialists in registration order.
-func (r *AgentRegistry) Names() []string {
+func (r *Registry) Names() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.list...)
@@ -191,7 +201,7 @@ func (r *AgentRegistry) Names() []string {
 // parent's config (providers, credentials, plugins, tracer) on every call
 // (REQ-MULTI-02/04). The child inherits the parent's model unless the
 // definition names its own.
-func (r *AgentRegistry) Tools(parent *Agent, maxBudgetUSD float64) []core.Tool {
+func (r *Registry) Tools(parent *agentkit.Agent, maxBudgetUSD float64) []core.Tool {
 	names := r.Names()
 	out := make([]core.Tool, 0, len(names))
 	for _, n := range names {
@@ -199,8 +209,8 @@ func (r *AgentRegistry) Tools(parent *Agent, maxBudgetUSD float64) []core.Tool {
 		if !ok {
 			continue
 		}
-		factory := func(context.Context) (*Agent, error) { return NewAgentFromDefinition(parent, def) }
-		out = append(out, SubagentTool(parent, factory, SubagentOptions{
+		factory := func(context.Context) (*agentkit.Agent, error) { return FromDefinition(parent, def) }
+		out = append(out, Tool(parent, factory, Options{
 			Name:           def.Name,
 			Description:    def.Description,
 			BudgetFraction: def.BudgetFraction,
@@ -210,13 +220,11 @@ func (r *AgentRegistry) Tools(parent *Agent, maxBudgetUSD float64) []core.Tool {
 	return out
 }
 
-// NewAgentFromDefinition constructs a fresh child from a definition. The
+// FromDefinition constructs a fresh child from a definition. The
 // parent's infrastructure fields carry over; its history, session store,
 // queues and system prompt do not (REQ-MULTI-02).
-func NewAgentFromDefinition(parent *Agent, def AgentDefinition) (*Agent, error) {
-	parent.mu.Lock()
-	pcfg := parent.cfg
-	parent.mu.Unlock()
+func FromDefinition(parent *agentkit.Agent, def Definition) (*agentkit.Agent, error) {
+	pcfg := parent.Config()
 
 	cfg := core.AgentConfig{
 		Model:          pcfg.Model,
@@ -246,7 +254,7 @@ func NewAgentFromDefinition(parent *Agent, def AgentDefinition) (*Agent, error) 
 	if cfg.StopPolicy == nil {
 		cfg.StopPolicy = pcfg.StopPolicy
 	}
-	child, err := NewAgent(cfg)
+	child, err := agentkit.NewAgent(cfg)
 	if err != nil {
 		return nil, err
 	}

@@ -1,4 +1,4 @@
-package agentkit
+package middleware
 
 import (
 	"context"
@@ -45,17 +45,17 @@ func firstEventBeforeEnd(t *testing.T, name string, s *core.EventStream) {
 	}
 }
 
-// TestMiddlewareDoesNotHoldEventsUntilTheResponseCompletes: RetryMiddleware
-// (on its final attempt), CachingMiddleware and TracingMiddleware each used
+// TestMiddlewareDoesNotHoldEventsUntilTheResponseCompletes: Retry
+// (on its final attempt), Caching and Tracing each used
 // to call Result() on the provider stream before returning it, which held
 // every event until the response ended. The loop forwards the provider
 // stream onto the agent stream, so installing any of them switched off
 // incremental streaming for the session.
 func TestMiddlewareDoesNotHoldEventsUntilTheResponseCompletes(t *testing.T) {
 	cases := map[string]core.Middleware{
-		"RetryMiddleware":   RetryMiddleware(noSleep()),
-		"CachingMiddleware": CachingMiddleware(CacheOptions{}),
-		"TracingMiddleware": TracingMiddleware(nil),
+		"Retry":   Retry(noSleep()),
+		"Caching": Caching(CacheOptions{}),
+		"Tracing": Tracing(nil),
 	}
 	for name, mw := range cases {
 		release := make(chan struct{})
@@ -80,7 +80,7 @@ func TestACacheEntryExistsOnceResultReturns(t *testing.T) {
 			Content: core.Content{core.TextBlock{Text: "x"}}, StopReason: core.StopReasonStop}})
 		return s
 	}
-	mw := CachingMiddleware(CacheOptions{})(h)
+	mw := Caching(CacheOptions{})(h)
 	for i := 0; i < 3; i++ {
 		if mw(context.Background(), core.Request{}).Result() == nil {
 			t.Fatal("no result")
@@ -100,7 +100,7 @@ func TestRateLimiterDoesNotDoubleCreditTheWait(t *testing.T) {
 		s.End(core.StreamResult{Message: &core.AssistantMessage{StopReason: core.StopReasonStop}})
 		return s
 	}
-	mw := RateLimitMiddleware(10, 1)(h) // one token, then one per 100ms
+	mw := RateLimit(10, 1)(h) // one token, then one per 100ms
 	start := time.Now()
 	for i := 0; i < 4; i++ {
 		_ = mw(context.Background(), core.Request{}).Result()

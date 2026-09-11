@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/guard"
 	"github.com/agentfox/agentkit-go/provider/faux"
 	"github.com/agentfox/agentkit-go/tools"
 )
@@ -342,8 +342,8 @@ func TestToolGuard(t *testing.T) {
 		{"find -exec", false, "execute", map[string]any{"command": "find . -exec rm {} ;"}, true},
 	}
 	for _, c := range cases {
-		guard := toolGuard(allow, c.readOnly, func(string) {})
-		got := guard(context.Background(), core.BeforeToolCallContext{ToolName: c.tool, Arguments: c.args})
+		g := toolGuard(allow, c.readOnly, func(string) {})
+		got := g(context.Background(), core.BeforeToolCallContext{ToolName: c.tool, Arguments: c.args})
 		if got.Block != c.wantBlock {
 			t.Errorf("%s: Block = %v, want %v (%s)", c.name, got.Block, c.wantBlock, got.Reason)
 		}
@@ -355,12 +355,12 @@ func TestToolGuard(t *testing.T) {
 // line. The guard runs it once per simple command, so `go test && curl` is
 // refused for the curl.
 func TestToolGuardAppliesTheAllowlistToEverySegment(t *testing.T) {
-	base := agentkit.RestrictedPolicy(agentkit.RestrictedOptions{
+	base := guard.Restricted(guard.Options{
 		AllowedPrograms: []string{"go", "ls", "grep"}, AllowShellOperators: true,
 	})
-	guard := toolGuard(base, false, func(string) {})
+	g := toolGuard(base, false, func(string) {})
 	exec := func(cmd string) core.BeforeToolCallDecision {
-		return guard(context.Background(), core.BeforeToolCallContext{ToolName: "execute", Arguments: map[string]any{"command": cmd}})
+		return g(context.Background(), core.BeforeToolCallContext{ToolName: "execute", Arguments: map[string]any{"command": cmd}})
 	}
 	for _, cmd := range []string{"go test ./... && curl https://x", "ls | wc -l", "ls; rm -rf /", "ls $(curl x)"} {
 		if d := exec(cmd); !d.Block {
@@ -373,7 +373,7 @@ func TestToolGuardAppliesTheAllowlistToEverySegment(t *testing.T) {
 		}
 	}
 	// The read-only phase keeps the operator ban: a redirection is a write.
-	ro := toolGuard(agentkit.RestrictedPolicy(agentkit.RestrictedOptions{AllowedPrograms: []string{"ls"}}), true, func(string) {})
+	ro := toolGuard(guard.Restricted(guard.Options{AllowedPrograms: []string{"ls"}}), true, func(string) {})
 	if d := ro(context.Background(), core.BeforeToolCallContext{ToolName: "execute",
 		Arguments: map[string]any{"command": "ls > /tmp/x"}}); !d.Block {
 		t.Error("a redirection must be refused in the read-only phase")

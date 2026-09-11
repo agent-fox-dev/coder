@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/provider"
 	"github.com/agentfox/agentkit-go/provider/anthropic"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 // This file is NFR-PERF-09's acceptance mechanism.
@@ -35,7 +38,7 @@ func benchAgent(b *testing.B, tools int) *Agent {
 	s := &scripted{}
 	cfg := core.AgentConfig{
 		Model:      testModel(),
-		StopPolicy: StopAfterTurns(1),
+		StopPolicy: stop.AfterTurns(1),
 		Providers:  core.ProviderRegistry{testAPI: s.provider()},
 	}
 	a, err := NewAgent(cfg)
@@ -104,7 +107,7 @@ func BenchmarkContextEstimate(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		EstimateContextTokens(msgs, nil)
+		compaction.EstimateContextTokens(msgs, nil)
 	}
 }
 
@@ -121,7 +124,7 @@ func BenchmarkLoopTurnWithToolBatch(b *testing.B) {
 				mustUse("c3", "tool_2", `{"v":"z"}`)),
 		}}
 		a, err := NewAgent(core.AgentConfig{
-			Model: testModel(), StopPolicy: StopAfterTurns(2), ParallelTools: true,
+			Model: testModel(), StopPolicy: stop.AfterTurns(2), ParallelTools: true,
 			Providers: core.ProviderRegistry{testAPI: s.provider()},
 		})
 		if err != nil {
@@ -163,7 +166,7 @@ func cachedHandler() (core.Handler, core.Handler, core.Request) {
 	}
 	req := core.Request{Messages: core.Messages{
 		core.UserMessage{Content: core.Content{core.TextBlock{Text: "a question"}}}}}
-	cached := CachingMiddleware(CacheOptions{})(direct)
+	cached := middleware.Caching(middleware.CacheOptions{})(direct)
 	// Warm it, so the benchmark measures HITS.
 	cached(context.Background(), req).Result()
 	return direct, cached, req
@@ -332,7 +335,7 @@ func BenchmarkFingerprint(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := Fingerprint(req); err != nil {
+		if _, err := middleware.Fingerprint(req); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -370,7 +373,7 @@ func benchAgentAtDepth(b *testing.B, turns int) *Agent {
 		h.Record(core.NullLeaf, m)
 	}
 	a, err := NewAgentWithHistory(core.AgentConfig{
-		Model: testModel(), StopPolicy: StopAfterTurns(1),
+		Model: testModel(), StopPolicy: stop.AfterTurns(1),
 		Providers: core.ProviderRegistry{testAPI: s.provider()},
 	}, h)
 	if err != nil {

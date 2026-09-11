@@ -13,7 +13,10 @@ import (
 	"time"
 
 	agentkit "github.com/agentfox/agentkit-go"
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/middleware"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -146,16 +149,16 @@ func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose, debug bool) 
 	cfg.SystemPrompt = systemPrompt
 	cfg.ToolPolicy = readOnlyPolicy()
 	// BeforeToolCall is intentionally nil. See assertReadOnly.
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(100),  // a wandering read loop
-		agentkit.StopOverBudget(2.00), // dollars, cumulative for the run
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(100),  // a wandering read loop
+		stop.OverBudget(2.00), // dollars, cumulative for the run
 	)
 	cfg.Middleware = append(append([]core.Middleware(nil), cfg.Middleware...),
-		agentkit.RetryMiddleware(agentkit.RetryOptions{MaxAttempts: 3}),
+		middleware.Retry(middleware.RetryOptions{MaxAttempts: 3}),
 	)
 
 	registered := append(append([]core.Tool(nil), built...), t.fileIssueTool())
-	resolved := agentkit.ResolveToolPolicy(registered, cfg.ToolPolicy)
+	resolved := cfg.ToolPolicy.Resolve(registered)
 	if err := assertReadOnly(resolved); err != nil {
 		return nil, err
 	}
@@ -210,10 +213,10 @@ func installCompaction(cfg *core.AgentConfig, history *core.ConversationHistory,
 		return
 	}
 	client := core.ClientFunc(p.Stream)
-	cfg.TransformContext = agentkit.NewContextTransform(agentkit.CompactionDeps{
-		Strategy:       agentkit.SummarizationCompaction{ThresholdFraction: 0.6},
-		Summarizer:     agentkit.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
-		TurnSummarizer: agentkit.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
+	cfg.TransformContext = compaction.NewContextTransform(compaction.Deps{
+		Strategy:       compaction.Summarization{ThresholdFraction: 0.6},
+		Summarizer:     compaction.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
+		TurnSummarizer: compaction.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
 		History:        history,
 		Model:          cfg.Model,
 		OnError:        onError,

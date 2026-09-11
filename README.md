@@ -67,7 +67,13 @@ in 0.4.1 rather than the code walked back.
 | `provider` | Send-time transcript repair, HTTP transport + retry, credential resolution, header precedence, cost arithmetic, SSE decoding — everything shared by every wire API. |
 | `provider/{anthropic,openai,google,ollama,faux}` | One wire API each, encode and decode. |
 | `difftest` | Separate module: the NFR-TEST-06/07 differential harness — canonicalizing comparator, key-order side channel, divergence ledger, exit machine. |
-| `.` (root) | `Agent`, the loop, the batch executor, stop policies, the argument pipeline, compaction, Axis 1 middleware, `SubagentTool`, session resume. |
+| `stop` | The built-in stop policies: `AfterTurns`, `OverBudget`, `AfterDuration`, `WhenToolCalled`, `Any`, `Never`. |
+| `middleware` | Axis 1: `Retry`, `Budget`, `Caching`, `Tracing`, `RateLimit`, and the `CacheMeter` behind `Agent.CacheStats`. |
+| `compaction` | The context transform, four strategies, two summarizers, the REQ-GO-16 summary taxonomy and the anchored token estimate. |
+| `prompt` | The assembled system prompt: base instructions, per-tool guidelines, skills and project-context blocks. |
+| `guard` | The execute boundary: `Restricted` (a program allowlist plus operator rejection) and `AllowAll`. |
+| `subagent` | Delegation: `Tool` over an agent factory, named `Definition`s in a `Registry`, `RunParallel`. The one package above the root. |
+| `.` (root) | `Agent`, its constructors, the loop, the batch executor, provider registration. |
 
 ## The parts worth reading
 
@@ -209,14 +215,14 @@ image a third over the limit it was checked against and nothing in the
 provider's error mentions base64.
 
 **A shell tool with no interceptor fails the run before the first request**
-([`policy.go`](policy.go)). REQ-SEC-03 made the embedder's `BeforeToolCall`
+([`guard/`](guard/)). REQ-SEC-03 made the embedder's `BeforeToolCall`
 the one authorization boundary, and a headless embedder that never wrote one
 would otherwise hand the model an unrestricted shell by omission — the exact
 outcome OQ-8 warned was worse than the allowlist it replaced. So `execute`,
 `run_command` or `powershell` in the resolved tool set with a nil interceptor
-is `ErrUnguardedExecute`; the opt-out is `AllowAllToolCalls`, an interceptor
+is `ErrUnguardedExecute`; the opt-out is `guard.AllowAll`, an interceptor
 that never blocks, so an unrestricted shell is something you say in code.
-`RestrictedPolicy` ships as the replaceable starting point: a program
+`guard.Restricted` ships as the replaceable starting point: a program
 allowlist plus operator rejection under a *declared* grammar (POSIX sh
 quoting), with `powershell` refused outright unless you supply a PowerShell
 filter — REQ-SEC-04's rule that a filter which silently does not hold on one
@@ -383,7 +389,7 @@ unmap first.
 oscillates: the compacted request reports small usage → the threshold passes →
 full history returns → it fails again. Each swing invalidates the provider's
 cache prefix and re-sends content already paid to summarize. **And extending
-a checkpoint summarizes only the delta** ([`compaction.go`](compaction.go)):
+a checkpoint summarizes only the delta** ([`compaction/`](compaction/)):
 the messages since the previous cut, with the previous summary handed to the
 summarizer to build on. Re-summarizing from message 0 on every extension is
 O(history) tokens each time and fails outright once the history has outgrown
@@ -759,7 +765,7 @@ Two operational notes that are easy to miss. `execute` output over the cap is
 spilled to a per-workspace directory under the OS temp dir by default
 (`tools.Options.SpillDir` to move it, `DisableSpill` to turn it off), and the
 spill files are the embedder's to clean. And a shell tool with no
-`BeforeToolCall` fails the run (`ErrUnguardedExecute`); `AllowAllToolCalls` is
+`BeforeToolCall` fails the run (`ErrUnguardedExecute`); `guard.AllowAll` is
 the explicit opt-out.
 
 All five wire APIs ship, including `openai-responses` as a separate

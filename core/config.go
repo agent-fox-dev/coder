@@ -18,7 +18,7 @@ type StopContext struct {
 	// REQ-LOOP-07 requires RunResult.StopReason = "max_turns" and, under
 	// ErrorOnLimit, ErrMaxTurns specifically — versus ErrBudgetExceeded for
 	// REQ-LOOP-08. With a bare bool the loop cannot tell which policy fired,
-	// and StopAny erases it entirely. A policy sets *Reason before returning
+	// and stop.Any erases it entirely. A policy sets *Reason before returning
 	// true; the loop defaults it to RunStopPolicy.
 	Reason *RunStopReason
 
@@ -37,7 +37,7 @@ func (sc StopContext) SetReason(r RunStopReason) {
 	}
 }
 
-// StopPolicy is REQ-LOOP-04's pinned signature. Policies compose via StopAny.
+// StopPolicy is REQ-LOOP-04's pinned signature. Policies compose via stop.Any.
 type StopPolicy func(StopContext) bool
 
 // ContextTransform is AgentConfig.TransformContext (REQ-GO-12): invoked
@@ -89,7 +89,7 @@ type AgentConfig struct {
 	Model    *Model
 	Provider string // vendor id; credential resolution + catalog only
 	// MaxTokens is an upper bound, clamped to the model (REQ-CAT-04). Nil is
-	// the SDK default (agentkit.DefaultMaxTokens), NOT the model's cap: the
+	// the SDK default (DefaultMaxTokens), NOT the model's cap: the
 	// cap is 128K on current models and providers reserve rate-limit budget
 	// from max_tokens at request start (REQ-PROV-16 presence).
 	MaxTokens    *int
@@ -133,7 +133,7 @@ type AgentConfig struct {
 	Plugins PluginRegistry
 	// Tracer receives the REQ-OBS-02 tool spans. Nil means NoopTracer.
 	//
-	// It is separate from TracingMiddleware's tracer, which wraps the MODEL
+	// It is separate from middleware.Tracing's tracer, which wraps the MODEL
 	// call: middleware cannot see a tool execution at all, so a tracer that
 	// reached the SDK only through Axis 1 would leave REQ-OBS-02
 	// unimplementable. Pass the same value to both to get one trace.
@@ -174,3 +174,14 @@ func Chain(base Handler, mw ...Middleware) Handler {
 	}
 	return h
 }
+
+// DefaultMaxTokens is the output bound sent when AgentConfig.MaxTokens is nil.
+// It is still clamped to the model's cap and the remaining window by
+// REQ-CAT-04; a caller who wants the model's full cap says so explicitly.
+//
+// Providers size rate-limit reservations from max_tokens at request start, so
+// a 128K default costs 128K of output-per-minute budget per turn — a 429 on
+// the first concurrent delegation on most tiers — and removes the only bound
+// on a runaway turn. 32K is generous for tool-call-shaped output and still an
+// order of magnitude below current caps.
+const DefaultMaxTokens = 32768

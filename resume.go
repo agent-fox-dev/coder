@@ -1,63 +1,11 @@
 package agentkit
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
-	"time"
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/session"
 )
-
-// OpenSession opens or creates a session log and returns the resume state.
-//
-// It is the front door for a persisted agent, and it exists so the ONLY way to
-// build one is the correct way. REQ-SESS-02 requires the recovered model and
-// reasoning level to be CONSTRUCTION INPUTS, not fields patched onto a built
-// agent — a distinction that is easy to state and easy to violate, so
-// NewAgent rejects a non-empty store outright (ErrSessionNotEmpty) and this is
-// what you reach for instead.
-func OpenSession(path string, opts session.Options) (*session.Store, *session.Resume, error) {
-	store, loaded, err := session.Open(path, opts)
-	if errors.Is(err, fs.ErrNotExist) {
-		// A session that does not exist yet is the ordinary first-run case,
-		// not an error the caller should have to distinguish.
-		cwd, _ := os.Getwd()
-		// The id and timestamp are left for session.Create to fill from
-		// opts.NewID and opts.Now when the caller supplied them, exactly as
-		// session.Create does on its own: those hooks exist so a golden can
-		// pin a whole file byte-for-byte (NFR-TEST-08), and a front door that
-		// overrode them made the header unpinnable through the one path an
-		// embedder is told to use. The "sess_" prefix and wall-clock default
-		// are kept for the caller that supplied neither.
-		h := core.SessionHeader{Version: core.SessionLogVersion, CWD: cwd}
-		if opts.NewID == nil {
-			h.ID = newID("sess")
-		}
-		if opts.Now == nil {
-			h.Timestamp = time.Now()
-		}
-		store, err = session.Create(path, h, opts)
-		if err != nil {
-			return nil, nil, err
-		}
-		return store, &session.Resume{Path: path, Header: store.Header(),
-			History: core.NewConversationHistory()}, nil
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	branch, err := store.Branch(store.Head())
-	if err != nil {
-		return nil, nil, err
-	}
-	r := session.Fold(store.Header(), branch)
-	r.Path = path
-	r.LoadRepairs = loaded.Repairs
-	return store, &r, nil
-}
 
 // NewAgentFromSession constructs an agent from folded session state.
 //

@@ -33,6 +33,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
 	"github.com/agentfox/agentkit-go/session"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 func main() {
@@ -68,13 +69,13 @@ func run() error {
 		google.Provider(google.Options{}),
 		ollama.Provider(ollama.Options{}),
 	)
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(10),
-		agentkit.StopOverBudget(1.00),
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(10),
+		stop.OverBudget(1.00),
 	)
 	cfg.SystemPrompt = "You are concise. Answer in plain prose, no preamble."
 
-	// 1. OpenSession creates the log or opens an existing one, and hands back
+	// 1. session.OpenOrCreate creates the log or opens an existing one, and hands back
 	//    both halves: the store to keep writing to, and the fold of what is
 	//    already there. It is the front door precisely because the wrong way
 	//    to resume — build an agent, then patch the recovered model onto it —
@@ -84,7 +85,7 @@ func run() error {
 	//    flush per message, and it is the right trade whenever losing the
 	//    transcript would lose real work; DurabilityBuffered (the default)
 	//    survives process death but not machine death.
-	store, resume, err := agentkit.OpenSession(*path, session.Options{
+	store, resume, err := session.OpenOrCreate(*path, session.Options{
 		Durability: session.DurabilityPerEntry,
 	})
 	if err != nil {

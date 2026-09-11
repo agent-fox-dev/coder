@@ -11,8 +11,12 @@ import (
 
 	afspec "github.com/agent-fox-dev/spec"
 	agentkit "github.com/agentfox/agentkit-go"
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/guard"
+	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -159,14 +163,14 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	// expensive times; the duration is agent-fox's session timeout; the
 	// sentinel tool is the INTENDED ending.
 	policies := []core.StopPolicy{
-		agentkit.StopAfterTurns(b.maxTurns),
-		agentkit.StopOverBudget(b.budgetUSD),
-		agentkit.StopWhenToolCalled(spec.terminalTool),
+		stop.AfterTurns(b.maxTurns),
+		stop.OverBudget(b.budgetUSD),
+		stop.WhenToolCalled(spec.terminalTool),
 	}
 	if b.timeout > 0 {
-		policies = append(policies, agentkit.StopAfterDuration(b.timeout))
+		policies = append(policies, stop.AfterDuration(b.timeout))
 	}
-	cfg.StopPolicy = agentkit.StopAny(policies...)
+	cfg.StopPolicy = stop.Any(policies...)
 
 	// The shipped restricted policy is the floor — an allowlist of program
 	// names. The coder may use shell operators (the pack's own test commands
@@ -175,7 +179,7 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	// git mutations belong to the pipeline, a read-only phase stays
 	// read-only, and every simple command on a line is checked, not only the
 	// first.
-	base := agentkit.RestrictedPolicy(agentkit.RestrictedOptions{
+	base := guard.Restricted(guard.Options{
 		AllowedPrograms:     spec.programs,
 		AllowShellOperators: !spec.readOnly,
 		TerminateOnBlock:    false,
@@ -186,7 +190,7 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 		}
 	})
 	cfg.Middleware = append(append([]core.Middleware(nil), b.base.Middleware...),
-		agentkit.RetryMiddleware(agentkit.RetryOptions{MaxAttempts: 3}),
+		middleware.Retry(middleware.RetryOptions{MaxAttempts: 3}),
 	)
 
 	// Compaction. A coder session over a large group fills the context
@@ -240,10 +244,10 @@ func installCompaction(cfg *core.AgentConfig, history *core.ConversationHistory,
 		return
 	}
 	client := core.ClientFunc(p.Stream)
-	cfg.TransformContext = agentkit.NewContextTransform(agentkit.CompactionDeps{
-		Strategy:       agentkit.SummarizationCompaction{ThresholdFraction: 0.6},
-		Summarizer:     agentkit.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
-		TurnSummarizer: agentkit.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
+	cfg.TransformContext = compaction.NewContextTransform(compaction.Deps{
+		Strategy:       compaction.Summarization{ThresholdFraction: 0.6},
+		Summarizer:     compaction.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
+		TurnSummarizer: compaction.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
 		History:        history,
 		Model:          cfg.Model,
 		OnError:        onError,

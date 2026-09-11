@@ -17,7 +17,7 @@
 //
 // The model decides when to delegate here. To fan delegations out from Go
 // code instead — one child per item in a slice, run concurrently, results
-// returned in input order with a per-item error — use agentkit.RunParallel.
+// returned in input order with a per-item error — use subagent.RunParallel.
 // Either way the delegation tools are safe to call in parallel, because every
 // call constructs its own agent value; nothing is shared between siblings.
 //
@@ -40,6 +40,8 @@ import (
 	"github.com/agentfox/agentkit-go/provider/ollama"
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
+	"github.com/agentfox/agentkit-go/stop"
+	"github.com/agentfox/agentkit-go/subagent"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -111,9 +113,9 @@ func run() error {
 	// 5. A stop policy is not optional for a delegating agent. Turns bound the
 	//    orchestration loop; the budget bounds the whole tree, since a child's
 	//    spend lands in the parent's usage as the delegation tool returns.
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(12),
-		agentkit.StopOverBudget(maxBudgetUSD),
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(12),
+		stop.OverBudget(maxBudgetUSD),
 	)
 
 	if err := checkCredentials(model); err != nil {
@@ -143,7 +145,7 @@ func run() error {
 	//    exactly what the orchestrator model sees as a tool, so a silent
 	//    replacement would change the tool surface without changing any code
 	//    that reads like it did.
-	registry := agentkit.NewAgentRegistry()
+	registry := subagent.NewRegistry()
 
 	// The researcher is handed the whole built-in set but ALLOWED only two of
 	// it. ToolPolicy resolution — not the Tools slice — decides what exists,
@@ -157,7 +159,7 @@ func run() error {
 	// type system and silently absent the moment any caller passes a bare
 	// context.Background(); here a missing budget is a visible zero in a
 	// struct literal you are already reading.
-	if err := registry.Register(agentkit.AgentDefinition{
+	if err := registry.Register(subagent.Definition{
 		Name: "researcher",
 		Description: "Investigate a question against the files in the working " +
 			"directory and report concrete findings with file paths.",
@@ -166,7 +168,7 @@ func run() error {
 			"file paths and short quotes. Never guess; say so when the files do not answer.",
 		Tools:          builtins,
 		ToolPolicy:     core.ToolPolicy{ToolNames: []string{"read_file", "search_files"}},
-		StopPolicy:     agentkit.StopAfterTurns(8),
+		StopPolicy:     stop.AfterTurns(8),
 		BudgetFraction: 0.30, // of whatever the parent has left when called
 	}); err != nil {
 		return err
@@ -176,14 +178,14 @@ func run() error {
 	// outright, custom tools included, so no allowlist has to be kept in sync
 	// as the built-in set grows. A specialist whose whole job is prose should
 	// not be one prompt injection away from a file read.
-	if err := registry.Register(agentkit.AgentDefinition{
+	if err := registry.Register(subagent.Definition{
 		Name:        "summarizer",
 		Description: "Turn research notes into a short, plain-prose summary.",
 		SystemPrompt: "You are a summarizer. You have no tools and no way to check " +
 			"anything: work only from the text you are given. Answer in plain prose, " +
 			"no preamble, no bullet lists.",
 		ToolPolicy:     core.ToolPolicy{NoTools: core.NoToolsAll},
-		StopPolicy:     agentkit.StopAfterTurns(2),
+		StopPolicy:     stop.AfterTurns(2),
 		BudgetFraction: 0.20,
 	}); err != nil {
 		return err

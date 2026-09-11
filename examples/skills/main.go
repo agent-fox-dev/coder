@@ -32,6 +32,7 @@ import (
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/prompt"
 	"github.com/agentfox/agentkit-go/provider"
 	"github.com/agentfox/agentkit-go/provider/anthropic"
 	"github.com/agentfox/agentkit-go/provider/google"
@@ -40,6 +41,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/skills"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -270,9 +272,9 @@ func run() error {
 	// and the block below will name read_file, because read_file is what the
 	// resolved set actually contains.
 	cfg.ToolPolicy.ToolNames = []string{"read_file", "list_files"}
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(8),
-		agentkit.StopOverBudget(1.00), // dollars, cumulative for the run
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(8),
+		stop.OverBudget(1.00), // dollars, cumulative for the run
 	)
 	// THE one place trust is stated. SkillsConfigFor derives the discovery
 	// config from this field, so the loop and the skills package cannot
@@ -304,15 +306,15 @@ func run() error {
 	// handed agent.Tools() — the set AFTER the policy resolved — because the
 	// block names the tool the model must read a skill with and naming one it
 	// does not have buys a hallucinated call and a wasted turn.
-	skillCfg := agentkit.SkillsConfigFor(cfg, work, skills.BuiltinDir())
+	skillCfg := skills.ConfigFor(cfg, work, skills.BuiltinDir())
 	session := agent.LoadSkills(skills.Discover(skillCfg), "coder", task, skillCfg)
 	ctxFiles, _ := skills.DiscoverContext(skillCfg)
-	if err := agent.SetPromptBlocks(agentkit.SkillBlocks(session, ctxFiles, agent.Tools())); err != nil {
+	if err := agent.SetPromptBlocks(prompt.SkillBlocks(session, ctxFiles, agent.Tools())); err != nil {
 		return err
 	}
 
 	fmt.Println("\n  the system prompt the provider will receive:")
-	fmt.Print(indent(agentkit.BuildSystemPrompt(agentkit.PromptInput{
+	fmt.Print(indent(prompt.Build(prompt.Input{
 		Custom: cfg.SystemPrompt, Tools: agent.Tools(), ExtraBlocks: agent.PromptBlocks(),
 	})))
 	fmt.Println("\n  A custom SystemPrompt replaces the built-in base and guidelines and")

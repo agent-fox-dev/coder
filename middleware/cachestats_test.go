@@ -1,7 +1,8 @@
-package agentkit
+package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/agentfox/agentkit-go/core"
@@ -72,7 +73,7 @@ func TestALevel2HitCreditsWhatThatResponseActuallyCost(t *testing.T) {
 		s.End(core.StreamResult{Message: &cp})
 		return s
 	}
-	mw := CachingMiddleware(CacheOptions{Meter: meter})
+	mw := Caching(CacheOptions{Meter: meter})
 	req := core.Request{Messages: core.Messages{
 		core.UserMessage{Content: core.Content{core.TextBlock{Text: "q"}}}}}
 
@@ -103,7 +104,7 @@ func TestCacheAttributesReachTheModelCallSpan(t *testing.T) {
 	// Tracing must WRAP caching for the note to be established before the
 	// cache decision is made. core.Chain applies middleware so the LAST
 	// registered is outermost.
-	chain := core.Chain(h, CachingMiddleware(CacheOptions{}), TracingMiddleware(rec))
+	chain := core.Chain(h, Caching(CacheOptions{}), Tracing(rec))
 	req := core.Request{Messages: core.Messages{
 		core.UserMessage{Content: core.Content{core.TextBlock{Text: "q"}}}}}
 	chain(context.Background(), req).Result()
@@ -132,7 +133,7 @@ func TestCacheAttributesReachTheModelCallSpan(t *testing.T) {
 // second's is the whole test: one is a miss and the other a hit.
 type spanRecorder struct{ spans []map[string]any }
 
-func (r *spanRecorder) StartSpan(_ string, fn func(Span) error) error {
+func (r *spanRecorder) StartSpan(_ string, fn func(core.Span) error) error {
 	sp := &collectingSpan{attrs: map[string]any{}}
 	err := fn(sp)
 	r.spans = append(r.spans, sp.attrs)
@@ -339,4 +340,15 @@ func TestMeterRecordsInvalidationsAndPromotions(t *testing.T) {
 	if s.LastInvalidation != "tool removed: x" {
 		t.Fatalf("last invalidation = %q, want the reason", s.LastInvalidation)
 	}
+}
+
+const testAPI core.API = "test-api"
+
+func toolUse(t *testing.T, id, name, args string) core.ToolUseBlock {
+	t.Helper()
+	b, err := core.NewToolUse(id, name, json.RawMessage(args))
+	if err != nil {
+		t.Fatalf("NewToolUse: %v", err)
+	}
+	return b
 }

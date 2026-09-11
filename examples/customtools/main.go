@@ -37,6 +37,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 func main() {
@@ -78,9 +79,9 @@ func run() error {
 	// 3. A tool-using run needs an upper bound that does not depend on the
 	//    model choosing to stop. submit_answer below is the *intended* ending;
 	//    the stop policy is what happens when the model never gets there.
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(12),
-		agentkit.StopOverBudget(1.00), // dollars, cumulative for the run
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(12),
+		stop.OverBudget(1.00), // dollars, cumulative for the run
 	)
 	cfg.SystemPrompt = "You are a parts-desk assistant. Use the tools rather than guessing part data."
 

@@ -12,7 +12,7 @@ extending, the previous summary is re-sent to the summarizer inside
 
 ## What the code did
 
-`NewContextTransform` handed the summarizer `msgs[:cut]` — the whole original
+`compaction.NewContextTransform` handed the summarizer `msgs[:cut]` — the whole original
 prefix from message 0 — on every extension, with the previous summary in the
 system prompt beside it. That is O(total history) tokens per extension, and
 it fails structurally: once the original history has outgrown the context
@@ -36,7 +36,7 @@ asking the model to do what the request shape made impossible to do cheaply.
   first message to be the user's. The note is model-visible and pinned by
   `TestADeltaStartingOnAnAssistantGetsAUserTurnFirst`.
 - With no reserve stated, the summary's `max_tokens` is bounded by
-  `agentkit.DefaultMaxTokens` rather than the model's output cap.
+  `core.DefaultMaxTokens` rather than the model's output cap.
 
 Pinned by `TestExtendingSummarizesOnlyTheDelta` and
 `TestACutBelowTheCheckpointDoesNotShrinkIt`.

@@ -30,6 +30,7 @@ import (
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider/faux"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -160,7 +161,7 @@ func TestWideningTheExcludesFailsTheRunRatherThanTheReview(t *testing.T) {
 	agent, err := agentkit.NewAgent(core.AgentConfig{
 		Model:      faux.Model(),
 		Providers:  core.ProviderRegistry{faux.API: p.APIProvider()},
-		StopPolicy: agentkit.StopAfterTurns(2),
+		StopPolicy: stop.AfterTurns(2),
 	})
 	if err != nil {
 		t.Fatal(err)

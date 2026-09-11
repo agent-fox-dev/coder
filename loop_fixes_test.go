@@ -9,7 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/guard"
 	"github.com/agentfox/agentkit-go/schema"
 )
 
@@ -517,7 +519,7 @@ func TestAShellToolWithNoInterceptorFailsTheRun(t *testing.T) {
 		return core.Tool{Name: name, Description: "shell", InputSchema: schema.Object(schema.Prop("command", schema.String())),
 			Handler: func(context.Context, json.RawMessage) (json.RawMessage, error) { return json.RawMessage(`{}`), nil }}
 	}
-	for _, name := range ShellToolNames {
+	for _, name := range guard.ShellToolNames {
 		s := &scripted{}
 		a := newTestAgent(t, s, nil)
 		_ = a.RegisterTool(shell(name))
@@ -530,10 +532,10 @@ func TestAShellToolWithNoInterceptorFailsTheRun(t *testing.T) {
 	}
 	// The explicit opt-out is an interceptor, so passing it is an act.
 	s := &scripted{}
-	a := newTestAgent(t, s, func(c *core.AgentConfig) { c.BeforeToolCall = AllowAllToolCalls })
+	a := newTestAgent(t, s, func(c *core.AgentConfig) { c.BeforeToolCall = guard.AllowAll })
 	_ = a.RegisterTool(shell("execute"))
 	if _, err := a.Run(context.Background(), "go"); err != nil {
-		t.Fatalf("AllowAllToolCalls: %v", err)
+		t.Fatalf("guard.AllowAll: %v", err)
 	}
 	// And a policy that excludes the shell tool from the run needs no guard.
 	s = &scripted{}
@@ -542,122 +544,6 @@ func TestAShellToolWithNoInterceptorFailsTheRun(t *testing.T) {
 	if _, err := a.Run(context.Background(), "go"); err != nil {
 		t.Fatalf("excluded shell tool: %v", err)
 	}
-}
-
-// TestRestrictedPolicy pins the reference interceptor's decisions.
-func TestRestrictedPolicy(t *testing.T) {
-	p := RestrictedPolicy(RestrictedOptions{AllowedPrograms: []string{"go", "/usr/bin/git"}})
-	call := func(tool string, args map[string]any) core.BeforeToolCallDecision {
-		return p(context.Background(), core.BeforeToolCallContext{ToolName: tool, Arguments: args})
-	}
-	cases := []struct {
-		tool  string
-		args  map[string]any
-		block bool
-		why   string
-	}{
-		{"execute", map[string]any{"command": "go test ./..."}, false, "allowed program"},
-		{"execute", map[string]any{"command": "GOFLAGS=-mod=mod go build"}, false, "env assignment prefix"},
-		{"execute", map[string]any{"command": "git log 'a;b'"}, false, "operator inside single quotes"},
-		{"execute", map[string]any{"command": "go test | tee out"}, true, "pipe"},
-		{"execute", map[string]any{"command": "go test; rm -rf /"}, true, "list operator"},
-		{"execute", map[string]any{"command": "echo $(whoami)"}, true, "command substitution"},
-		{"execute", map[string]any{"command": "git log \"$HOME\""}, true, "expansion inside double quotes"},
-		{"execute", map[string]any{"command": "rm -rf /"}, true, "program not allowed"},
-		{"execute", map[string]any{"command": ""}, true, "empty"},
-		{"run_command", map[string]any{"argv": []any{"go", "vet", "a;b"}}, false, "argv is not re-parsed"},
-		{"run_command", map[string]any{"argv": []any{"curl", "x"}}, true, "argv program not allowed"},
-		{"powershell", map[string]any{"command": "Get-ChildItem"}, true, "no PowerShell grammar: refused outright"},
-		{"read_file", map[string]any{"path": "x"}, false, "non-shell tools pass"},
-	}
-	for _, c := range cases {
-		if got := call(c.tool, c.args).Block; got != c.block {
-			t.Errorf("%s %v: block=%v, want %v (%s)", c.tool, c.args, got, c.block, c.why)
-		}
-	}
-	if !call("execute", map[string]any{"command": "go test | tee"}).Block {
-		t.Fatal("pipe")
-	}
-	loose := RestrictedPolicy(RestrictedOptions{AllowedPrograms: []string{"go"}, AllowShellOperators: true})
-	if loose(context.Background(), core.BeforeToolCallContext{ToolName: "execute",
-		Arguments: map[string]any{"command": "go test | tee"}}).Block {
-		t.Fatal("AllowShellOperators must permit the pipe")
-	}
-	term := RestrictedPolicy(RestrictedOptions{TerminateOnBlock: true})
-	if d := term(context.Background(), core.BeforeToolCallContext{ToolName: "execute",
-		Arguments: map[string]any{"command": "ls"}}); !d.Block || !d.Terminate {
-		t.Fatal("TerminateOnBlock must cast the REQ-TOOL-13.2 vote")
-	}
-}
-
-// ------------------------------------------------------------------ REQ-MULTI-05
-
-// TestNamedSpecialistsAreInvokableByName: a registered definition becomes a
-// tool the parent model can call, and every call gets a fresh child scoped
-// by the definition's ToolPolicy.
-func TestNamedSpecialistsAreInvokableByName(t *testing.T) {
-	// One scripted double serves parent and children alike (the child
-	// inherits the parent's providers): the first call is the parent's
-	// delegating turn, and every call after it answers "done".
-	prov := &scripted{turns: []core.AssistantMessage{
-		assistantWithTools(core.StopReasonToolUse,
-			toolUse(t, "d1", "reviewer", `{"prompt":"look at x"}`),
-			toolUse(t, "d2", "reviewer", `{"prompt":"look at y"}`)),
-	}}
-	reg := core.ProviderRegistry{testAPI: prov.provider()}
-	parent, err := NewAgent(core.AgentConfig{Model: testModel(), Providers: reg, StopPolicy: StopAfterTurns(5), ParallelTools: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	specialists := NewAgentRegistry()
-	if err := specialists.Register(AgentDefinition{
-		Name: "reviewer", Description: "reviews code", SystemPrompt: "You review.",
-		ToolPolicy: core.ToolPolicy{ToolNames: []string{"read_file"}},
-		StopPolicy: StopAfterTurns(2),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := specialists.Register(AgentDefinition{Name: "reviewer"}); err == nil {
-		t.Fatal("a duplicate name must be refused")
-	}
-	for _, tool := range specialists.Tools(parent, 0) {
-		if err := parent.RegisterTool(tool); err != nil {
-			t.Fatal(err)
-		}
-	}
-	res, err := parent.Run(context.Background(), "review both")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range []string{"d1", "d2"} {
-		tr := findToolResult(t, res.Messages, id)
-		if tr.IsError {
-			t.Fatalf("%s: %s", id, tr.Content.Text())
-		}
-	}
-	child, err := NewAgentFromDefinition(parent, mustLookup(t, specialists, "reviewer"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if child.History().Len() != 0 {
-		t.Fatal("a child must start with empty history (REQ-MULTI-02)")
-	}
-	if names := child.Tools(); len(names) != 0 {
-		t.Fatalf("the child's tool policy allowlists read_file only; got %d tools", len(names))
-	}
-	if child.ResolvedModel() != parent.ResolvedModel() {
-		t.Fatal("a definition with no model inherits the parent's")
-	}
-}
-
-func mustLookup(t *testing.T, r *AgentRegistry, name string) AgentDefinition {
-	t.Helper()
-	d, ok := r.Lookup(name)
-	if !ok {
-		t.Fatalf("no specialist %q", name)
-	}
-	return d
 }
 
 // ------------------------------------------------------------------ REQ-GO-14
@@ -674,7 +560,7 @@ func TestACutInsideATurnSummarizesTheTurnSeparately(t *testing.T) {
 		user("q3"), assistantSaying("a3", 0),
 	}
 	var mainSeen, turnSeen core.Messages
-	tf := NewContextTransform(CompactionDeps{
+	tf := compaction.NewContextTransform(compaction.Deps{
 		Strategy: cutAt{3}, // lands on assistant a2: inside turn q2
 		Summarizer: func(_ context.Context, prefix core.Messages, _ string) (string, error) {
 			mainSeen = prefix
@@ -690,7 +576,7 @@ func TestACutInsideATurnSummarizesTheTurnSeparately(t *testing.T) {
 	if len(mainSeen) != 2 || len(turnSeen) != 1 {
 		t.Fatalf("main summarizer saw %d messages, turn summarizer %d; want 2 (q1,a1) and 1 (q2)", len(mainSeen), len(turnSeen))
 	}
-	want := CompactionSummaryPrefix + "HEAD" + CompactionSplitSeparator + "TURN"
+	want := compaction.SummaryPrefix + "HEAD" + compaction.SplitSeparator + "TURN"
 	if got := view[0].(core.UserMessage).Content.Text(); got != want {
 		t.Fatalf("summary = %q, want %q", got, want)
 	}
@@ -703,4 +589,4 @@ type cutAt struct{ at int }
 
 func (cutAt) ShouldCompact(int, int) bool       { return true }
 func (c cutAt) CutIndex(core.Messages, int) int { return c.at }
-func (cutAt) CutPolicy() CutPolicy              { return CutNotToolResult }
+func (cutAt) CutPolicy() compaction.CutPolicy   { return compaction.CutNotToolResult }

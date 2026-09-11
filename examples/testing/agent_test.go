@@ -13,6 +13,7 @@ import (
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider/faux"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 // ---------------------------------------------------------------- fixtures
@@ -62,7 +63,7 @@ func newAgent(t *testing.T, p *faux.Provider, mutate func(*core.AgentConfig)) *a
 		Model:        faux.Model(),
 		Providers:    core.ProviderRegistry{faux.API: p.APIProvider()},
 		SystemPrompt: systemPrompt,
-		StopPolicy:   agentkit.StopAfterTurns(5),
+		StopPolicy:   stop.AfterTurns(5),
 	}
 	if mutate != nil {
 		mutate(&cfg)

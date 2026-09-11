@@ -70,7 +70,7 @@ Read from `agent-fox` v4.9.1, `packages/agentfox/agentfox/`.
 | Context | `## Requirements` · `## Test Specification` · `## Tasks` scoped by `render_individual_scoped(group, max_tokens=30_000)` · `## Architecture` · `## Steering Directives` · `## Memory Facts`, joined by `---` (`session/context.py`) | `Pack.AssembleContext`, via `afspec.RenderIndividualScoped` |
 | Task prompt | "Implement task group N from specification `x`… Do not modify tasks.json… commit… run the relevant test suite and linter" (`session/prompt.py:129`) | same text, two sentences changed (below) |
 | Retry note | "**Note:** This is retry attempt N. The previous attempt failed with: …" (`session_lifecycle.py:383`) | verbatim |
-| Tools | the CLI's toolset; Bash gated by a program allowlist and a shell-operator ban (`core/security.py`) | AgentKit's file tools + `execute` under `RestrictedPolicy` with agent-fox's allowlist. The coder may use shell operators — the pack's own test commands need `&&` — and every simple command on a line is checked; the gate and the verifier get no operators. `git` is limited to read-only subcommands, and an environment assignment in front of a program does not hide it |
+| Tools | the CLI's toolset; Bash gated by a program allowlist and a shell-operator ban (`core/security.py`) | AgentKit's file tools + `execute` under `guard.Restricted` with agent-fox's allowlist. The coder may use shell operators — the pack's own test commands need `&&` — and every simple command on a line is checked; the gate and the verifier get no operators. `git` is limited to read-only subcommands, and an environment assignment in front of a program does not hide it |
 | Bounds | Sonnet, `max_turns=300`, `max_budget_usd=20`, session timeout 45 min, `max_retries=2` | the same defaults |
 | Done | the orchestrator marks the subtasks done and commits `chore: mark task group N subtasks done` (`session_lifecycle.py:774`) | same message, through `TransitionSubtask` |
 | Landing | `git merge --squash` into `main` with the last non-housekeeping commit's message (`workspace/harvest.py`) | `SquashMergeInto` + `SquashMessage` |
@@ -117,8 +117,8 @@ Each of these is a choice, not an omission.
    later group's context.
 5. **No pre-flight reviewer, no audit-review, no coverage-regression
    finding.** All three feed and read the knowledge store. Compaction *is*
-   set up: every session installs `agentkit.NewContextTransform` with
-   `SummarizationCompaction` at 60% of the context window (`installCompaction`
+   set up: every session installs `compaction.NewContextTransform` with
+   `compaction.Summarization` at 60% of the context window (`installCompaction`
    in [`phases.go`](phases.go)), so a long coder session summarizes its own
    transcript instead of ending on a context-length error.
 6. **AGENTS.md / CLAUDE.md and steering are rendered into the coder's

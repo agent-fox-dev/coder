@@ -37,6 +37,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/session"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 func main() {
@@ -258,9 +259,9 @@ func run() error {
 		fmt.Printf("  [storage] session %q from plugin %q\n",
 			store.Header().ID, sp.PluginName())
 	}
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(6),
-		agentkit.StopOverBudget(0.50),
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(6),
+		stop.OverBudget(0.50),
 	)
 	cfg.SystemPrompt = "Use the tools. Report plainly what each one returned, including refusals."
 

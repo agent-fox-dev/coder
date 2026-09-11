@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 type auditLog struct {
@@ -112,41 +113,6 @@ func TestTheAuditTrailHashesArgumentsRatherThanRecordingThem(t *testing.T) {
 		}
 	}
 
-	// The same call hashes the same way, so an auditor can correlate; a
-	// different one does not.
-	same := ArgumentsHash([]byte(`{"a":1}`))
-	if same != ArgumentsHash([]byte(`{"a":1}`)) {
-		t.Fatal("the hash must be stable, or it correlates nothing")
-	}
-	if same == ArgumentsHash([]byte(`{"a":2}`)) {
-		t.Fatal("different arguments must hash differently")
-	}
-	if ArgumentsHash(nil) != "" {
-		t.Fatal("no arguments means no hash, not the hash of nothing")
-	}
-}
-
-func TestMCPServerOf(t *testing.T) {
-	cases := map[string]string{
-		"mcp__github__create_issue": "github",
-		"mcp__db__query":            "db",
-		"read_file":                 "",
-		"mcp__malformed":            "",
-		"mcp__":                     "",
-		"":                          "",
-		// A LOCAL tool whose name happens to contain the separator. Without
-		// the prefix check this reports a server called "my", inventing an MCP
-		// origin for a tool that has none — and an audit trail that attributes
-		// a local call to a remote server is worse than one that omits the
-		// field.
-		"my__local__tool": "",
-		"__leading":       "",
-	}
-	for in, want := range cases {
-		if got := MCPServerOf(in); got != want {
-			t.Errorf("MCPServerOf(%q) = %q, want %q", in, got, want)
-		}
-	}
 }
 
 // TestSessionStartAndEndFireOnEveryExit is REQ-OBS-03.
@@ -179,7 +145,7 @@ func TestSessionStartAndEndFireOnEveryExit(t *testing.T) {
 			assistantWithTools(core.StopReasonToolUse, toolUse(t, "c2", "echo", `{"v":"x"}`)),
 		}}
 		a := newTestAgent(t, s, func(c *core.AgentConfig) {
-			c.StopPolicy = StopAfterTurns(1)
+			c.StopPolicy = stop.AfterTurns(1)
 			c.ErrorOnLimit = true
 			c.Hooks.OnSessionStart = log.add
 			c.Hooks.OnSessionEnd = log.add
@@ -307,3 +273,24 @@ func TestAPanickingAuditHookDoesNotTakeTheRunWithIt(t *testing.T) {
 		t.Fatal("the panic must be surfaced through OnError, not swallowed")
 	}
 }
+
+// spanRecorder keeps EVERY span's attributes.
+type spanRecorder struct{ spans []map[string]any }
+
+func (r *spanRecorder) StartSpan(_ string, fn func(core.Span) error) error {
+	sp := &collectingSpan{attrs: map[string]any{}}
+	err := fn(sp)
+	r.spans = append(r.spans, sp.attrs)
+	return err
+}
+
+type collectingSpan struct{ attrs map[string]any }
+
+func (s *collectingSpan) SetAttributes(a map[string]any) {
+	for k, v := range a {
+		s.attrs[k] = v
+	}
+}
+func (s *collectingSpan) SetStatus(error)                 {}
+func (s *collectingSpan) AddEvent(string, map[string]any) {}
+func (s *collectingSpan) End()                            {}
