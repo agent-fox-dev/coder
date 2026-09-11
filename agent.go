@@ -512,3 +512,36 @@ func (a *Agent) wasAborted() bool {
 	defer a.mu.Unlock()
 	return a.aborted
 }
+
+// Config returns a copy of the agent's current configuration, read under the
+// lock. It is what a caller building a DERIVED agent — a delegation child
+// that inherits the parent's providers, credentials, plugins and tracer —
+// reads from; Snapshot's ConfigView is the narrower, serializable form.
+//
+// It is a copy of the struct, not a deep copy: the registries and slices it
+// carries are shared with the agent. Mutating them through the copy is the
+// caller's bug, exactly as it would be for the config passed to NewAgent.
+func (a *Agent) Config() core.AgentConfig {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg
+}
+
+// SetStopPolicy replaces AgentConfig.StopPolicy. Like RegisterTool and
+// SetPromptBlocks it returns ErrBusy while a run is in flight: the policy is
+// consulted at every turn boundary of the run that started with it, and
+// swapping it underneath that run would make the stop reason describe a
+// policy the caller of Run never saw.
+//
+// It exists so a delegation tool can graft a budget onto a child a factory
+// built without one (REQ-MULTI-03); an embedder constructing its own agent
+// puts the policy on the config instead.
+func (a *Agent) SetStopPolicy(p core.StopPolicy) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return core.ErrBusy
+	}
+	a.cfg.StopPolicy = p
+	return nil
+}
