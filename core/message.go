@@ -3,7 +3,7 @@
 // that are part of the contract, and the EventStream.
 //
 // core imports only jsonx and schema. Nothing in AgentKit below the root
-// package may import the root package, which is what keeps SubagentTool
+// package may import the root package, which is what keeps subagent.Tool
 // (needs *Agent) and compaction (needs a model call) out of core.
 package core
 

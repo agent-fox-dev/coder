@@ -13,7 +13,6 @@ import (
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/guard"
 	"github.com/agentfox/agentkit-go/schema"
-	"github.com/agentfox/agentkit-go/stop"
 )
 
 // blocking is a provider that honours ctx: it holds the stream open until the
@@ -545,76 +544,6 @@ func TestAShellToolWithNoInterceptorFailsTheRun(t *testing.T) {
 	if _, err := a.Run(context.Background(), "go"); err != nil {
 		t.Fatalf("excluded shell tool: %v", err)
 	}
-}
-
-// ------------------------------------------------------------------ REQ-MULTI-05
-
-// TestNamedSpecialistsAreInvokableByName: a registered definition becomes a
-// tool the parent model can call, and every call gets a fresh child scoped
-// by the definition's ToolPolicy.
-func TestNamedSpecialistsAreInvokableByName(t *testing.T) {
-	// One scripted double serves parent and children alike (the child
-	// inherits the parent's providers): the first call is the parent's
-	// delegating turn, and every call after it answers "done".
-	prov := &scripted{turns: []core.AssistantMessage{
-		assistantWithTools(core.StopReasonToolUse,
-			toolUse(t, "d1", "reviewer", `{"prompt":"look at x"}`),
-			toolUse(t, "d2", "reviewer", `{"prompt":"look at y"}`)),
-	}}
-	reg := core.ProviderRegistry{testAPI: prov.provider()}
-	parent, err := NewAgent(core.AgentConfig{Model: testModel(), Providers: reg, StopPolicy: stop.AfterTurns(5), ParallelTools: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	specialists := NewAgentRegistry()
-	if err := specialists.Register(AgentDefinition{
-		Name: "reviewer", Description: "reviews code", SystemPrompt: "You review.",
-		ToolPolicy: core.ToolPolicy{ToolNames: []string{"read_file"}},
-		StopPolicy: stop.AfterTurns(2),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := specialists.Register(AgentDefinition{Name: "reviewer"}); err == nil {
-		t.Fatal("a duplicate name must be refused")
-	}
-	for _, tool := range specialists.Tools(parent, 0) {
-		if err := parent.RegisterTool(tool); err != nil {
-			t.Fatal(err)
-		}
-	}
-	res, err := parent.Run(context.Background(), "review both")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range []string{"d1", "d2"} {
-		tr := findToolResult(t, res.Messages, id)
-		if tr.IsError {
-			t.Fatalf("%s: %s", id, tr.Content.Text())
-		}
-	}
-	child, err := NewAgentFromDefinition(parent, mustLookup(t, specialists, "reviewer"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if child.History().Len() != 0 {
-		t.Fatal("a child must start with empty history (REQ-MULTI-02)")
-	}
-	if names := child.Tools(); len(names) != 0 {
-		t.Fatalf("the child's tool policy allowlists read_file only; got %d tools", len(names))
-	}
-	if child.ResolvedModel() != parent.ResolvedModel() {
-		t.Fatal("a definition with no model inherits the parent's")
-	}
-}
-
-func mustLookup(t *testing.T, r *AgentRegistry, name string) AgentDefinition {
-	t.Helper()
-	d, ok := r.Lookup(name)
-	if !ok {
-		t.Fatalf("no specialist %q", name)
-	}
-	return d
 }
 
 // ------------------------------------------------------------------ REQ-GO-14

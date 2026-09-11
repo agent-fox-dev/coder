@@ -37,7 +37,7 @@ type prefixEntry struct {
 //
 // It is a value on the session, never a package-level map: two agents in one
 // process routinely hold tools of the same NAME and different schemas — that
-// is what SubagentTool is for — and a shared cache keyed by name would serve
+// is what subagent.Tool is for — and a shared cache keyed by name would serve
 // one agent's schema to the other.
 type ToolPrefix struct {
 	mu sync.Mutex

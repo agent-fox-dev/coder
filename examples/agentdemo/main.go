@@ -24,6 +24,7 @@ import (
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/session"
 	"github.com/agentfox/agentkit-go/stop"
+	"github.com/agentfox/agentkit-go/subagent"
 )
 
 func main() {
@@ -431,7 +432,7 @@ func demoKillAndResume() {
 
 func demoDelegation() {
 	rule("7. Delegation hands out a FRESH child per call (REQ-MULTI-02/04)")
-	fmt.Println("SubagentTool takes a FACTORY, not an agent. A single shared child looks")
+	fmt.Println("subagent.Tool takes a FACTORY, not an agent. A single shared child looks")
 	fmt.Println("correct and fails under exactly the condition delegation exists for: two")
 	fmt.Print("parallel calls, where the second finds the run slot taken.\n\n")
 
@@ -466,8 +467,8 @@ func demoDelegation() {
 		}
 		return child, nil
 	}
-	if err := a.RegisterTool(agentkit.SubagentTool(a, factory,
-		agentkit.SubagentOptions{Name: "researcher"})); err != nil {
+	if err := a.RegisterTool(subagent.Tool(a, factory,
+		subagent.Options{Name: "researcher"})); err != nil {
 		fail(err)
 	}
 
