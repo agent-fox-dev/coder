@@ -377,7 +377,7 @@ func demoKillAndResume() {
 	path := filepath.Join(dir, "session.jsonl")
 
 	// ---- Process 1.
-	store1, _, err := agentkit.OpenSession(path, session.Options{Durability: session.DurabilityPerEntry})
+	store1, _, err := session.OpenOrCreate(path, session.Options{Durability: session.DurabilityPerEntry})
 	if err != nil {
 		fail(err)
 	}
@@ -394,7 +394,7 @@ func demoKillAndResume() {
 	fmt.Print("  ...process 1 exits.\n\n")
 
 	// ---- Process 2 reopens the same path.
-	store2, resume, err := agentkit.OpenSession(path, session.Options{Durability: session.DurabilityPerEntry})
+	store2, resume, err := session.OpenOrCreate(path, session.Options{Durability: session.DurabilityPerEntry})
 	if err != nil {
 		fail(err)
 	}

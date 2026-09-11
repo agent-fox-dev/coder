@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/session"
 )
 
 // TestEveryStreamedEventEncodesAsTheUnion drives a real run and encodes every
@@ -22,7 +23,7 @@ func TestEveryStreamedEventEncodesAsTheUnion(t *testing.T) {
 	}
 	n := 0
 	for e := range st.Events() {
-		b, err := EventJSON(e)
+		b, err := session.EventJSON(e)
 		if err != nil {
 			t.Fatalf("%T: %v", e, err)
 		}

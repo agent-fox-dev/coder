@@ -17,9 +17,9 @@ import (
 
 func openTestSession(t *testing.T, path string) (*session.Store, *session.Resume) {
 	t.Helper()
-	store, r, err := OpenSession(path, session.Options{Durability: session.DurabilityPerEntry})
+	store, r, err := session.OpenOrCreate(path, session.Options{Durability: session.DurabilityPerEntry})
 	if err != nil {
-		t.Fatalf("OpenSession: %v", err)
+		t.Fatalf("OpenOrCreate: %v", err)
 	}
 	return store, r
 }

@@ -75,7 +75,7 @@ func run() error {
 	)
 	cfg.SystemPrompt = "You are concise. Answer in plain prose, no preamble."
 
-	// 1. OpenSession creates the log or opens an existing one, and hands back
+	// 1. session.OpenOrCreate creates the log or opens an existing one, and hands back
 	//    both halves: the store to keep writing to, and the fold of what is
 	//    already there. It is the front door precisely because the wrong way
 	//    to resume — build an agent, then patch the recovered model onto it —
@@ -85,7 +85,7 @@ func run() error {
 	//    flush per message, and it is the right trade whenever losing the
 	//    transcript would lose real work; DurabilityBuffered (the default)
 	//    survives process death but not machine death.
-	store, resume, err := agentkit.OpenSession(*path, session.Options{
+	store, resume, err := session.OpenOrCreate(*path, session.Options{
 		Durability: session.DurabilityPerEntry,
 	})
 	if err != nil {
