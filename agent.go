@@ -171,7 +171,7 @@ func (a *Agent) RegisterTool(t core.Tool) error {
 
 // SetPromptBlocks replaces AgentConfig.PromptBlocks: the extra system-prompt
 // sections appended after the built-in ones, which is where the skills and
-// project-context block goes (SkillBlocks builds it).
+// project-context block goes (prompt.SkillBlocks builds it).
 //
 // It exists because the two halves of the skills wiring sat on opposite sides
 // of the constructor. The assembled block is a field on core.AgentConfig, so
@@ -182,10 +182,10 @@ func (a *Agent) RegisterTool(t core.Tool) error {
 // AuditSkills — which is the exact call LoadSkills exists to make
 // unforgettable. Now there is one order that does both:
 //
-//	cfg := agentkit.SkillsConfigFor(agentCfg, workDir, skills.BuiltinDir())
+//	cfg := skills.ConfigFor(agentCfg, workDir, skills.BuiltinDir())
 //	sel := agent.LoadSkills(skills.Discover(cfg), archetype, task, cfg)
 //	files, _ := skills.DiscoverContext(cfg)
-//	err := agent.SetPromptBlocks(agentkit.SkillBlocks(sel, files, agent.Tools()))
+//	err := agent.SetPromptBlocks(prompt.SkillBlocks(sel, files, agent.Tools()))
 //
 // Like RegisterTool it returns ErrBusy while a run is in flight, for the same
 // reason: the assembled prompt is the provider's cached prefix (REQ-CACHE-06),

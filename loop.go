@@ -8,6 +8,7 @@ import (
 
 	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/prompt"
 )
 
 // maxTokensToolText is REQ-LOOP-10's fixed result text, pinned byte-for-byte
@@ -567,7 +568,7 @@ func (a *Agent) callModel(ctx context.Context, out *core.EventStream, view core.
 	// (NFR-TEST-08a) and REQ-TOOL-04e's conditional guideline are only visible
 	// to the model if something assembles them, and the tool set they describe
 	// is the RESOLVED one just computed above.
-	if sys := BuildSystemPrompt(PromptInput{
+	if sys := prompt.Build(prompt.Input{
 		Custom: cfg.SystemPrompt, Tools: tools, ExtraBlocks: cfg.PromptBlocks,
 	}); sys != "" {
 		req.System = []core.ContentBlock{core.TextBlock{Text: sys}}

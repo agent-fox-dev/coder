@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/prompt"
 	"github.com/agentfox/agentkit-go/skills"
 )
 
@@ -42,8 +43,8 @@ func TestAnUntrustedProjectSkillNeverReachesTheAssembledPrompt(t *testing.T) {
 		// has and is omitted when there is none (REQ-SKILL-06.2), so the
 		// trusted arm needs one to be offered anything at all.
 		_ = a.RegisterTool(echoTool("read_file", nil))
-		reg := skills.Discover(SkillsConfigFor(a.cfg, work, ""))
-		a.cfg.PromptBlocks = SkillBlocks(reg.Skills(), nil, a.Tools())
+		reg := skills.Discover(skills.ConfigFor(a.cfg, work, ""))
+		a.cfg.PromptBlocks = prompt.SkillBlocks(reg.Skills(), nil, a.Tools())
 		if _, err := a.Run(context.Background(), "go"); err != nil {
 			t.Fatal(err)
 		}
@@ -92,7 +93,7 @@ func TestLoadSkillsAuditsEverySkillItReturns(t *testing.T) {
 		c.TrustProject = true
 		c.Hooks.OnAudit = log.add
 	})
-	cfg := SkillsConfigFor(a.cfg, work, "")
+	cfg := skills.ConfigFor(a.cfg, work, "")
 	sel := a.LoadSkills(skills.Discover(cfg), "", "", cfg)
 	if len(sel) != 2 {
 		t.Fatalf("selected %d skills, want 2", len(sel))
@@ -145,10 +146,10 @@ func TestLoadSkillsSelectionCanReachTheAssembledPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := SkillsConfigFor(a.cfg, work, "")
+	cfg := skills.ConfigFor(a.cfg, work, "")
 	sel := a.LoadSkills(skills.Discover(cfg), "", "", cfg)
 	files, _ := skills.DiscoverContext(cfg)
-	if err := a.SetPromptBlocks(SkillBlocks(sel, files, a.Tools())); err != nil {
+	if err := a.SetPromptBlocks(prompt.SkillBlocks(sel, files, a.Tools())); err != nil {
 		t.Fatalf("SetPromptBlocks: %v", err)
 	}
 	if _, err := a.Run(context.Background(), "go"); err != nil {

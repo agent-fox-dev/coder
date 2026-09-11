@@ -1,4 +1,13 @@
-package agentkit
+// Package prompt assembles the system prompt the loop sends (NFR-TEST-08a,
+// REQ-TOOL-04e, REQ-SKILL-06).
+//
+// Until this existed, core.Tool.PromptGuidelines was a field nothing read and
+// the loop sent AgentConfig.SystemPrompt verbatim — so a tool could declare
+// guidance the model never saw. NFR-TEST-08(a) asks for a golden of the
+// assembled prompt "built through the real tool resolver", which needs a real
+// assembler to build it. Build is that assembler; SkillBlocks renders the
+// skills and project-context block that goes into Input.ExtraBlocks.
+package prompt
 
 import (
 	"strings"
@@ -8,23 +17,15 @@ import (
 	"github.com/agentfox/agentkit-go/tools"
 )
 
-// The assembled system prompt (NFR-TEST-08a, REQ-TOOL-04e, REQ-SKILL-06).
-//
-// Until this existed, core.Tool.PromptGuidelines was a field nothing read and
-// the loop sent AgentConfig.SystemPrompt verbatim — so a tool could declare
-// guidance the model never saw. NFR-TEST-08(a) asks for a golden of the
-// assembled prompt "built through the real tool resolver", which needs a real
-// assembler to build it.
-
-// PromptSection names a block of the assembled prompt. The order of this
+// Section names a block of the assembled prompt. The order of this
 // declaration is the order they appear, and the golden pins it.
-type PromptSection string
+type Section string
 
 const (
-	SectionBase       PromptSection = "base"
-	SectionTools      PromptSection = "tools"
-	SectionGuidelines PromptSection = "guidelines"
-	SectionSkills     PromptSection = "skills"
+	SectionBase       Section = "base"
+	SectionTools      Section = "tools"
+	SectionGuidelines Section = "guidelines"
+	SectionSkills     Section = "skills"
 )
 
 // BaseInstructions is the built-in opening section.
@@ -50,8 +51,8 @@ var UniversalGuidelines = []string{
 	"Report what you actually did, including what failed.",
 }
 
-// PromptInput is everything the assembler needs.
-type PromptInput struct {
+// Input is everything the assembler needs.
+type Input struct {
 	// Custom replaces the BUILT-IN sections when non-empty (AgentConfig.SystemPrompt).
 	Custom string
 	// Tools is the set actually active after the REQ-TOOL-10 policy resolved,
@@ -69,14 +70,14 @@ type PromptInput struct {
 	ExtraBlocks []string
 }
 
-// BuildSystemPrompt assembles the prompt.
+// Build assembles the prompt.
 //
 // A CUSTOM prompt replaces the built-in base and the built-in guidelines, and
 // nothing else. Skills and project context still append: an embedder enables
 // those by a separate affirmative act — discovery, and REQ-SEC-10's project
 // trust — and having a custom prompt silently switch them off would mean the
 // trust decision quietly stopped applying.
-func BuildSystemPrompt(in PromptInput) string {
+func Build(in Input) string {
 	var blocks []string
 
 	if in.Custom != "" {
@@ -97,7 +98,7 @@ func BuildSystemPrompt(in PromptInput) string {
 }
 
 // SkillBlocks renders the REQ-SKILL-06 skills block and the REQ-CTX project
-// context block, ready for PromptInput.ExtraBlocks.
+// context block, ready for Input.ExtraBlocks.
 //
 // tools must be the ACTIVE set: the block names the tool the model should read
 // a skill with, and naming one the model does not have produces a hallucinated
