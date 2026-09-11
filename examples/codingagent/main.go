@@ -92,7 +92,7 @@ func run() error {
 	//    set above, so a nil cfg.BeforeToolCall fails the run on its first
 	//    line with core.ErrUnguardedExecute — before a request is sent, and
 	//    long before an unrestricted shell shows up on a bill. There are
-	//    exactly two ways past it: an interceptor, or agentkit.AllowAllToolCalls,
+	//    exactly two ways past it: an interceptor, or guard.AllowAll,
 	//    which is the explicit "yes, this agent runs an unrestricted shell".
 	//
 	//    RestrictedPolicy is the shipped starting point: an allowlist of

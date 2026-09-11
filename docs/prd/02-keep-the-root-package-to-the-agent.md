@@ -1,7 +1,8 @@
 # Keep the root package to the Agent
 
-Status: **proposal, awaiting review**. Nothing in this document has been
-implemented. It records what the root package holds today, what it should
+Status: **implemented** (ADR [01](../adr/01-keep-the-root-package-to-the-agent.md),
+erratum [`package_layout.md`](../errata/package_layout.md)). Written as the
+proposal it was; it records what the root package holds today, what it should
 hold, the dependency facts that decide which code can move where, and the
 order of the moves so that every step leaves `make check` green.
 

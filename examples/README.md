@@ -263,14 +263,14 @@ These are not defaults you can ignore — the library will stop you.
 `run_command` or `powershell` with a nil `AgentConfig.BeforeToolCall` fails the
 run with `core.ErrUnguardedExecute`, before any request is built. A headless
 service would otherwise hand the model an unrestricted shell by omission.
-Supply an interceptor — `agentkit.RestrictedPolicy` is a replaceable starting
-point — or pass `agentkit.AllowAllToolCalls` to say in code that you meant it.
+Supply an interceptor — `guard.Restricted` is a replaceable starting
+point — or pass `guard.AllowAll` to say in code that you meant it.
 See [`codingagent`](codingagent).
 
-**A stop policy is how a run ends.** `StopAfterTurns` and `StopOverBudget`
-compose with `StopAny`. Without one, a tool-using agent has no upper bound.
+**A stop policy is how a run ends.** `stop.AfterTurns` and `stop.OverBudget`
+compose with `stop.Any`. Without one, a tool-using agent has no upper bound.
 The budget check runs after each turn, so a run can overshoot by at most one
-turn plus its tool batch; `BudgetMiddleware` is the pre-turn gate if you need
+turn plus its tool batch; `middleware.Budget` is the pre-turn gate if you need
 a hard ceiling.
 
 **File tools are contained to a workspace root**, resolved through symlinks
@@ -308,7 +308,7 @@ Deltas are an optimization; the authoritative events always arrive.
 
 ## Compaction
 
-`agentkit.NewContextTransform` installs a context transform that summarizes a
+`compaction.NewContextTransform` installs a context transform that summarizes a
 growing transcript in place. Once a summary checkpoint exists it is always
 re-applied; the threshold only decides whether to extend it. The naive
 "compact when over threshold" reading oscillates.

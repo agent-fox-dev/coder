@@ -88,7 +88,7 @@ not because the prompt asks nicely.
 is handed against one directory, symlinks included, so `../../.ssh/id_rsa` is
 refused by the tool rather than by a paragraph in the system prompt.
 
-**A layered authorization boundary.** `agentkit.RestrictedPolicy` supplies the
+**A layered authorization boundary.** `guard.Restricted` supplies the
 floor — an allowlist of program names. The implementation phase may use shell
 operators (`go test ./... 2>&1 | grep FAIL`); the read-only analysis phase may
 not, because a redirection is a write. On top of it, `toolGuard` in
@@ -103,8 +103,8 @@ environment assignment in front of a program (`GIT_AUTHOR_NAME=x git push`)
 does not hide it. A refusal comes back to the model as a blocked tool result,
 so it adapts instead of dying.
 
-**Compaction.** Both phases install `agentkit.NewContextTransform` with
-`SummarizationCompaction` at 60% of the context window (`installCompaction` in
+**Compaction.** Both phases install `compaction.NewContextTransform` with
+`compaction.Summarization` at 60% of the context window (`installCompaction` in
 [`phases.go`](phases.go)), so a phase that reads many large files summarizes
 its own transcript instead of ending on a context-length error before it
 reaches its terminating tool.
@@ -115,7 +115,7 @@ moment the structured answer arrives — and the stop policy names them too, so
 `StopWhenToolCalled` is the intended ending rather than the turn ceiling.
 
 **Bounds that are not the model's choice.** Every phase runs under
-`StopAny(StopAfterTurns(n), StopOverBudget(usd), StopWhenToolCalled(...))`. A
+`stop.Any(stop.AfterTurns(n), stop.OverBudget(usd), stop.WhenToolCalled(...))`. A
 phase that never reaches its terminating tool stops anyway, and the program
 reports that as a failed run rather than as a fix.
 
@@ -283,7 +283,7 @@ Stated rather than left to be discovered:
   `Brain` is an interface, and an implementation that loops on `VerifyResult`
   would be a drop-in.)
 - **No session persistence.** Each phase is a fresh agent. A crashed run is
-  re-run from the start, not resumed — `agentkit.OpenSession` is what you would
+  re-run from the start, not resumed — `session.OpenOrCreate` is what you would
   add here, and [`examples/session`](../session) shows how.
 - **It does not look at CI.** Verification is the local command only.
 - **The shell allowlist is a floor, not a sandbox.** `go` and `make` alone can
