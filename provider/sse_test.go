@@ -108,7 +108,7 @@ func TestOversizedEventIsRejectedBeforeItIsAccumulated(t *testing.T) {
 // retry for the commonest streaming failure there is.
 func TestTruncationErrorTextMatchesTheRetryAllowlist(t *testing.T) {
 	if !strings.Contains(provider.ErrSSETruncated.Error(), "stream ended before message_stop") {
-		t.Fatalf("ErrSSETruncated = %q; RetryMiddleware's allowlist matches "+
+		t.Fatalf("ErrSSETruncated = %q; middleware.Retry's allowlist matches "+
 			"\"stream ended before message_stop\"", provider.ErrSSETruncated)
 	}
 }

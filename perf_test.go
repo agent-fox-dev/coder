@@ -8,6 +8,7 @@ import (
 
 	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/provider"
 	"github.com/agentfox/agentkit-go/provider/anthropic"
 	"github.com/agentfox/agentkit-go/schema"
@@ -165,7 +166,7 @@ func cachedHandler() (core.Handler, core.Handler, core.Request) {
 	}
 	req := core.Request{Messages: core.Messages{
 		core.UserMessage{Content: core.Content{core.TextBlock{Text: "a question"}}}}}
-	cached := CachingMiddleware(CacheOptions{})(direct)
+	cached := middleware.Caching(middleware.CacheOptions{})(direct)
 	// Warm it, so the benchmark measures HITS.
 	cached(context.Background(), req).Result()
 	return direct, cached, req
@@ -334,7 +335,7 @@ func BenchmarkFingerprint(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := Fingerprint(req); err != nil {
+		if _, err := middleware.Fingerprint(req); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -133,7 +133,7 @@ type AgentConfig struct {
 	Plugins PluginRegistry
 	// Tracer receives the REQ-OBS-02 tool spans. Nil means NoopTracer.
 	//
-	// It is separate from TracingMiddleware's tracer, which wraps the MODEL
+	// It is separate from middleware.Tracing's tracer, which wraps the MODEL
 	// call: middleware cannot see a tool execution at all, so a tracer that
 	// reached the SDK only through Axis 1 would leave REQ-OBS-02
 	// unimplementable. Pass the same value to both to get one trace.

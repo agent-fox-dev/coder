@@ -411,7 +411,7 @@ func (d *decodeState) consume(r *provider.SSEReader) error {
 				// A 200 whose body simply stops is the single commonest
 				// streaming failure and it is invisible to the transport
 				// layer. Only this check turns it into something
-				// RetryMiddleware can classify.
+				// middleware.Retry can classify.
 				return provider.ErrSSETruncated
 			}
 			return nil

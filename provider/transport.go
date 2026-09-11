@@ -16,7 +16,7 @@ import (
 //
 // It is one of the two independent layers of REQ-PROV-06, and the split is not
 // redundancy. This layer sees status codes, `x-should-retry` and `Retry-After`
-// and nothing else; the semantic layer (RetryMiddleware, REQ-PROV-14) sees a
+// and nothing else; the semantic layer (middleware.Retry, REQ-PROV-14) sees a
 // completed AssistantMessage and classifies its prose. Neither subsumes the
 // other: a truncated SSE body is a 200 here and an error there, and an
 // out-of-credit 429 is retryable here and denylisted there.

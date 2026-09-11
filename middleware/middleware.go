@@ -1,4 +1,20 @@
-package agentkit
+// Package middleware is Axis 1 of the two extension axes (§5): functions that
+// wrap the whole model call and operate on CANONICAL types. A middleware can
+// change *what* is asked for, not *how* the provider encoded it —
+// post-serialization interception is core.RequestOptions.OnPayload.
+//
+// The last registered middleware is outermost and executes first
+// (core.Chain). The five shipped here are Retry (REQ-PROV-14), Budget
+// (the pre-turn cost gate), Caching (Level 2 dedup, REQ-CACHE-01..05),
+// Tracing (REQ-OBS-01) and RateLimit; CacheMeter is the REQ-CACHE-08 session
+// aggregate the Agent holds and Caching feeds.
+//
+// Compaction is deliberately NOT a middleware. It is a context transform
+// inside the loop (REQ-GO-12, package compaction), because a compaction
+// middleware's own summarization call would re-enter the chain, be
+// fingerprinted by the dedup cache, and be charged against the budget gate as
+// though it were a conversational turn.
+package middleware
 
 import (
 	"context"
@@ -26,7 +42,7 @@ import (
 
 // ---------------------------------------------------------------- retry
 
-// RetryOptions configures RetryMiddleware.
+// RetryOptions configures Retry.
 type RetryOptions struct {
 	// MaxAttempts counts the FIRST attempt. 1 means no retries.
 	//
@@ -72,7 +88,7 @@ func (o RetryOptions) withDefaults() RetryOptions {
 	return o
 }
 
-// RetryMiddleware is the SEMANTIC retry layer of REQ-PROV-14.
+// Retry is the SEMANTIC retry layer of REQ-PROV-14.
 //
 // It operates on a completed AssistantMessage with stop_reason "error",
 // classifying its error text — because a large fraction of real provider
@@ -85,7 +101,7 @@ func (o RetryOptions) withDefaults() RetryOptions {
 // slept) belongs inside the provider (REQ-PROV-13). It is NOT implemented in
 // v1 and deliberately has no knobs here: exposing MaxServerDelay on this
 // struct would advertise a control that nothing reads.
-func RetryMiddleware(opts RetryOptions) core.Middleware {
+func Retry(opts RetryOptions) core.Middleware {
 	o := opts.withDefaults()
 	return func(next core.Handler) core.Handler {
 		return func(ctx context.Context, req core.Request) *core.EventStream {
@@ -190,10 +206,10 @@ func Retryable(msg *core.AssistantMessage) bool {
 
 // ---------------------------------------------------------------- budget
 
-// ErrBudgetGate is returned by BudgetMiddleware when a turn is refused.
+// ErrBudgetGate is returned by Budget when a turn is refused.
 var ErrBudgetGate = errors.New("agentkit: budget gate refused the turn")
 
-// BudgetMiddleware is the PRE-TURN cost gate.
+// Budget is the PRE-TURN cost gate.
 //
 // It is a different mechanism from stop.OverBudget, and both exist on purpose.
 // The stop policy runs AFTER a turn, so a run may overshoot by one turn plus
@@ -201,7 +217,7 @@ var ErrBudgetGate = errors.New("agentkit: budget gate refused the turn")
 // before it is sent, which is the only way to not spend the money at all. A
 // caller who cares about the ceiling wants both: this to stop the next turn,
 // the policy to end the run cleanly.
-func BudgetMiddleware(maxUSD float64, usage func() core.Usage) core.Middleware {
+func Budget(maxUSD float64, usage func() core.Usage) core.Middleware {
 	return func(next core.Handler) core.Handler {
 		return func(ctx context.Context, req core.Request) *core.EventStream {
 			if usage != nil && usage().CostUSD >= maxUSD {
@@ -217,7 +233,7 @@ func BudgetMiddleware(maxUSD float64, usage func() core.Usage) core.Middleware {
 
 // ---------------------------------------------------------------- caching
 
-// CacheOptions configures CachingMiddleware.
+// CacheOptions configures Caching.
 type CacheOptions struct {
 	MaxSize int // default 128 (REQ-CACHE-03)
 	// IgnoreTemperature replays non-deterministic responses. Off by default:
@@ -233,7 +249,7 @@ type CacheOptions struct {
 	Meter *CacheMeter
 }
 
-// CachingMiddleware is Level 2, in-process request deduplication.
+// Caching is Level 2, in-process request deduplication.
 //
 // The fingerprint is a SHA-256 over the SERIALIZED REQUEST BYTES — the exact
 // bytes a provider would put on the wire, including preserved tool-argument
@@ -242,7 +258,7 @@ type CacheOptions struct {
 // map to fix that produces a stable fingerprint that no longer identifies the
 // bytes actually sent, which is worse than the instability it cured
 // (REQ-CACHE-01).
-func CachingMiddleware(opts CacheOptions) core.Middleware {
+func Caching(opts CacheOptions) core.Middleware {
 	if opts.MaxSize <= 0 {
 		opts.MaxSize = 128
 	}
@@ -439,36 +455,18 @@ func (l *lru) len() int {
 
 // ---------------------------------------------------------------- tracing
 
-// Span is the tracing contract, defined by AgentKit rather than imported.
-//
-// REQ-OBS-01 named OpenTelemetry and REQ-GO-11 forbids any third-party
-// dependency in the root module; the two could not both hold as written. Two
-// small interfaces plus a no-op default resolve it, and the OTel binding
-// becomes the host's — which is where it belongs anyway, since the host
-// already has a tracer configured.
-// Span, Tracer and NoopTracer are aliases of the core declarations. They moved
-// to core when REQ-OBS-02 put a span around every tool call: AgentConfig has to
-// hold a Tracer, and a tracer reachable only through Axis 1 middleware cannot
-// see a tool.
-type Span = core.Span
-
-type Tracer = core.Tracer
-
-// NoopTracer is core.NoopTracer.
-var NoopTracer = core.NoopTracer
-
-// TracingMiddleware wraps every model call in a span carrying REQ-OBS-01's
+// Tracing wraps every model call in a span carrying REQ-OBS-01's
 // attributes, plus REQ-CACHE-09's cache attributes when a cache decision was
 // made inside the span.
 //
 // ORDERING: for the cache attributes to appear, tracing must WRAP caching.
 // Since the last registered middleware is outermost (§5, Axis 1), that means
-// registering TracingMiddleware AFTER CachingMiddleware. Registered the other
+// registering Tracing AFTER Caching. Registered the other
 // way round the spans still carry every REQ-OBS-01 attribute and simply omit
 // the cache ones — a missing attribute, never a wrong one.
-func TracingMiddleware(t Tracer) core.Middleware {
+func Tracing(t core.Tracer) core.Middleware {
 	if t == nil {
-		t = NoopTracer
+		t = core.NoopTracer
 	}
 	return func(next core.Handler) core.Handler {
 		return func(ctx context.Context, req core.Request) *core.EventStream {
@@ -478,7 +476,7 @@ func TracingMiddleware(t Tracer) core.Middleware {
 			// completes; the events are not held back for it (see
 			// teeStream). Tracer.StartSpan's callback shape is kept — the
 			// callback returns immediately and the span is ended on the tee.
-			_ = t.StartSpan("agentkit.model_call", func(sp Span) error {
+			_ = t.StartSpan("agentkit.model_call", func(sp core.Span) error {
 				out = teeStream(next(ctx, req), func(msg *core.AssistantMessage) {
 					defer sp.End()
 					attrs := map[string]any{
@@ -512,8 +510,8 @@ func TracingMiddleware(t Tracer) core.Middleware {
 
 // ---------------------------------------------------------------- rate limit
 
-// RateLimitMiddleware is a token bucket over model calls.
-func RateLimitMiddleware(perSecond float64, burst int) core.Middleware {
+// RateLimit is a token bucket over model calls.
+func RateLimit(perSecond float64, burst int) core.Middleware {
 	if burst < 1 {
 		burst = 1
 	}

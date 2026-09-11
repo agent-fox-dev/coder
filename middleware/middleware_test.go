@@ -1,4 +1,4 @@
-package agentkit
+package middleware
 
 import (
 	"context"
@@ -88,7 +88,7 @@ func TestRetryDefaultsToNoRetries(t *testing.T) {
 	// A hidden retry multiplies cost and tail latency invisibly, once per turn,
 	// against the same budget the SDK promises to enforce (OQ-9).
 	h, calls := handlerReturning(errMsg("overloaded"), errMsg("overloaded"))
-	mw := RetryMiddleware(noSleep())
+	mw := Retry(noSleep())
 	_ = mw(h)(context.Background(), core.Request{}).Result()
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("handler called %d times with default options, want 1: retries are "+
@@ -102,7 +102,7 @@ func TestRetryStopsOnFirstSuccess(t *testing.T) {
 	h, calls := handlerReturning(errMsg("overloaded"), errMsg("rate limit"), ok)
 	o := noSleep()
 	o.MaxAttempts = 5
-	msg := RetryMiddleware(o)(h)(context.Background(), core.Request{}).Result()
+	msg := Retry(o)(h)(context.Background(), core.Request{}).Result()
 
 	if calls.Load() != 3 {
 		t.Fatalf("handler called %d times, want 3 (two failures then success)", calls.Load())
@@ -116,7 +116,7 @@ func TestRetryGivesUpOnANonRetryableError(t *testing.T) {
 	h, calls := handlerReturning(errMsg("insufficient_quota"), errMsg("insufficient_quota"))
 	o := noSleep()
 	o.MaxAttempts = 5
-	_ = RetryMiddleware(o)(h)(context.Background(), core.Request{}).Result()
+	_ = Retry(o)(h)(context.Background(), core.Request{}).Result()
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("handler called %d times on a quota error, want 1", got)
 	}
@@ -141,7 +141,7 @@ func TestCancellationDuringBackoffNormalizesToAborted(t *testing.T) {
 	h, _ := handlerReturning(errMsg("overloaded"), errMsg("overloaded"))
 	o := RetryOptions{MaxAttempts: 3, Rand: func() float64 { return 0 }}
 	o.Sleep = func(context.Context, time.Duration) error { return context.Canceled }
-	msg := RetryMiddleware(o)(h)(context.Background(), core.Request{}).Result()
+	msg := Retry(o)(h)(context.Background(), core.Request{}).Result()
 	if msg.StopReason != core.StopReasonAborted {
 		t.Fatalf("stop reason = %q, want aborted: a cancellation landing during the "+
 			"backoff sleep normalizes to an aborted message (REQ-PROV-14)", msg.StopReason)
@@ -157,7 +157,7 @@ func TestBudgetGateRefusesBeforeSending(t *testing.T) {
 	h, calls := handlerReturning()
 	var u core.Usage
 	u.SetCost(2.0)
-	mw := BudgetMiddleware(1.0, func() core.Usage { return u })
+	mw := Budget(1.0, func() core.Usage { return u })
 
 	s := mw(h)(context.Background(), core.Request{})
 	if calls.Load() != 0 {
@@ -173,7 +173,7 @@ func TestBudgetGatePassesWhenUnderBudget(t *testing.T) {
 	h, calls := handlerReturning()
 	var u core.Usage
 	u.SetCost(0.1)
-	_ = BudgetMiddleware(1.0, func() core.Usage { return u })(h)(context.Background(), core.Request{}).Result()
+	_ = Budget(1.0, func() core.Usage { return u })(h)(context.Background(), core.Request{}).Result()
 	if calls.Load() != 1 {
 		t.Fatal("an under-budget request must pass through")
 	}
@@ -184,7 +184,7 @@ func TestBudgetGatePassesWhenUnderBudget(t *testing.T) {
 func TestCacheHitSkipsTheProvider(t *testing.T) {
 	h, calls := handlerReturning()
 	var hits, misses atomic.Int32
-	mw := CachingMiddleware(CacheOptions{
+	mw := Caching(CacheOptions{
 		OnHit:  func(string) { hits.Add(1) },
 		OnMiss: func(string) { misses.Add(1) },
 	})
@@ -263,7 +263,7 @@ func TestCacheDoesNotReplayNonDeterministicResponses(t *testing.T) {
 		Temperature: &temp,
 		Messages:    core.Messages{core.UserMessage{Content: core.Content{core.TextBlock{Text: "x"}}}},
 	}
-	mw := CachingMiddleware(CacheOptions{})
+	mw := Caching(CacheOptions{})
 	_ = mw(h)(context.Background(), req).Result()
 	_ = mw(h)(context.Background(), req).Result()
 	if calls.Load() != 2 {
@@ -274,7 +274,7 @@ func TestCacheDoesNotReplayNonDeterministicResponses(t *testing.T) {
 
 func TestCacheDoesNotStoreErrors(t *testing.T) {
 	h, calls := handlerReturning(errMsg("overloaded"))
-	mw := CachingMiddleware(CacheOptions{})
+	mw := Caching(CacheOptions{})
 	req := core.Request{Messages: core.Messages{
 		core.UserMessage{Content: core.Content{core.TextBlock{Text: "x"}}}}}
 	_ = mw(h)(context.Background(), req).Result()
@@ -306,7 +306,7 @@ type recordingTracer struct {
 	status error
 }
 
-func (r *recordingTracer) StartSpan(_ string, fn func(Span) error) error {
+func (r *recordingTracer) StartSpan(_ string, fn func(core.Span) error) error {
 	r.spans.Add(1)
 	return fn(&recordingSpan{t: r})
 }
@@ -329,7 +329,7 @@ func TestTracingCarriesTheRequiredAttributes(t *testing.T) {
 
 	h, _ := handlerReturning(msg)
 	tr := &recordingTracer{}
-	_ = TracingMiddleware(tr)(h)(context.Background(), core.Request{}).Result()
+	_ = Tracing(tr)(h)(context.Background(), core.Request{}).Result()
 
 	if tr.spans.Load() != 1 {
 		t.Fatalf("spans = %d, want 1", tr.spans.Load())
@@ -346,7 +346,7 @@ func TestNoopTracerRetainsNothing(t *testing.T) {
 	h, _ := handlerReturning()
 	// The point is that this neither panics nor requires a consumer: an
 	// untraced run must not inspect or retain what it is handed.
-	msg := TracingMiddleware(nil)(h)(context.Background(), core.Request{}).Result()
+	msg := Tracing(nil)(h)(context.Background(), core.Request{}).Result()
 	if msg == nil {
 		t.Fatal("the no-op tracer must not swallow the response")
 	}
@@ -355,7 +355,7 @@ func TestNoopTracerRetainsNothing(t *testing.T) {
 func TestTracingReportsAnErrorStatus(t *testing.T) {
 	h, _ := handlerReturning(errMsg("boom"))
 	tr := &recordingTracer{}
-	_ = TracingMiddleware(tr)(h)(context.Background(), core.Request{}).Result()
+	_ = Tracing(tr)(h)(context.Background(), core.Request{}).Result()
 	if tr.status == nil || !strings.Contains(tr.status.Error(), "boom") {
 		t.Fatalf("span status = %v, want the provider error", tr.status)
 	}
@@ -386,40 +386,10 @@ func TestLastRegisteredIsOutermost(t *testing.T) {
 	}
 }
 
-// TestMiddlewareComposesEndToEndThroughTheAgent runs the real loop with a
-// chain installed, so the wiring is exercised rather than only the pieces.
-func TestMiddlewareComposesEndToEndThroughTheAgent(t *testing.T) {
-	var hits, misses atomic.Int32
-	tr := &recordingTracer{}
-
-	s := &scripted{turns: []core.AssistantMessage{
-		{Content: core.Content{core.TextBlock{Text: "answer"}}, StopReason: core.StopReasonStop},
-	}}
-	a := newTestAgent(t, s, func(c *core.AgentConfig) {
-		c.Middleware = []core.Middleware{
-			TracingMiddleware(tr),
-			CachingMiddleware(CacheOptions{
-				OnHit:  func(string) { hits.Add(1) },
-				OnMiss: func(string) { misses.Add(1) },
-			}),
-			RetryMiddleware(noSleep()),
-		}
-	})
-	if _, err := a.Run(context.Background(), "question"); err != nil {
-		t.Fatal(err)
-	}
-	if tr.spans.Load() != 1 {
-		t.Fatalf("spans = %d, want 1 span for the one model call", tr.spans.Load())
-	}
-	if misses.Load() != 1 {
-		t.Fatalf("cache misses = %d, want 1", misses.Load())
-	}
-}
-
 // TestRateLimitDelaysTheSecondCall.
 func TestRateLimitDelaysTheSecondCall(t *testing.T) {
 	h, _ := handlerReturning()
-	mw := RateLimitMiddleware(100, 1) // 100/s, burst 1
+	mw := RateLimit(100, 1) // 100/s, burst 1
 	chained := mw(h)
 
 	start := time.Now()

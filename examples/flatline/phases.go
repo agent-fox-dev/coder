@@ -13,6 +13,7 @@ import (
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
@@ -188,7 +189,7 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 		}
 	})
 	cfg.Middleware = append(append([]core.Middleware(nil), b.base.Middleware...),
-		agentkit.RetryMiddleware(agentkit.RetryOptions{MaxAttempts: 3}),
+		middleware.Retry(middleware.RetryOptions{MaxAttempts: 3}),
 	)
 
 	// Compaction. A coder session over a large group fills the context

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/session"
 )
 
@@ -94,7 +95,7 @@ type Agent struct {
 	// meter is REQ-CACHE-08's session aggregate. It is never nil, so every
 	// call site is unconditional and the metered and unmetered paths cannot
 	// drift apart — the same reasoning that makes rec never nil.
-	meter *CacheMeter
+	meter *middleware.CacheMeter
 }
 
 // NewAgent constructs an Agent. Credentials, catalog lookup and provider
@@ -129,7 +130,7 @@ func NewAgentWithHistory(cfg core.AgentConfig, h *core.ConversationHistory) (*Ag
 }
 
 func newAgent(cfg core.AgentConfig, h *core.ConversationHistory) *Agent {
-	a := &Agent{producerID: newID("prod"), cfg: cfg, history: h, meter: NewCacheMeter()}
+	a := &Agent{producerID: newID("prod"), cfg: cfg, history: h, meter: middleware.NewCacheMeter()}
 	a.rec = session.NewRecorder(cfg.SessionStore, h, cfg.OnPersistError)
 	a.tools = append(a.tools, cfg.ToolPolicy.CustomTools...)
 	return a
@@ -344,18 +345,18 @@ func (a *Agent) History() *core.ConversationHistory { return a.history }
 // Level 1 figures come from what the PROVIDER reported, never from a
 // re-estimate: REQ-GO-15 forbids treating an estimate as a measurement, and a
 // savings number computed from estimated tokens is a guess wearing a dollar
-// sign. Level 2 hit and miss counts require CachingMiddleware to have been
+// sign. Level 2 hit and miss counts require middleware.Caching to have been
 // registered with this agent's Meter — see AgentConfig.Middleware and
 // CacheOptions.Meter.
-func (a *Agent) CacheStats() CacheStats { return a.meter.Stats() }
+func (a *Agent) CacheStats() middleware.CacheStats { return a.meter.Stats() }
 
-// Meter exposes the agent's cache meter so CachingMiddleware can be wired to
+// Meter exposes the agent's cache meter so middleware.Caching can be wired to
 // it at construction:
 //
 //	a, _ := agentkit.NewAgent(cfg)
 //	cfg.Middleware = append(cfg.Middleware,
-//	    agentkit.CachingMiddleware(agentkit.CacheOptions{Meter: a.Meter()}))
-func (a *Agent) Meter() *CacheMeter { return a.meter }
+//	    middleware.Caching(middleware.CacheOptions{Meter: a.Meter()}))
+func (a *Agent) Meter() *middleware.CacheMeter { return a.meter }
 
 // Usage returns cumulative usage for the agent's lifetime.
 func (a *Agent) Usage() core.Usage {

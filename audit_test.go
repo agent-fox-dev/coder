@@ -273,3 +273,24 @@ func TestAPanickingAuditHookDoesNotTakeTheRunWithIt(t *testing.T) {
 		t.Fatal("the panic must be surfaced through OnError, not swallowed")
 	}
 }
+
+// spanRecorder keeps EVERY span's attributes.
+type spanRecorder struct{ spans []map[string]any }
+
+func (r *spanRecorder) StartSpan(_ string, fn func(core.Span) error) error {
+	sp := &collectingSpan{attrs: map[string]any{}}
+	err := fn(sp)
+	r.spans = append(r.spans, sp.attrs)
+	return err
+}
+
+type collectingSpan struct{ attrs map[string]any }
+
+func (s *collectingSpan) SetAttributes(a map[string]any) {
+	for k, v := range a {
+		s.attrs[k] = v
+	}
+}
+func (s *collectingSpan) SetStatus(error)                 {}
+func (s *collectingSpan) AddEvent(string, map[string]any) {}
+func (s *collectingSpan) End()                            {}

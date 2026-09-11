@@ -4,7 +4,7 @@
 // completed turn's tools have executed and their results are in history. It
 // ends a run cleanly at a turn boundary, which is what distinguishes it from a
 // context deadline (an abort mid-turn, leaving the REQ-LOOP-09 marker) and
-// from BudgetMiddleware (a pre-turn gate that refuses to send at all).
+// from middleware.Budget (a pre-turn gate that refuses to send at all).
 //
 // The types are core.StopPolicy and core.StopContext; this package only
 // supplies implementations, so an embedder writing its own policy needs
@@ -36,7 +36,7 @@ func AfterTurns(n int) core.StopPolicy {
 // Because the check runs post-turn, a run may overshoot the budget by at most
 // one turn plus its tool batch. That is inherent to a post-turn predicate and
 // is the documented behaviour: the pre-turn gate that prevents overshoot is
-// BudgetMiddleware (Axis 1), a separate mechanism.
+// middleware.Budget (Axis 1), a separate mechanism.
 func OverBudget(usd float64) core.StopPolicy {
 	return func(sc core.StopContext) bool {
 		if sc.Usage.CostUSD > usd {

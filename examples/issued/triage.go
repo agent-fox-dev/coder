@@ -15,6 +15,7 @@ import (
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
@@ -153,7 +154,7 @@ func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose, debug bool) 
 		stop.OverBudget(2.00), // dollars, cumulative for the run
 	)
 	cfg.Middleware = append(append([]core.Middleware(nil), cfg.Middleware...),
-		agentkit.RetryMiddleware(agentkit.RetryOptions{MaxAttempts: 3}),
+		middleware.Retry(middleware.RetryOptions{MaxAttempts: 3}),
 	)
 
 	registered := append(append([]core.Tool(nil), built...), t.fileIssueTool())

@@ -199,7 +199,7 @@ func (e *ErrBadSummary) Error() string { return "agentkit: unusable summary: " +
 // It calls core.ProviderClient DIRECTLY and holds NO middleware chain. That is
 // structural, not a rule anyone has to remember: REQ-GO-12.3 requires the
 // summarization call to stay off the middleware path so it cannot re-enter
-// BudgetMiddleware, the retry layers' turn accounting, or the dedup cache as
+// middleware.Budget, the retry layers' turn accounting, or the dedup cache as
 // though it were a conversational turn. A summarizer that went back through
 // the loop would satisfy the requirement only by convention.
 //
