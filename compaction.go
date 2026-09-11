@@ -262,7 +262,7 @@ const summaryContinuationNote = "[The earlier conversation is summarized in the 
 
 // summaryMaxTokens is REQ-GO-12.3's clamp: min(0.8 × reserve, model.MaxTokens),
 // with each unknown side deferring to the other and a floor of 1. With no
-// reserve stated the model's ceiling is further bounded by DefaultMaxTokens: a
+// reserve stated the model's ceiling is further bounded by core.DefaultMaxTokens: a
 // summary does not need a 128K output budget, and providers size rate-limit
 // reservations from max_tokens.
 func summaryMaxTokens(m *core.Model, reserve int) int {
@@ -273,8 +273,8 @@ func summaryMaxTokens(m *core.Model, reserve int) int {
 	if m != nil && m.MaxTokens > 0 && (n <= 0 || n > m.MaxTokens) {
 		n = m.MaxTokens
 	}
-	if reserve <= 0 && n > DefaultMaxTokens {
-		n = DefaultMaxTokens
+	if reserve <= 0 && n > core.DefaultMaxTokens {
+		n = core.DefaultMaxTokens
 	}
 	if n <= 0 {
 		n = 1

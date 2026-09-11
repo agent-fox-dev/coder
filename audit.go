@@ -3,20 +3,12 @@ package agentkit
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/agentfox/agentkit-go/core"
 )
 
 // This file is REQ-OBS-02..05: the audit trail and the tool span.
-
-// ArgumentsHash is core.HashArguments, kept here because it was part of this
-// package's surface before the MCP client needed it too.
-func ArgumentsHash(raw []byte) string { return core.HashArguments(raw) }
-
-// MCPPrefix is the REQ-SEC-08 tool-name prefix for an MCP-qualified tool.
-const MCPPrefix = "mcp__"
 
 // serverNameOf resolves REQ-OBS-05's server_name.
 //
@@ -27,26 +19,12 @@ const MCPPrefix = "mcp__"
 // configured with an empty prefix carries no server in the name at all. The
 // layer that opened the connection is the only one that knows.
 //
-// MCPServerOf remains as a fallback for a tool assembled without the field.
+// core.MCPServerOf remains as a fallback for a tool assembled without the field.
 func serverNameOf(t core.Tool, name string) string {
 	if t.MCPServer != "" {
 		return t.MCPServer
 	}
-	return MCPServerOf(name)
-}
-
-// MCPServerOf extracts a server name from a tool name carrying the `mcp__`
-// prefix. It is a FALLBACK: prefer core.Tool.MCPServer, which is authoritative.
-func MCPServerOf(toolName string) string {
-	rest, ok := strings.CutPrefix(toolName, MCPPrefix)
-	if !ok {
-		return ""
-	}
-	server, _, ok := strings.Cut(rest, "__")
-	if !ok {
-		return ""
-	}
-	return server
+	return core.MCPServerOf(name)
 }
 
 func (a *Agent) sessionID() string {

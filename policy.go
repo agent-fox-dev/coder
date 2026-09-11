@@ -46,7 +46,7 @@ func (a *Agent) checkExecuteGuard() error {
 	if a.cfg.BeforeToolCall != nil {
 		return nil
 	}
-	for _, t := range ResolveToolPolicy(a.tools, a.cfg.ToolPolicy) {
+	for _, t := range a.cfg.ToolPolicy.Resolve(a.tools) {
 		if isShellTool(t.Name) {
 			return fmt.Errorf("%w (tool %q)", core.ErrUnguardedExecute, t.Name)
 		}

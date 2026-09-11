@@ -67,7 +67,7 @@ func defaultToolSet(t *testing.T) []core.Tool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ResolveToolPolicy(all, core.ToolPolicy{})
+	return core.ToolPolicy{}.Resolve(all)
 }
 
 // TestGoldenDefaultSystemPrompt pins the whole assembled default prompt.

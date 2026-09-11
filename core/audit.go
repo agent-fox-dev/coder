@@ -3,6 +3,7 @@ package core
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"time"
 )
 
@@ -81,4 +82,26 @@ func HashArguments(raw []byte) string {
 	}
 	sum := sha256.Sum256(raw)
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// MCPPrefix is the REQ-SEC-08 tool-name prefix for an MCP-qualified tool.
+const MCPPrefix = "mcp__"
+
+// MCPServerOf extracts a server name from a tool name carrying the `mcp__`
+// prefix. It is a FALLBACK for REQ-OBS-05's server_name: prefer
+// Tool.MCPServer, which is authoritative. REQ-MCP-CLIENT-05's convention is
+// `server_name__tool_name` with a CONFIGURABLE prefix, so a local tool named
+// `a__b` is indistinguishable from server `a`'s tool `b`, and a server
+// configured with an empty prefix carries no server in the name at all. The
+// layer that opened the connection is the only one that knows.
+func MCPServerOf(toolName string) string {
+	rest, ok := strings.CutPrefix(toolName, MCPPrefix)
+	if !ok {
+		return ""
+	}
+	server, _, ok := strings.Cut(rest, "__")
+	if !ok {
+		return ""
+	}
+	return server
 }

@@ -151,11 +151,11 @@ func TestADeltaStartingOnAnAssistantGetsAUserTurnFirst(t *testing.T) {
 }
 
 // TestSummaryMaxTokensIsBoundedWithoutAReserve: with no reserve stated the
-// summary's max_tokens is the model cap bounded by DefaultMaxTokens, not the
+// summary's max_tokens is the model cap bounded by core.DefaultMaxTokens, not the
 // raw 128K cap.
 func TestSummaryMaxTokensIsBoundedWithoutAReserve(t *testing.T) {
-	if got := summaryMaxTokens(&core.Model{MaxTokens: 128000}, 0); got != DefaultMaxTokens {
-		t.Fatalf("got %d, want %d", got, DefaultMaxTokens)
+	if got := summaryMaxTokens(&core.Model{MaxTokens: 128000}, 0); got != core.DefaultMaxTokens {
+		t.Fatalf("got %d, want %d", got, core.DefaultMaxTokens)
 	}
 	if got := summaryMaxTokens(&core.Model{MaxTokens: 128000}, 100000); got != 80000 {
 		t.Fatalf("an explicit reserve is honoured: got %d, want 80000", got)

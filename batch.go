@@ -38,7 +38,7 @@ import (
 func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant *core.AssistantMessage, calls []core.ToolUseBlock, turnCount int) ([]core.ToolResultMessage, bool) {
 	a.mu.Lock()
 	cfg := a.cfg
-	tools := ResolveToolPolicy(a.tools, cfg.ToolPolicy)
+	tools := cfg.ToolPolicy.Resolve(a.tools)
 	a.mu.Unlock()
 
 	// Read ONCE, here, alongside cfg. Reaching back through a.mu from inside a
@@ -139,7 +139,7 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 		// is user code; a panic in it is an invalid-arguments result, not a
 		// crashed process.
 		var (
-			prepared Prepared
+			prepared core.PreparedArguments
 			perr     error
 		)
 		func() {
@@ -149,7 +149,7 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 					report(fmt.Errorf("agentkit: panic in PrepareArguments for %q: %v", c.Name, r))
 				}
 			}()
-			prepared, perr = PrepareArguments(tool, c)
+			prepared, perr = core.PrepareArguments(tool, c)
 		}()
 		if perr != nil {
 			// The error text re-serializes the model's OWN key order, so the
@@ -248,7 +248,7 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 				Kind: core.AuditToolCall, SessionID: auditSession,
 				ToolName: c.Name, ToolUseID: c.ID,
 				ServerName:    serverNameOf(tool, c.Name),
-				ArgumentsHash: ArgumentsHash(prepared.Raw),
+				ArgumentsHash: core.HashArguments(prepared.Raw),
 				IsError:       !out.OK,
 				ElapsedMS:     time.Since(start).Milliseconds(),
 			})
@@ -375,7 +375,7 @@ func (a *Agent) executeBatch(ctx context.Context, s *core.EventStream, assistant
 
 // invokeHandler calls the tool, converting every failure mode into a result.
 // No tool outcome is ever propagated to the caller as a Go error (REQ-GO-04).
-func invokeHandler(ctx context.Context, t core.Tool, p Prepared) (res core.ToolResult) {
+func invokeHandler(ctx context.Context, t core.Tool, p core.PreparedArguments) (res core.ToolResult) {
 	defer func() {
 		if r := recover(); r != nil {
 			// A handler panic becomes a tool result and the loop continues

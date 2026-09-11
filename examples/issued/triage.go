@@ -155,7 +155,7 @@ func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose, debug bool) 
 	)
 
 	registered := append(append([]core.Tool(nil), built...), t.fileIssueTool())
-	resolved := agentkit.ResolveToolPolicy(registered, cfg.ToolPolicy)
+	resolved := cfg.ToolPolicy.Resolve(registered)
 	if err := assertReadOnly(resolved); err != nil {
 		return nil, err
 	}

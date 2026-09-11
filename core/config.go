@@ -89,7 +89,7 @@ type AgentConfig struct {
 	Model    *Model
 	Provider string // vendor id; credential resolution + catalog only
 	// MaxTokens is an upper bound, clamped to the model (REQ-CAT-04). Nil is
-	// the SDK default (agentkit.DefaultMaxTokens), NOT the model's cap: the
+	// the SDK default (DefaultMaxTokens), NOT the model's cap: the
 	// cap is 128K on current models and providers reserve rate-limit budget
 	// from max_tokens at request start (REQ-PROV-16 presence).
 	MaxTokens    *int
@@ -174,3 +174,14 @@ func Chain(base Handler, mw ...Middleware) Handler {
 	}
 	return h
 }
+
+// DefaultMaxTokens is the output bound sent when AgentConfig.MaxTokens is nil.
+// It is still clamped to the model's cap and the remaining window by
+// REQ-CAT-04; a caller who wants the model's full cap says so explicitly.
+//
+// Providers size rate-limit reservations from max_tokens at request start, so
+// a 128K default costs 128K of output-per-minute budget per turn — a 429 on
+// the first concurrent delegation on most tiers — and removes the only bound
+// on a runaway turn. 32K is generous for tool-call-shaped output and still an
+// order of magnitude below current caps.
+const DefaultMaxTokens = 32768
