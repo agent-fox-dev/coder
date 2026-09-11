@@ -11,6 +11,7 @@ import (
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 // blocking is a provider that honours ctx: it holds the stream open until the
@@ -605,7 +606,7 @@ func TestNamedSpecialistsAreInvokableByName(t *testing.T) {
 			toolUse(t, "d2", "reviewer", `{"prompt":"look at y"}`)),
 	}}
 	reg := core.ProviderRegistry{testAPI: prov.provider()}
-	parent, err := NewAgent(core.AgentConfig{Model: testModel(), Providers: reg, StopPolicy: StopAfterTurns(5), ParallelTools: true})
+	parent, err := NewAgent(core.AgentConfig{Model: testModel(), Providers: reg, StopPolicy: stop.AfterTurns(5), ParallelTools: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,7 +615,7 @@ func TestNamedSpecialistsAreInvokableByName(t *testing.T) {
 	if err := specialists.Register(AgentDefinition{
 		Name: "reviewer", Description: "reviews code", SystemPrompt: "You review.",
 		ToolPolicy: core.ToolPolicy{ToolNames: []string{"read_file"}},
-		StopPolicy: StopAfterTurns(2),
+		StopPolicy: stop.AfterTurns(2),
 	}); err != nil {
 		t.Fatal(err)
 	}

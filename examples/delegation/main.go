@@ -40,6 +40,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/ollama"
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -111,9 +112,9 @@ func run() error {
 	// 5. A stop policy is not optional for a delegating agent. Turns bound the
 	//    orchestration loop; the budget bounds the whole tree, since a child's
 	//    spend lands in the parent's usage as the delegation tool returns.
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(12),
-		agentkit.StopOverBudget(maxBudgetUSD),
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(12),
+		stop.OverBudget(maxBudgetUSD),
 	)
 
 	if err := checkCredentials(model); err != nil {
@@ -166,7 +167,7 @@ func run() error {
 			"file paths and short quotes. Never guess; say so when the files do not answer.",
 		Tools:          builtins,
 		ToolPolicy:     core.ToolPolicy{ToolNames: []string{"read_file", "search_files"}},
-		StopPolicy:     agentkit.StopAfterTurns(8),
+		StopPolicy:     stop.AfterTurns(8),
 		BudgetFraction: 0.30, // of whatever the parent has left when called
 	}); err != nil {
 		return err
@@ -183,7 +184,7 @@ func run() error {
 			"anything: work only from the text you are given. Answer in plain prose, " +
 			"no preamble, no bullet lists.",
 		ToolPolicy:     core.ToolPolicy{NoTools: core.NoToolsAll},
-		StopPolicy:     agentkit.StopAfterTurns(2),
+		StopPolicy:     stop.AfterTurns(2),
 		BudgetFraction: 0.20,
 	}); err != nil {
 		return err

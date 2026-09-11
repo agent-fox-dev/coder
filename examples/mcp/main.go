@@ -59,6 +59,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 func main() {
@@ -191,9 +192,9 @@ func clientMode(ctx context.Context, prompt, external string) error {
 		google.Provider(google.Options{}),
 		ollama.Provider(ollama.Options{}),
 	)
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(8),
-		agentkit.StopOverBudget(1.00),
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(8),
+		stop.OverBudget(1.00),
 	)
 	cfg.SystemPrompt = "You are concise. Use the tools rather than guessing, and answer in plain prose."
 	cfg.Hooks.OnAudit = printAudit("agent")

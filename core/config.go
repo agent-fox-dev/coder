@@ -18,7 +18,7 @@ type StopContext struct {
 	// REQ-LOOP-07 requires RunResult.StopReason = "max_turns" and, under
 	// ErrorOnLimit, ErrMaxTurns specifically — versus ErrBudgetExceeded for
 	// REQ-LOOP-08. With a bare bool the loop cannot tell which policy fired,
-	// and StopAny erases it entirely. A policy sets *Reason before returning
+	// and stop.Any erases it entirely. A policy sets *Reason before returning
 	// true; the loop defaults it to RunStopPolicy.
 	Reason *RunStopReason
 
@@ -37,7 +37,7 @@ func (sc StopContext) SetReason(r RunStopReason) {
 	}
 }
 
-// StopPolicy is REQ-LOOP-04's pinned signature. Policies compose via StopAny.
+// StopPolicy is REQ-LOOP-04's pinned signature. Policies compose via stop.Any.
 type StopPolicy func(StopContext) bool
 
 // ContextTransform is AgentConfig.TransformContext (REQ-GO-12): invoked

@@ -30,6 +30,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/ollama"
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -126,10 +127,10 @@ func run() error {
 	// 5. Turns and budget are separate bounds because they fail differently.
 	//    A tool-using agent can loop cheaply for a long time (turns catch
 	//    that) or spend a lot in three turns over a large file (budget
-	//    catches that). StopAny fires on whichever comes first.
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(20),
-		agentkit.StopOverBudget(2.00), // dollars, cumulative for the run
+	//    catches that). stop.Any fires on whichever comes first.
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(20),
+		stop.OverBudget(2.00), // dollars, cumulative for the run
 	)
 	cfg.SystemPrompt = "You are a careful coding assistant. Read before you write. " +
 		"Prefer the search and read tools over shell commands. Be concise."

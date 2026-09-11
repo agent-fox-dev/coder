@@ -8,6 +8,7 @@ import (
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 // AgentFactory builds a fresh child agent for one delegation.
@@ -101,7 +102,7 @@ func SubagentTool(parent *Agent, factory AgentFactory, opts SubagentOptions) cor
 				slice := remaining * opts.BudgetFraction
 				child.mu.Lock()
 				existing := child.cfg.StopPolicy
-				child.cfg.StopPolicy = StopAny(existing, StopOverBudget(slice))
+				child.cfg.StopPolicy = stop.Any(existing, stop.OverBudget(slice))
 				child.mu.Unlock()
 			}
 

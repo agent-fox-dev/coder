@@ -13,6 +13,7 @@ import (
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -159,14 +160,14 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	// expensive times; the duration is agent-fox's session timeout; the
 	// sentinel tool is the INTENDED ending.
 	policies := []core.StopPolicy{
-		agentkit.StopAfterTurns(b.maxTurns),
-		agentkit.StopOverBudget(b.budgetUSD),
-		agentkit.StopWhenToolCalled(spec.terminalTool),
+		stop.AfterTurns(b.maxTurns),
+		stop.OverBudget(b.budgetUSD),
+		stop.WhenToolCalled(spec.terminalTool),
 	}
 	if b.timeout > 0 {
-		policies = append(policies, agentkit.StopAfterDuration(b.timeout))
+		policies = append(policies, stop.AfterDuration(b.timeout))
 	}
-	cfg.StopPolicy = agentkit.StopAny(policies...)
+	cfg.StopPolicy = stop.Any(policies...)
 
 	// The shipped restricted policy is the floor — an allowlist of program
 	// names. The coder may use shell operators (the pack's own test commands

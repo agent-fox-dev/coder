@@ -23,6 +23,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/session"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 func main() {
@@ -341,9 +342,9 @@ func newAgent(p *faux.Provider) *agentkit.Agent {
 	cfg := core.AgentConfig{
 		Model:        faux.Model(),
 		SystemPrompt: "You are a helpful assistant.",
-		StopPolicy: agentkit.StopAny(
-			agentkit.StopAfterTurns(8),
-			agentkit.StopOverBudget(0.50),
+		StopPolicy: stop.Any(
+			stop.AfterTurns(8),
+			stop.OverBudget(0.50),
 		),
 		ParallelTools: true,
 		Providers:     core.ProviderRegistry{faux.API: p.APIProvider()},
@@ -492,7 +493,7 @@ func baseConfig(p *faux.Provider) core.AgentConfig {
 	return core.AgentConfig{
 		Model:        faux.Model(),
 		SystemPrompt: "You are a helpful assistant.",
-		StopPolicy:   agentkit.StopAfterTurns(8),
+		StopPolicy:   stop.AfterTurns(8),
 		Providers:    core.ProviderRegistry{faux.API: p.APIProvider()},
 	}
 }

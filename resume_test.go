@@ -12,6 +12,7 @@ import (
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/session"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 func openTestSession(t *testing.T, path string) (*session.Store, *session.Resume) {
@@ -92,7 +93,7 @@ func TestKillAndResume(t *testing.T) {
 	}}
 	cfg := core.AgentConfig{
 		Model:        testModel(),
-		StopPolicy:   StopAfterTurns(5),
+		StopPolicy:   stop.AfterTurns(5),
 		Providers:    core.ProviderRegistry{testAPI: s2.provider()},
 		SessionStore: store2,
 	}
@@ -229,7 +230,7 @@ func TestSubagentGetsFreshHistory(t *testing.T) {
 	factory := func(ctx context.Context) (*Agent, error) {
 		return NewAgent(core.AgentConfig{
 			Model:      testModel(),
-			StopPolicy: StopAfterTurns(3),
+			StopPolicy: stop.AfterTurns(3),
 			Providers:  core.ProviderRegistry{testAPI: childProv.provider()},
 		})
 	}
@@ -282,7 +283,7 @@ func TestParallelDelegationDoesNotHitTheRunSlot(t *testing.T) {
 		}}
 		return NewAgent(core.AgentConfig{
 			Model:      testModel(),
-			StopPolicy: StopAfterTurns(3),
+			StopPolicy: stop.AfterTurns(3),
 			Providers:  core.ProviderRegistry{testAPI: p.provider()},
 		})
 	}

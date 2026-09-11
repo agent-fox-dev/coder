@@ -43,6 +43,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 func main() {
@@ -65,9 +66,9 @@ func run() error {
 		google.Provider(google.Options{}),
 		ollama.Provider(ollama.Options{}),
 	)
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(20),
-		agentkit.StopOverBudget(2.00),
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(20),
+		stop.OverBudget(2.00),
 	)
 	cfg.SystemPrompt = "You are a helpful assistant. Use the slow_work tool when " +
 		"asked to do something that takes a while, so the user can watch it happen."

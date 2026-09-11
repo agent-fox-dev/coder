@@ -12,6 +12,7 @@ import (
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -171,10 +172,10 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	// loops cheaply; the budget catches one that reads large files a few
 	// expensive times; the sentinel tool is the INTENDED ending, and the other
 	// two are what happens when the model never reaches it.
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(b.maxTurns),
-		agentkit.StopOverBudget(b.budgetUSD),
-		agentkit.StopWhenToolCalled(spec.terminalTool),
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(b.maxTurns),
+		stop.OverBudget(b.budgetUSD),
+		stop.WhenToolCalled(spec.terminalTool),
 	)
 
 	// The shipped restricted policy is the floor: an allowlist of program

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 type auditLog struct {
@@ -144,7 +145,7 @@ func TestSessionStartAndEndFireOnEveryExit(t *testing.T) {
 			assistantWithTools(core.StopReasonToolUse, toolUse(t, "c2", "echo", `{"v":"x"}`)),
 		}}
 		a := newTestAgent(t, s, func(c *core.AgentConfig) {
-			c.StopPolicy = StopAfterTurns(1)
+			c.StopPolicy = stop.AfterTurns(1)
 			c.ErrorOnLimit = true
 			c.Hooks.OnSessionStart = log.add
 			c.Hooks.OnSessionEnd = log.add

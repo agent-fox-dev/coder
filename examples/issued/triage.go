@@ -14,6 +14,7 @@ import (
 
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -146,9 +147,9 @@ func NewTriager(cfg core.AgentConfig, ws *tools.Workspace, verbose, debug bool) 
 	cfg.SystemPrompt = systemPrompt
 	cfg.ToolPolicy = readOnlyPolicy()
 	// BeforeToolCall is intentionally nil. See assertReadOnly.
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(100),  // a wandering read loop
-		agentkit.StopOverBudget(2.00), // dollars, cumulative for the run
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(100),  // a wandering read loop
+		stop.OverBudget(2.00), // dollars, cumulative for the run
 	)
 	cfg.Middleware = append(append([]core.Middleware(nil), cfg.Middleware...),
 		agentkit.RetryMiddleware(agentkit.RetryOptions{MaxAttempts: 3}),

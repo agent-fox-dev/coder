@@ -40,6 +40,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/skills"
+	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
 )
 
@@ -270,9 +271,9 @@ func run() error {
 	// and the block below will name read_file, because read_file is what the
 	// resolved set actually contains.
 	cfg.ToolPolicy.ToolNames = []string{"read_file", "list_files"}
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(8),
-		agentkit.StopOverBudget(1.00), // dollars, cumulative for the run
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(8),
+		stop.OverBudget(1.00), // dollars, cumulative for the run
 	)
 	// THE one place trust is stated. SkillsConfigFor derives the discovery
 	// config from this field, so the loop and the skills package cannot

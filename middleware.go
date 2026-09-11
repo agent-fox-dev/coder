@@ -195,7 +195,7 @@ var ErrBudgetGate = errors.New("agentkit: budget gate refused the turn")
 
 // BudgetMiddleware is the PRE-TURN cost gate.
 //
-// It is a different mechanism from StopOverBudget, and both exist on purpose.
+// It is a different mechanism from stop.OverBudget, and both exist on purpose.
 // The stop policy runs AFTER a turn, so a run may overshoot by one turn plus
 // its tool batch — inherent to a post-turn predicate. This refuses the request
 // before it is sent, which is the only way to not spend the money at all. A

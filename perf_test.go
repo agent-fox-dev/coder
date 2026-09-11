@@ -10,6 +10,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider"
 	"github.com/agentfox/agentkit-go/provider/anthropic"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 // This file is NFR-PERF-09's acceptance mechanism.
@@ -35,7 +36,7 @@ func benchAgent(b *testing.B, tools int) *Agent {
 	s := &scripted{}
 	cfg := core.AgentConfig{
 		Model:      testModel(),
-		StopPolicy: StopAfterTurns(1),
+		StopPolicy: stop.AfterTurns(1),
 		Providers:  core.ProviderRegistry{testAPI: s.provider()},
 	}
 	a, err := NewAgent(cfg)
@@ -121,7 +122,7 @@ func BenchmarkLoopTurnWithToolBatch(b *testing.B) {
 				mustUse("c3", "tool_2", `{"v":"z"}`)),
 		}}
 		a, err := NewAgent(core.AgentConfig{
-			Model: testModel(), StopPolicy: StopAfterTurns(2), ParallelTools: true,
+			Model: testModel(), StopPolicy: stop.AfterTurns(2), ParallelTools: true,
 			Providers: core.ProviderRegistry{testAPI: s.provider()},
 		})
 		if err != nil {
@@ -370,7 +371,7 @@ func benchAgentAtDepth(b *testing.B, turns int) *Agent {
 		h.Record(core.NullLeaf, m)
 	}
 	a, err := NewAgentWithHistory(core.AgentConfig{
-		Model: testModel(), StopPolicy: StopAfterTurns(1),
+		Model: testModel(), StopPolicy: stop.AfterTurns(1),
 		Providers: core.ProviderRegistry{testAPI: s.provider()},
 	}, h)
 	if err != nil {

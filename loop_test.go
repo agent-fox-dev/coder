@@ -13,6 +13,7 @@ import (
 
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 // ---------------------------------------------------------------- scaffolding
@@ -99,7 +100,7 @@ func newTestAgent(t *testing.T, s *scripted, mutate func(*core.AgentConfig)) *Ag
 	t.Helper()
 	cfg := core.AgentConfig{
 		Model:      testModel(),
-		StopPolicy: StopAfterTurns(10),
+		StopPolicy: stop.AfterTurns(10),
 		Providers:  core.ProviderRegistry{testAPI: s.provider()},
 	}
 	if mutate != nil {
@@ -543,7 +544,7 @@ func TestStopPolicyReasonSurvivesStopAny(t *testing.T) {
 	}}
 	a := newTestAgent(t, s, func(c *core.AgentConfig) {
 		c.ErrorOnLimit = true
-		c.StopPolicy = StopAny(StopOverBudget(1e9), StopAfterTurns(1))
+		c.StopPolicy = stop.Any(stop.OverBudget(1e9), stop.AfterTurns(1))
 	})
 	res, err := a.Run(context.Background(), "go")
 	if !errors.Is(err, core.ErrMaxTurns) {
@@ -766,7 +767,7 @@ func TestContinuePreconditions(t *testing.T) {
 		s := &scripted{turns: []core.AssistantMessage{
 			{Content: core.Content{core.TextBlock{Text: "resumed"}}, StopReason: core.StopReasonStop},
 		}}
-		cfg := core.AgentConfig{Model: testModel(), StopPolicy: StopAfterTurns(5),
+		cfg := core.AgentConfig{Model: testModel(), StopPolicy: stop.AfterTurns(5),
 			Providers: core.ProviderRegistry{testAPI: s.provider()}}
 		a, err := NewAgentWithHistory(cfg, h)
 		if err != nil {

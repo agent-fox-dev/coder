@@ -1,4 +1,15 @@
-package agentkit
+// Package stop holds the built-in StopPolicy implementations (REQ-LOOP-04).
+//
+// A stop policy is the single post-turn predicate the loop consults after a
+// completed turn's tools have executed and their results are in history. It
+// ends a run cleanly at a turn boundary, which is what distinguishes it from a
+// context deadline (an abort mid-turn, leaving the REQ-LOOP-09 marker) and
+// from BudgetMiddleware (a pre-turn gate that refuses to send at all).
+//
+// The types are core.StopPolicy and core.StopContext; this package only
+// supplies implementations, so an embedder writing its own policy needs
+// nothing from here.
+package stop
 
 import (
 	"time"
@@ -6,11 +17,11 @@ import (
 	"github.com/agentfox/agentkit-go/core"
 )
 
-// StopAfterTurns is REQ-LOOP-07 as what it actually is: a built-in StopPolicy
+// AfterTurns is REQ-LOOP-07 as what it actually is: a built-in StopPolicy
 // implementation, not a loop primitive. The run ends with StopReason
 // "max_turns"; ErrMaxTurns is returned only when AgentConfig.ErrorOnLimit is
 // set.
-func StopAfterTurns(n int) core.StopPolicy {
+func AfterTurns(n int) core.StopPolicy {
 	return func(sc core.StopContext) bool {
 		if sc.TurnCount >= n {
 			sc.SetReason(core.RunStopMaxTurns)
@@ -20,13 +31,13 @@ func StopAfterTurns(n int) core.StopPolicy {
 	}
 }
 
-// StopOverBudget is REQ-LOOP-08.
+// OverBudget is REQ-LOOP-08.
 //
 // Because the check runs post-turn, a run may overshoot the budget by at most
 // one turn plus its tool batch. That is inherent to a post-turn predicate and
 // is the documented behaviour: the pre-turn gate that prevents overshoot is
 // BudgetMiddleware (Axis 1), a separate mechanism.
-func StopOverBudget(usd float64) core.StopPolicy {
+func OverBudget(usd float64) core.StopPolicy {
 	return func(sc core.StopContext) bool {
 		if sc.Usage.CostUSD > usd {
 			sc.SetReason(core.RunStopBudgetExceeded)
@@ -36,14 +47,14 @@ func StopOverBudget(usd float64) core.StopPolicy {
 	}
 }
 
-// StopAfterDuration ends the run at the first turn boundary past d.
+// AfterDuration ends the run at the first turn boundary past d.
 //
 // It uses StopContext.StartedAt rather than a captured time.Now(): a policy
 // value is reused across runs, so a closure capturing construction time would
 // fire immediately on the second run. It is also not the same as a ctx
 // deadline — a deadline aborts mid-turn and leaves the REQ-LOOP-09 dirty
 // marker, where a StopPolicy ends the run cleanly at a turn boundary.
-func StopAfterDuration(d time.Duration) core.StopPolicy {
+func AfterDuration(d time.Duration) core.StopPolicy {
 	return func(sc core.StopContext) bool {
 		if !sc.StartedAt.IsZero() && time.Since(sc.StartedAt) >= d {
 			sc.SetReason(core.RunStopPolicy)
@@ -53,11 +64,11 @@ func StopAfterDuration(d time.Duration) core.StopPolicy {
 	}
 }
 
-// StopWhenToolCalled ends the run once a named tool has produced a result. It
+// WhenToolCalled ends the run once a named tool has produced a result. It
 // is the sentinel-tool detection §5 names as a default policy implementation,
 // and is distinct from REQ-TOOL-13 termination: this is the caller's policy
 // observing the transcript, that is the tool voting on its own batch.
-func StopWhenToolCalled(name string) core.StopPolicy {
+func WhenToolCalled(name string) core.StopPolicy {
 	return func(sc core.StopContext) bool {
 		for _, r := range sc.ToolResults {
 			if r.ToolName == name {
@@ -69,11 +80,11 @@ func StopWhenToolCalled(name string) core.StopPolicy {
 	}
 }
 
-// StopAny composes policies. The first to return true wins and its reason is
+// Any composes policies. The first to return true wins and its reason is
 // preserved — which is why StopContext carries a Reason pointer at all: with a
-// bare bool, StopAny erases which policy fired and the loop cannot tell
+// bare bool, Any erases which policy fired and the loop cannot tell
 // ErrMaxTurns from ErrBudgetExceeded.
-func StopAny(policies ...core.StopPolicy) core.StopPolicy {
+func Any(policies ...core.StopPolicy) core.StopPolicy {
 	return func(sc core.StopContext) bool {
 		for _, p := range policies {
 			if p == nil {
@@ -87,7 +98,7 @@ func StopAny(policies ...core.StopPolicy) core.StopPolicy {
 	}
 }
 
-// StopNever is the explicit "run until the model stops" policy. It exists so
+// Never is the explicit "run until the model stops" policy. It exists so
 // that "no policy" and "deliberately unbounded" are distinguishable in a
 // config a reviewer is reading.
-func StopNever() core.StopPolicy { return func(core.StopContext) bool { return false } }
+func Never() core.StopPolicy { return func(core.StopContext) bool { return false } }

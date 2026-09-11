@@ -33,6 +33,7 @@ import (
 	"github.com/agentfox/agentkit-go/provider/openai"
 	"github.com/agentfox/agentkit-go/provider/openairesponses"
 	"github.com/agentfox/agentkit-go/session"
+	"github.com/agentfox/agentkit-go/stop"
 )
 
 func main() {
@@ -68,9 +69,9 @@ func run() error {
 		google.Provider(google.Options{}),
 		ollama.Provider(ollama.Options{}),
 	)
-	cfg.StopPolicy = agentkit.StopAny(
-		agentkit.StopAfterTurns(10),
-		agentkit.StopOverBudget(1.00),
+	cfg.StopPolicy = stop.Any(
+		stop.AfterTurns(10),
+		stop.OverBudget(1.00),
 	)
 	cfg.SystemPrompt = "You are concise. Answer in plain prose, no preamble."
 
