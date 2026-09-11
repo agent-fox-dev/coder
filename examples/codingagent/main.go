@@ -24,6 +24,7 @@ import (
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/catalog"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/guard"
 	"github.com/agentfox/agentkit-go/provider"
 	"github.com/agentfox/agentkit-go/provider/anthropic"
 	"github.com/agentfox/agentkit-go/provider/google"
@@ -100,7 +101,7 @@ func run() error {
 	//    not a sandbox — `go` alone can run arbitrary code through a test
 	//    file or a generator — so an embedder that knows what it is running
 	//    should replace it rather than widen it.
-	policy := agentkit.RestrictedPolicy(agentkit.RestrictedOptions{
+	policy := guard.Restricted(guard.Options{
 		AllowedPrograms: allowedPrograms,
 		// A refusal is fed back to the model as a blocked tool result, and it
 		// will usually try a different command. Set TerminateOnBlock to end

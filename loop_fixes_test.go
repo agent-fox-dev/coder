@@ -11,6 +11,7 @@ import (
 
 	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/guard"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/stop"
 )
@@ -519,7 +520,7 @@ func TestAShellToolWithNoInterceptorFailsTheRun(t *testing.T) {
 		return core.Tool{Name: name, Description: "shell", InputSchema: schema.Object(schema.Prop("command", schema.String())),
 			Handler: func(context.Context, json.RawMessage) (json.RawMessage, error) { return json.RawMessage(`{}`), nil }}
 	}
-	for _, name := range ShellToolNames {
+	for _, name := range guard.ShellToolNames {
 		s := &scripted{}
 		a := newTestAgent(t, s, nil)
 		_ = a.RegisterTool(shell(name))
@@ -532,10 +533,10 @@ func TestAShellToolWithNoInterceptorFailsTheRun(t *testing.T) {
 	}
 	// The explicit opt-out is an interceptor, so passing it is an act.
 	s := &scripted{}
-	a := newTestAgent(t, s, func(c *core.AgentConfig) { c.BeforeToolCall = AllowAllToolCalls })
+	a := newTestAgent(t, s, func(c *core.AgentConfig) { c.BeforeToolCall = guard.AllowAll })
 	_ = a.RegisterTool(shell("execute"))
 	if _, err := a.Run(context.Background(), "go"); err != nil {
-		t.Fatalf("AllowAllToolCalls: %v", err)
+		t.Fatalf("guard.AllowAll: %v", err)
 	}
 	// And a policy that excludes the shell tool from the run needs no guard.
 	s = &scripted{}
@@ -548,7 +549,7 @@ func TestAShellToolWithNoInterceptorFailsTheRun(t *testing.T) {
 
 // TestRestrictedPolicy pins the reference interceptor's decisions.
 func TestRestrictedPolicy(t *testing.T) {
-	p := RestrictedPolicy(RestrictedOptions{AllowedPrograms: []string{"go", "/usr/bin/git"}})
+	p := guard.Restricted(guard.Options{AllowedPrograms: []string{"go", "/usr/bin/git"}})
 	call := func(tool string, args map[string]any) core.BeforeToolCallDecision {
 		return p(context.Background(), core.BeforeToolCallContext{ToolName: tool, Arguments: args})
 	}
@@ -580,12 +581,12 @@ func TestRestrictedPolicy(t *testing.T) {
 	if !call("execute", map[string]any{"command": "go test | tee"}).Block {
 		t.Fatal("pipe")
 	}
-	loose := RestrictedPolicy(RestrictedOptions{AllowedPrograms: []string{"go"}, AllowShellOperators: true})
+	loose := guard.Restricted(guard.Options{AllowedPrograms: []string{"go"}, AllowShellOperators: true})
 	if loose(context.Background(), core.BeforeToolCallContext{ToolName: "execute",
 		Arguments: map[string]any{"command": "go test | tee"}}).Block {
 		t.Fatal("AllowShellOperators must permit the pipe")
 	}
-	term := RestrictedPolicy(RestrictedOptions{TerminateOnBlock: true})
+	term := guard.Restricted(guard.Options{TerminateOnBlock: true})
 	if d := term(context.Background(), core.BeforeToolCallContext{ToolName: "execute",
 		Arguments: map[string]any{"command": "ls"}}); !d.Block || !d.Terminate {
 		t.Fatal("TerminateOnBlock must cast the REQ-TOOL-13.2 vote")

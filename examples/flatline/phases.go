@@ -13,6 +13,7 @@ import (
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/guard"
 	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/stop"
@@ -178,7 +179,7 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	// git mutations belong to the pipeline, a read-only phase stays
 	// read-only, and every simple command on a line is checked, not only the
 	// first.
-	base := agentkit.RestrictedPolicy(agentkit.RestrictedOptions{
+	base := guard.Restricted(guard.Options{
 		AllowedPrograms:     spec.programs,
 		AllowShellOperators: !spec.readOnly,
 		TerminateOnBlock:    false,

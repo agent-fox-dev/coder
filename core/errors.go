@@ -38,6 +38,6 @@ var (
 	// shipped starting point — or pass AllowAllToolCalls to say so explicitly.
 	ErrUnguardedExecute = errors.New(
 		"agentkit: a shell tool is registered but AgentConfig.BeforeToolCall is nil; " +
-			"supply an interceptor (agentkit.RestrictedPolicy is the shipped starting point) " +
-			"or agentkit.AllowAllToolCalls to opt out explicitly (OQ-8)")
+			"supply an interceptor (guard.Restricted is the shipped starting point) " +
+			"or guard.AllowAll to opt out explicitly (OQ-8)")
 )

@@ -12,6 +12,7 @@ import (
 	agentkit "github.com/agentfox/agentkit-go"
 	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
+	"github.com/agentfox/agentkit-go/guard"
 	"github.com/agentfox/agentkit-go/middleware"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/stop"
@@ -189,7 +190,7 @@ func (b *agentBrain) newAgent(spec phaseSpec) (*agentkit.Agent, error) {
 	// cares about and a generic policy cannot: that git mutations belong to
 	// the pipeline rather than to the model, and that nothing the model does
 	// should reach GitHub without passing through the audited comment path.
-	base := agentkit.RestrictedPolicy(agentkit.RestrictedOptions{
+	base := guard.Restricted(guard.Options{
 		AllowedPrograms:     spec.programs,
 		AllowShellOperators: !spec.readOnly,
 		TerminateOnBlock:    false,

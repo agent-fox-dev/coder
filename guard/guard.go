@@ -1,4 +1,20 @@
-package agentkit
+// Package guard is OQ-8's resolution: the `execute` boundary in
+// non-interactive deployments.
+//
+// REQ-SEC-03 replaced the command allowlist with a per-call interceptor on the
+// grounds that a static allowlist is both trivially escaped and too narrow to
+// run a build. That reasoning assumes an embedder that can answer a permission
+// question. A daemon triaging issues overnight cannot, and "allow" by default
+// is strictly worse than the allowlist it replaced. So, per OQ-8's
+// recommendation (b) plus (a):
+//
+//   - a run fails LOUDLY when a shell tool is in the resolved set and no
+//     interceptor is configured (core.ErrUnguardedExecute, checked by the
+//     Agent at the head of every run), and
+//   - Restricted ships as an importable, REPLACEABLE starting point — kept
+//     out of the SDK's enforcement path so it can be swapped rather than
+//     only narrowed.
+package guard
 
 import (
 	"context"
@@ -9,52 +25,20 @@ import (
 	"github.com/agentfox/agentkit-go/core"
 )
 
-// This file is OQ-8's resolution: the `execute` boundary in non-interactive
-// deployments.
-//
-// REQ-SEC-03 replaced the command allowlist with a per-call interceptor on the
-// grounds that a static allowlist is both trivially escaped and too narrow to
-// run a build. That reasoning assumes an embedder that can answer a permission
-// question. A daemon triaging issues overnight cannot, and "allow" by default
-// is strictly worse than the allowlist it replaced. So, per OQ-8's
-// recommendation (b) plus (a):
-//
-//   - a run fails LOUDLY when a shell tool is in the resolved set and no
-//     interceptor is configured (ErrUnguardedExecute), and
-//   - RestrictedPolicy ships as an importable, REPLACEABLE starting point —
-//     kept out of the SDK's enforcement path so it can be swapped rather than
-//     only narrowed.
-
 // ShellToolNames are the tools the guard treats as a shell. A caller-supplied
 // tool of the same name counts: the name is what the model calls, and a
 // custom `execute` is no less a shell for being custom.
 var ShellToolNames = []string{"execute", "run_command", "powershell"}
 
-// AllowAllToolCalls is the explicit opt-out from the guard: an interceptor
+// AllowAll is the explicit opt-out from the guard: an interceptor
 // that never blocks. Passing it is the affirmative act OQ-8 asks for — the
 // embedder has said, in code, that this agent runs an unrestricted shell.
-func AllowAllToolCalls(context.Context, core.BeforeToolCallContext) core.BeforeToolCallDecision {
+func AllowAll(context.Context, core.BeforeToolCallContext) core.BeforeToolCallDecision {
 	return core.BeforeToolCallDecision{}
 }
 
-// checkExecuteGuard is consulted at the head of every run (before the slot is
-// claimed, so the failure is an ordinary returned error and not a stream
-// nobody reads).
-func (a *Agent) checkExecuteGuard() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.cfg.BeforeToolCall != nil {
-		return nil
-	}
-	for _, t := range a.cfg.ToolPolicy.Resolve(a.tools) {
-		if isShellTool(t.Name) {
-			return fmt.Errorf("%w (tool %q)", core.ErrUnguardedExecute, t.Name)
-		}
-	}
-	return nil
-}
-
-func isShellTool(name string) bool {
+// IsShellTool reports whether name is one of ShellToolNames.
+func IsShellTool(name string) bool {
 	for _, n := range ShellToolNames {
 		if n == name {
 			return true
@@ -63,8 +47,8 @@ func isShellTool(name string) bool {
 	return false
 }
 
-// RestrictedOptions configures RestrictedPolicy.
-type RestrictedOptions struct {
+// Options configures RestrictedPolicy.
+type Options struct {
 	// AllowedPrograms are the program names (the basename of argv[0], or of
 	// the first word of an `execute` command) that may run. Empty means every
 	// shell call is blocked, which is the safe default for a policy whose
@@ -89,7 +73,7 @@ type RestrictedOptions struct {
 	TerminateOnBlock bool
 }
 
-// RestrictedPolicy is the reference interceptor for headless embedders: an
+// Restricted is the reference interceptor for headless embedders: an
 // allowlist of programs plus shell-operator rejection.
 //
 // It is a FLOOR, not a sandbox. REQ-SEC-03's argument still holds — an
@@ -98,7 +82,7 @@ type RestrictedOptions struct {
 // nothing about that. What it does is make the unattended default "no"
 // instead of "yes", which is the difference OQ-8 exists to close. Embedders
 // with real context should replace it, not extend it.
-func RestrictedPolicy(o RestrictedOptions) core.BeforeToolCall {
+func Restricted(o Options) core.BeforeToolCall {
 	allowed := make(map[string]bool, len(o.AllowedPrograms))
 	for _, p := range o.AllowedPrograms {
 		allowed[path.Base(strings.TrimSpace(p))] = true
@@ -113,20 +97,20 @@ func RestrictedPolicy(o RestrictedOptions) core.BeforeToolCall {
 
 	return func(_ context.Context, in core.BeforeToolCallContext) core.BeforeToolCallDecision {
 		if blocked[in.ToolName] {
-			return block(fmt.Sprintf("RestrictedPolicy: tool %q is not permitted", in.ToolName))
+			return block(fmt.Sprintf("guard.Restricted: tool %q is not permitted", in.ToolName))
 		}
 		switch in.ToolName {
 		case "execute":
 			cmd, _ := in.Arguments["command"].(string)
 			if !o.AllowShellOperators {
 				if op, found := firstShellOperator(cmd); found {
-					return block(fmt.Sprintf("RestrictedPolicy: shell operator %q is not permitted "+
+					return block(fmt.Sprintf("guard.Restricted: shell operator %q is not permitted "+
 						"(grammar: POSIX sh); use run_command with an argument list, or one plain command", op))
 				}
 			}
 			prog := firstProgram(cmd)
 			if prog == "" || !allowed[prog] {
-				return block(fmt.Sprintf("RestrictedPolicy: program %q is not on the allowlist", prog))
+				return block(fmt.Sprintf("guard.Restricted: program %q is not on the allowlist", prog))
 			}
 		case "run_command":
 			argv, _ := in.Arguments["argv"].([]any)
@@ -136,16 +120,16 @@ func RestrictedPolicy(o RestrictedOptions) core.BeforeToolCall {
 				prog = path.Base(strings.TrimSpace(s))
 			}
 			if prog == "" || !allowed[prog] {
-				return block(fmt.Sprintf("RestrictedPolicy: program %q is not on the allowlist", prog))
+				return block(fmt.Sprintf("guard.Restricted: program %q is not on the allowlist", prog))
 			}
 		case "powershell":
 			if o.PowerShellFilter == nil {
-				return block("RestrictedPolicy: powershell is refused outright; this policy filters " +
+				return block("guard.Restricted: powershell is refused outright; this policy filters " +
 					"POSIX sh only and has no PowerShell grammar (REQ-SEC-04)")
 			}
 			cmd, _ := in.Arguments["command"].(string)
 			if b, reason := o.PowerShellFilter(cmd); b {
-				return block("RestrictedPolicy: " + reason)
+				return block("guard.Restricted: " + reason)
 			}
 		}
 		return core.BeforeToolCallDecision{}
