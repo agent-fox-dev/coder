@@ -4,9 +4,13 @@
 // can read and step through. Nothing is hidden inside a subprocess or a graph
 // engine.
 //
-// The canonical vocabulary lives in the core package and is re-exported here
-// by type alias, so agentkit.Tool and core.Tool are the same type and no
-// conversion exists anywhere.
+// The canonical vocabulary — messages, content blocks, events, Tool,
+// AgentConfig and every interface seam — lives in the core package and is
+// used directly; this package adds nothing to it. What lives here is the
+// Agent: its constructors, the loop, the tool batch executor and provider
+// registration. Stop policies, middleware, compaction, the prompt assembler,
+// the execute guard and delegation are each their own package beneath this
+// one.
 package agentkit
 
 import (
@@ -221,7 +225,7 @@ func (a *Agent) PromptBlocks() []string {
 func (a *Agent) Tools() []core.Tool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return ResolveToolPolicy(a.tools, a.cfg.ToolPolicy)
+	return a.cfg.ToolPolicy.Resolve(a.tools)
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -290,7 +294,7 @@ func (a *Agent) Snapshot(ctx context.Context) (core.SessionSnapshot, error) {
 	a.mu.Lock()
 	cfg, usage := a.cfg, a.usage
 	names := make([]string, 0, len(a.tools))
-	for _, t := range ResolveToolPolicy(a.tools, cfg.ToolPolicy) {
+	for _, t := range cfg.ToolPolicy.Resolve(a.tools) {
 		names = append(names, t.Name)
 	}
 	idle := a.Phase() == core.PhaseIdle && a.holds == 0 && !a.running
