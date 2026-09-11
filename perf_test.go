@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/provider"
 	"github.com/agentfox/agentkit-go/provider/anthropic"
@@ -105,7 +106,7 @@ func BenchmarkContextEstimate(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		EstimateContextTokens(msgs, nil)
+		compaction.EstimateContextTokens(msgs, nil)
 	}
 }
 

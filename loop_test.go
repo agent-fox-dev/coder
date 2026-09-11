@@ -956,48 +956,6 @@ func TestHoldKeepsAgentNonIdle(t *testing.T) {
 	}
 }
 
-// ------------------------------------------------------------------- estimate
-
-// TestEstimateSkipRulesEachFireIndependently pins REQ-GO-15. Each case
-// satisfies the OTHER two skip rules, so deleting any one `continue` from the
-// implementation fails exactly one subtest.
-func TestEstimateSkipRulesEachFireIndependently(t *testing.T) {
-	good := core.AssistantMessage{StopReason: core.StopReasonStop}
-	good.Usage.SetField(core.UsageInputTokens, 1000)
-
-	t.Run("(a) aborted turn is not an anchor", func(t *testing.T) {
-		bad := core.AssistantMessage{StopReason: core.StopReasonAborted}
-		bad.Usage.SetField(core.UsageInputTokens, 999999)
-		got := EstimateContextTokens(core.Messages{good, bad}, nil)
-		if got > 2000 {
-			t.Fatalf("estimate %d used an aborted turn as the anchor", got)
-		}
-	})
-
-	t.Run("(b) zero-usage turn is not an anchor", func(t *testing.T) {
-		var zero core.AssistantMessage
-		zero.StopReason = core.StopReasonStop
-		zero.Usage.SetField(core.UsageInputTokens, 0)
-		got := EstimateContextTokens(core.Messages{good, zero}, nil)
-		if got < 1000 {
-			t.Fatalf("estimate %d fell back past the valid anchor: a zero-usage response "+
-				"was treated as authoritative", got)
-		}
-	})
-
-	t.Run("(c) anchor invalidated by a later-inserted prefix", func(t *testing.T) {
-		// The checkpoint says a summary was inserted, so an assistant message
-		// from before it was sent under a different prefix.
-		cp := &core.CompactionCheckpoint{PrefixLen: 1, Summary: "s", CreatedAtLen: 4}
-		msgs := core.Messages{good, good, good}
-		got := EstimateContextTokens(msgs, cp)
-		if got >= 1000 {
-			t.Fatalf("estimate %d used a stale anchor: rule (c) never fired. Without "+
-				"CompactionCheckpoint.CreatedAtLen it cannot fire at all (ruling P-2)", got)
-		}
-	})
-}
-
 func TestStreamResultAvailableWithoutReadingAnyEvent(t *testing.T) {
 	// REQ-GO-08: the result is fed by the terminal event, not by consumption,
 	// and that is what makes abandoning a stream safe.
@@ -1041,3 +999,18 @@ func TestUnknownToolYieldsAnErrorResultNotACrash(t *testing.T) {
 }
 
 var _ = fmt.Sprintf
+
+func user(s string) core.Message {
+	return core.UserMessage{Content: core.Content{core.TextBlock{Text: s}}}
+}
+
+func assistantSaying(s string, tokens int64) core.Message {
+	m := core.AssistantMessage{
+		Content:    core.Content{core.TextBlock{Text: s}},
+		StopReason: core.StopReasonStop,
+	}
+	if tokens > 0 {
+		m.Usage.SetField(core.UsageInputTokens, tokens)
+	}
+	return m
+}

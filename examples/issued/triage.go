@@ -13,6 +13,7 @@ import (
 	"time"
 
 	agentkit "github.com/agentfox/agentkit-go"
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/stop"
 	"github.com/agentfox/agentkit-go/tools"
@@ -211,10 +212,10 @@ func installCompaction(cfg *core.AgentConfig, history *core.ConversationHistory,
 		return
 	}
 	client := core.ClientFunc(p.Stream)
-	cfg.TransformContext = agentkit.NewContextTransform(agentkit.CompactionDeps{
-		Strategy:       agentkit.SummarizationCompaction{ThresholdFraction: 0.6},
-		Summarizer:     agentkit.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
-		TurnSummarizer: agentkit.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
+	cfg.TransformContext = compaction.NewContextTransform(compaction.Deps{
+		Strategy:       compaction.Summarization{ThresholdFraction: 0.6},
+		Summarizer:     compaction.ModelSummarizer(client, cfg.Model, compactionReserveTokens),
+		TurnSummarizer: compaction.ModelTurnSummarizer(client, cfg.Model, compactionReserveTokens),
 		History:        history,
 		Model:          cfg.Model,
 		OnError:        onError,

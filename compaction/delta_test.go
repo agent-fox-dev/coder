@@ -1,4 +1,4 @@
-package agentkit
+package compaction
 
 import (
 	"context"
@@ -28,8 +28,8 @@ func TestExtendingSummarizesOnlyTheDelta(t *testing.T) {
 		sawLen   int
 		sawPrev  string
 	)
-	tf := NewContextTransform(CompactionDeps{
-		Strategy: SummarizationCompaction{ThresholdFraction: 0.1, KeepTokens: 1000},
+	tf := NewContextTransform(Deps{
+		Strategy: Summarization{ThresholdFraction: 0.1, KeepTokens: 1000},
 		Summarizer: func(_ context.Context, prefix core.Messages, prev string) (string, error) {
 			sawPrev, sawLen = prev, len(prefix)
 			sawFirst = indexOfText(msgs, prefix)
@@ -100,9 +100,9 @@ func TestACutBelowTheCheckpointDoesNotShrinkIt(t *testing.T) {
 	h.SetCheckpoint(core.CompactionCheckpoint{PrefixLen: 38, Summary: "DEEP", CreatedAtLen: 40})
 
 	calls := 0
-	tf := NewContextTransform(CompactionDeps{
+	tf := NewContextTransform(Deps{
 		// KeepTokens large enough that the cut lands well before index 38.
-		Strategy: SummarizationCompaction{ThresholdFraction: 0.01, KeepTokens: 10000},
+		Strategy: Summarization{ThresholdFraction: 0.01, KeepTokens: 10000},
 		Summarizer: func(context.Context, core.Messages, string) (string, error) {
 			calls++
 			return "WRONG", nil

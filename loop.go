@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
 )
 
@@ -556,7 +557,7 @@ func (a *Agent) callModel(ctx context.Context, out *core.EventStream, view core.
 		Temperature:      cfg.Temperature,
 		TopP:             cfg.TopP,
 		ThinkingLevel:    cfg.ThinkingLevel,
-		EstContextTokens: EstimateContextTokens(view, checkpointOf(a.history)),
+		EstContextTokens: compaction.EstimateContextTokens(view, checkpointOf(a.history)),
 		Options:          cfg.RequestOptions,
 		// REQ-PROV-19: carried from the options a caller can actually set
 		// onto the field a provider reads.

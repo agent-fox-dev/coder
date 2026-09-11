@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/session"
@@ -297,10 +298,10 @@ func TestGoldenModelVisibleWrappers(t *testing.T) {
 	b.WriteString("### branch_summary\n")
 	b.WriteString(session.RenderBranchSummary("Tried the wrong glob; switched to **/*.go."))
 	b.WriteString("\n### compaction\n")
-	b.WriteString(CompactionSummaryPrefix + "The user asked for the Go files and got them.")
+	b.WriteString(compaction.SummaryPrefix + "The user asked for the Go files and got them.")
 	b.WriteString("\n### compaction, split turn (REQ-GO-14)\n")
-	b.WriteString(CompactionSummaryPrefix + "The user asked for the Go files and got them." +
-		CompactionSplitSeparator + "The user then asked for the tests; the assistant had listed the directory.")
+	b.WriteString(compaction.SummaryPrefix + "The user asked for the Go files and got them." +
+		compaction.SplitSeparator + "The user then asked for the tests; the assistant had listed the directory.")
 	b.WriteString("\n")
 	checkGolden(t, "model_visible_wrappers.txt", b.String())
 }

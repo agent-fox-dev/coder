@@ -1,4 +1,4 @@
-package agentkit
+package compaction
 
 import (
 	"context"
@@ -51,8 +51,8 @@ func TestCompactionDoesNotOscillate(t *testing.T) {
 	h := core.NewConversationHistory()
 	msgs := longConversation(12)
 
-	tf := NewContextTransform(CompactionDeps{
-		Strategy: SummarizationCompaction{ThresholdFraction: 0.5, KeepTokens: 2000},
+	tf := NewContextTransform(Deps{
+		Strategy: Summarization{ThresholdFraction: 0.5, KeepTokens: 2000},
 		Summarizer: func(ctx context.Context, prefix core.Messages, prev string) (string, error) {
 			summarizerCalls.Add(1)
 			return "SUMMARY", nil
@@ -92,10 +92,10 @@ func TestCheckpointIsAppliedBeforeTheEstimate(t *testing.T) {
 		PrefixLen: 10, Summary: "EARLIER", CreatedAtLen: len(msgs),
 	})
 
-	tf := NewContextTransform(CompactionDeps{
+	tf := NewContextTransform(Deps{
 		// A strategy that never wants to compact. The checkpoint must still
 		// be applied.
-		Strategy: SummarizationCompaction{ThresholdFraction: 0.99, KeepTokens: 2000},
+		Strategy: Summarization{ThresholdFraction: 0.99, KeepTokens: 2000},
 		Summarizer: func(context.Context, core.Messages, string) (string, error) {
 			t.Fatal("summarizer must not run when the threshold does not fire")
 			return "", nil
@@ -120,8 +120,8 @@ func TestCompactionNeverMutatesHistory(t *testing.T) {
 	msgs := longConversation(10)
 	before := len(msgs)
 
-	tf := NewContextTransform(CompactionDeps{
-		Strategy:   SummarizationCompaction{ThresholdFraction: 0.1, KeepTokens: 1000},
+	tf := NewContextTransform(Deps{
+		Strategy:   Summarization{ThresholdFraction: 0.1, KeepTokens: 1000},
 		Summarizer: func(context.Context, core.Messages, string) (string, error) { return "S", nil },
 		History:    h,
 		Model:      &core.Model{ContextWindow: 10000},
@@ -178,9 +178,9 @@ func TestWindowStrategiesCutOnUserMessagesOnly(t *testing.T) {
 		user("u2"), assistantSaying("a2", 0),
 		user("u3"), assistantSaying("a3", 0),
 	}
-	for name, s := range map[string]CompactionStrategy{
-		"turn window":  TurnWindowCompaction{MaxTurns: 1},
-		"token window": TokenWindowCompaction{KeepTokens: 1},
+	for name, s := range map[string]Strategy{
+		"turn window":  TurnWindow{MaxTurns: 1},
+		"token window": TokenWindow{KeepTokens: 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if s.CutPolicy() != CutUserOnly {
@@ -236,8 +236,8 @@ func TestFailedSummarizationNeverCheckpoints(t *testing.T) {
 	msgs := longConversation(10)
 	var reported error
 
-	tf := NewContextTransform(CompactionDeps{
-		Strategy: SummarizationCompaction{ThresholdFraction: 0.1, KeepTokens: 1000},
+	tf := NewContextTransform(Deps{
+		Strategy: Summarization{ThresholdFraction: 0.1, KeepTokens: 1000},
 		Summarizer: func(context.Context, core.Messages, string) (string, error) {
 			return "", &ErrBadSummary{Reason: "truncated"}
 		},
@@ -269,8 +269,8 @@ func TestExtendingReusesThePreviousSummary(t *testing.T) {
 
 	var sawPrevious string
 	msgs := longConversation(20) // far past the threshold, so it extends
-	tf := NewContextTransform(CompactionDeps{
-		Strategy: SummarizationCompaction{ThresholdFraction: 0.1, KeepTokens: 1000},
+	tf := NewContextTransform(Deps{
+		Strategy: Summarization{ThresholdFraction: 0.1, KeepTokens: 1000},
 		Summarizer: func(_ context.Context, _ core.Messages, prev string) (string, error) {
 			sawPrevious = prev
 			return "SECOND", nil

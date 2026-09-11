@@ -1,4 +1,4 @@
-package agentkit
+package compaction
 
 import (
 	"github.com/agentfox/agentkit-go/core"

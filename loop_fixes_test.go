@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/agentfox/agentkit-go/compaction"
 	"github.com/agentfox/agentkit-go/core"
 	"github.com/agentfox/agentkit-go/schema"
 	"github.com/agentfox/agentkit-go/stop"
@@ -675,7 +676,7 @@ func TestACutInsideATurnSummarizesTheTurnSeparately(t *testing.T) {
 		user("q3"), assistantSaying("a3", 0),
 	}
 	var mainSeen, turnSeen core.Messages
-	tf := NewContextTransform(CompactionDeps{
+	tf := compaction.NewContextTransform(compaction.Deps{
 		Strategy: cutAt{3}, // lands on assistant a2: inside turn q2
 		Summarizer: func(_ context.Context, prefix core.Messages, _ string) (string, error) {
 			mainSeen = prefix
@@ -691,7 +692,7 @@ func TestACutInsideATurnSummarizesTheTurnSeparately(t *testing.T) {
 	if len(mainSeen) != 2 || len(turnSeen) != 1 {
 		t.Fatalf("main summarizer saw %d messages, turn summarizer %d; want 2 (q1,a1) and 1 (q2)", len(mainSeen), len(turnSeen))
 	}
-	want := CompactionSummaryPrefix + "HEAD" + CompactionSplitSeparator + "TURN"
+	want := compaction.SummaryPrefix + "HEAD" + compaction.SplitSeparator + "TURN"
 	if got := view[0].(core.UserMessage).Content.Text(); got != want {
 		t.Fatalf("summary = %q, want %q", got, want)
 	}
@@ -704,4 +705,4 @@ type cutAt struct{ at int }
 
 func (cutAt) ShouldCompact(int, int) bool       { return true }
 func (c cutAt) CutIndex(core.Messages, int) int { return c.at }
-func (cutAt) CutPolicy() CutPolicy              { return CutNotToolResult }
+func (cutAt) CutPolicy() compaction.CutPolicy   { return compaction.CutNotToolResult }
